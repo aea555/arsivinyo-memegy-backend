@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = [
+    "src/api",
+    "src/worker",
+    "src/shared",
+    "src/shared/migration",
+]

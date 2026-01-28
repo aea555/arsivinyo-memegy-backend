@@ -1,0 +1,29 @@
+[package]
+name = "api"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+shared = { path = "../shared" }
+
+# Web Framework
+axum = { version = "0.7", features = ["macros", "multipart"] }
+tokio = { version = "1.40", features = ["full"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "limit"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Auth
+oauth2 = "4.4"
+jsonwebtoken = "9.3"
+axum-extra = { version = "0.9.0", features = ["cookie", "typed-header"] }
+reqwest = { version = "0.13.1", features = ["form", "json"] }
+sea-orm = "1.1.19"
+anyhow = "1.0.100"
+serde = "1.0.228"
+uuid = "1.20.0"
+chrono = "0.4.43"
+redis = { version = "1.0.2", features = ["tokio-comp"] }

@@ -1,0 +1,30 @@
+[package]
+name = "shared"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Database (SeaORM + SQLx)
+sea-orm = { version = "1.1", features = [ "sqlx-postgres", "runtime-tokio-rustls", "macros" ] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono"] }
+
+# Utils
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.10", features = ["serde", "v4"] }
+dotenvy = "0.15"
+thiserror = "2.0"
+tracing = "0.1"
+anyhow = "1.0"
+url = "2.5"
+argon2 = "0.5.3"
+rand = "0.9.2"
+jsonwebtoken = "10.3.0"
+hex = "0.4.3"
+aws-config = "1.8.12"
+aws-sdk-s3 = "1.120.0"
+redis = { version = "1.0.2", features = ["tokio-comp"] }
+tokio = { version = "1.49.0", features = ["fs", "io-util"] }
