@@ -6,9 +6,11 @@ use std::env;
 pub struct Config {
     pub server_host: String,
     pub server_port: u16,
+    pub oauth_redirect_base_url: String,
     pub database_url: String,
     pub valkey_url: String,
     pub jwt_secret: String,
+    pub cors_allowed_origins: String,
     pub minio_endpoint: String,
     pub minio_access_key: String,
     pub minio_secret_key: String,
@@ -30,9 +32,14 @@ impl Config {
                 .unwrap_or_else(|_| "3000".to_string())
                 .parse()
                 .expect("SERVER_PORT must be a number"),
+            oauth_redirect_base_url: env::var("OAUTH_REDIRECT_BASE_URL")
+                .unwrap_or_else(|_| "http://localhost:3000".to_string())
+                .trim_end_matches('/')
+                .to_string(),
             database_url: env::var("DATABASE_URL").expect("DATABASE_URL must be set"),
             valkey_url: env::var("VALKEY_URL").expect("VALKEY_URL must be set"),
             jwt_secret: env::var("JWT_SECRET").expect("JWT_SECRET must be set"),
+            cors_allowed_origins: env::var("CORS_ALLOWED_ORIGINS").unwrap_or_default(),
             minio_endpoint: env::var("MINIO_ENDPOINT").expect("MINIO_ENDPOINT must be set"),
             minio_access_key: env::var("MINIO_ROOT_USER").expect("MINIO_ROOT_USER must be set"),
             minio_secret_key: env::var("MINIO_ROOT_PASSWORD")

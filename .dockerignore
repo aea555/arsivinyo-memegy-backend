@@ -1,6 +1,42 @@
+# Rust build artifacts
 target/
+
+# Git
 .git/
+.gitignore
+
+# Environment files
 .env
-docker/
-README.md
+.env.*
+!.env.example
+
+# Documentation
 **/*.md
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+
+# Docker
+docker-compose.yml
+
+# Logs
+*.log
+
+# Temporary
+tmp/
+temp/
+
+.git
+target
+node_modules
+Dockerfile
+
+.cargo/
+rust-toolchain.toml
+rust-toolchain

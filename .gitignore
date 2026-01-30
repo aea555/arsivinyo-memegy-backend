@@ -8,3 +8,9 @@ Cargo.lock
 docker/postgres_data/
 docker/valkey_data/
 docker/minio_data/
+
+# Ignore all markdown files
+*.md
+
+# Except README.md
+!README.md

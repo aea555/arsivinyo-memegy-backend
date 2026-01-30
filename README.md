@@ -14,7 +14,7 @@ A high-performance meme archive backend built with Rust, Axum, SeaORM, and Redis
 ## Prerequisites
 
 - Docker & Docker Compose
-- Rust (1.80+)
+- Rust (1.93+)
 
 ## Getting Started
 
@@ -47,6 +47,19 @@ A high-performance meme archive backend built with Rust, Axum, SeaORM, and Redis
     cargo run -p worker
     ```
 
+## API Documentation
+
+Once the server is running, visit:
+- **Interactive Documentation (Scalar)**: http://localhost:3000/docs
+- **OpenAPI Spec**: http://localhost:3000/openapi.yaml
+
+The documentation includes:
+- All endpoints with detailed descriptions
+- Request/Response schemas
+- Authentication requirements
+- Rate limiting information
+- Error responses
+
 ## Endpoints
 
 ### Auth
@@ -68,6 +81,19 @@ For Upload:
 1. Call `/videos/init` -> Get `upload_url`.
 2. PUT file to `upload_url`.
 3. Call `/videos/{id}/confirm`.
+
+## Docker Deployment
+
+Build and run the entire stack (API + Worker + Infrastructure):
+```bash
+docker compose up -d --build
+```
+
+This will:
+- Build the Rust binaries
+- Start PostgreSQL, Valkey, and MinIO
+- Launch the API server on port 3000
+- Start the background worker
 
 ## License
 MIT

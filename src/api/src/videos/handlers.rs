@@ -10,7 +10,7 @@ use uuid::Uuid;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
-use crate::{state::AppState, auth::extractors::AuthUser};
+use crate::{state::AppState, auth::extractors::AuthUser, error::{ApiResult, ApiErrorResponse}};
 use shared::{entities::{videos, likes}, queue::VideoProcessJob};
 use super::dtos::*;
 
@@ -32,7 +32,7 @@ pub struct VideoFeedItem {
 pub async fn get_feed(
     State(state): State<AppState>,
     Query(query): Query<FeedQuery>,
-) -> Result<Json<Vec<VideoFeedItem>>, StatusCode> {
+) -> ApiResult<Json<Vec<VideoFeedItem>>> {
     let sort = query.sort.as_deref().unwrap_or("random");
     let page = query.page.unwrap_or(0);
     let page_size = 20;
@@ -55,8 +55,7 @@ pub async fn get_feed(
     let videos = select
         .paginate(&state.db, page_size)
         .fetch_page(page)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .await?;
 
     let base_url = format!("{}/{}", state.config.minio_endpoint, state.config.minio_bucket_videos);
 
@@ -75,34 +74,28 @@ pub async fn like_video(
     State(state): State<AppState>,
     AuthUser(user_id): AuthUser,
     Path(video_id): Path<Uuid>,
-) -> Result<StatusCode, StatusCode> {
+) -> ApiResult<StatusCode> {
     // Transaction to ensure consistency
-    let txn = state.db.begin().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let txn = state.db.begin().await?;
 
     // Check if already liked
     let existing = likes::Entity::find()
         .filter(likes::Column::UserId.eq(user_id))
         .filter(likes::Column::VideoId.eq(video_id))
         .one(&txn)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .await?;
 
     if let Some(like) = existing {
         // Unlike
-        like.delete(&txn).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        like.delete(&txn).await?;
         
-        // Decrement count
-        // videos::Entity::update_many() ...
-        // Or fetch and update
-        // Use raw SQL execution for atomic update is safer/faster for counters,
-        // but finding and updating is easier with ORM.
-        if let Some(_v) = videos::Entity::find_by_id(video_id).one(&txn).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? {
-             // Decrement count atomically
+        // Decrement count atomically
+        if let Some(_v) = videos::Entity::find_by_id(video_id).one(&txn).await? {
              txn.execute(Statement::from_sql_and_values(
                  DbBackend::Postgres,
                  r#"UPDATE "videos" SET "like_count" = "like_count" - 1 WHERE "id" = $1"#,
                  [video_id.into()]
-             )).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+             )).await?;
         }
     } else {
         // Like
@@ -111,16 +104,16 @@ pub async fn like_video(
             video_id: Set(video_id),
             created_at: Set(Utc::now().into()),
         };
-        new_like.insert(&txn).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        new_like.insert(&txn).await?;
 
         txn.execute(Statement::from_sql_and_values(
              DbBackend::Postgres,
              r#"UPDATE "videos" SET "like_count" = "like_count" + 1 WHERE "id" = $1"#,
              [video_id.into()]
-         )).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+         )).await?;
     }
 
-    txn.commit().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    txn.commit().await?;
 
     Ok(StatusCode::OK)
 }
@@ -129,32 +122,29 @@ pub async fn init_upload(
     State(state): State<AppState>,
     AuthUser(user_id): AuthUser,
     Json(payload): Json<InitUploadRequest>,
-) -> Result<Json<InitUploadResponse>, StatusCode> {
+) -> ApiResult<Json<InitUploadResponse>> {
     // 1. Rate Limiting Check
-    // We'll use a sliding window via Redis, or just a simple expiry bucket.
-    // Key: `rate_limit:upload:{user_id}`
     let key = format!("rate_limit:upload:{}", user_id);
     let limit = state.config.limit_upload_bytes_hourly as i64;
     
-    let mut conn = state.queue.get_conn().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?; // Need to expose conn
+    let mut conn = state.queue.get_conn().await
+        .map_err(|e| ApiErrorResponse::internal_error(format!("Redis connection failed: {}", e)))?;
     
     // Check current usage
     let current_usage: i64 = conn.get(&key).await.unwrap_or(0);
     
     if current_usage + payload.size_bytes > limit {
-        // Simple error for now, ideally 429 Too Many Requests
-        return Err(StatusCode::TOO_MANY_REQUESTS);
+        return Err(ApiErrorResponse::too_many_requests("Upload rate limit exceeded. Please try again later."));
     }
 
     // 2. Create DB Record (DRAFT)
     let video_id = Uuid::new_v4();
-    // Use filename extension if available, else default
     let ext = std::path::Path::new(&payload.filename)
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("bin");
         
-    let s3_key = format!("{}/{}.{}", user_id, video_id, ext); // e.g. user-uuid/video-uuid.mp4
+    let s3_key = format!("{}/{}.{}", user_id, video_id, ext);
 
     let new_video = videos::ActiveModel {
         id: Set(video_id),
@@ -170,20 +160,16 @@ pub async fn init_upload(
         updated_at: Set(Utc::now().into()),
     };
 
-    new_video.insert(&state.db).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    new_video.insert(&state.db).await?;
 
     // 3. Generate Presigned URL
-    // Expiry 1 Hour
     let upload_url = state.storage
         .generate_presigned_put(&state.config.minio_bucket_raw, &s3_key, Duration::from_secs(3600))
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| ApiErrorResponse::internal_error(format!("Failed to generate upload URL: {}", e)))?;
 
     // 4. Update Rate Limit
     let _: () = conn.incr(&key, payload.size_bytes).await.unwrap_or(());
-    let _: () = conn.expire(&key, 3600).await.unwrap_or(()); // Reset expiry to 1h on every write? Or keep original?
-    // Proper way: IF key didn't exist, set expiry. If exists, keep ttl.
-    // For simplicity, I'll set expire if ttl is -1.
     let ttl: i64 = conn.ttl(&key).await.unwrap_or(-1);
     if ttl == -1 {
          let _: () = conn.expire(&key, 3600).await.unwrap_or(());
@@ -199,34 +185,33 @@ pub async fn confirm_upload(
     State(state): State<AppState>,
     AuthUser(user_id): AuthUser,
     Path(video_id): Path<Uuid>,
-) -> Result<StatusCode, StatusCode> {
+) -> ApiResult<StatusCode> {
     // 1. Fetch Video
     let video = videos::Entity::find_by_id(video_id)
         .filter(videos::Column::UserId.eq(user_id))
         .one(&state.db)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
+        .await?
+        .ok_or_else(|| ApiErrorResponse::not_found("Video not found"))?;
 
     if video.status != "DRAFT" {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(ApiErrorResponse::bad_request("Video is not in DRAFT status"));
     }
 
     // 2. Check S3
     let exists = state.storage
         .file_exists(&video.s3_bucket, &video.s3_key)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| ApiErrorResponse::internal_error(format!("Failed to check file: {}", e)))?;
 
     if !exists {
-        return Err(StatusCode::BAD_REQUEST); // File not uploaded yet
+        return Err(ApiErrorResponse::bad_request("File not uploaded yet"));
     }
 
     // 3. Update Status
     let mut active_video: videos::ActiveModel = video.clone().into();
     active_video.status = Set("PROCESSING".to_string());
     active_video.updated_at = Set(Utc::now().into());
-    active_video.update(&state.db).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    active_video.update(&state.db).await?;
 
     // 4. Queue Job
     let job = VideoProcessJob {
@@ -236,7 +221,8 @@ pub async fn confirm_upload(
         raw_key: video.s3_key,
     };
 
-    state.queue.push_video_job(job).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    state.queue.push_video_job(job).await
+        .map_err(|e| ApiErrorResponse::internal_error(format!("Failed to queue job: {}", e)))?;
 
     Ok(StatusCode::ACCEPTED)
 }

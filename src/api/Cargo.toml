@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 shared = { path = "../shared" }
+migration = { path = "../shared/migration" }
 
 # Web Framework
 axum = { version = "0.7", features = ["macros", "multipart"] }
@@ -22,8 +23,10 @@ jsonwebtoken = "9.3"
 axum-extra = { version = "0.9.0", features = ["cookie", "typed-header"] }
 reqwest = { version = "0.13.1", features = ["form", "json"] }
 sea-orm = "1.1.19"
+sea-orm-migration = "1.1.19"
 anyhow = "1.0.100"
 serde = "1.0.228"
 uuid = "1.20.0"
 chrono = "0.4.43"
 redis = { version = "1.0.2", features = ["tokio-comp"] }
+time = "0.3.46"

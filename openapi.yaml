@@ -1,0 +1,547 @@
+openapi: 3.0.3
+info:
+  title: Arsivinyo Memegy API
+  version: 0.1.0
+  description: |
+    A high-performance meme archive backend built with Rust. 
+    This API allows users to upload, like, and discover short meme videos.
+    
+    ## Authentication
+    This API uses **Bearer Token** authentication via JWT. Obtain tokens through the Google OAuth flow.
+    
+    ## Rate Limits
+    - **Upload**: 50MB per hour per user (configurable)
+    - **Feed**: 60 requests per minute (configurable)
+    
+  contact:
+    name: Arsivinyo Team
+  license:
+    name: MIT
+
+servers:
+  - url: http://localhost:3000
+    description: Local development server
+  - url: https://api.memegy.arsivinyo.com
+    description: Production server
+
+tags:
+  - name: Health
+    description: Health check endpoints
+  - name: Authentication
+    description: Google OAuth2 authentication flow
+  - name: Videos
+    description: Video upload and management
+  - name: Feed
+    description: Video discovery and social features
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT access token obtained from the authentication flow
+
+  schemas:
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+          description: Error message
+      required:
+        - error
+
+    AuthResponse:
+      type: object
+      properties:
+        access_token:
+          type: string
+          description: JWT access token (valid for 15 minutes)
+          example: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+        refresh_token:
+          type: string
+          description: Opaque refresh token (valid for 14 days)
+          example: a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6
+        user:
+          $ref: '#/components/schemas/UserDto'
+      required:
+        - access_token
+        - refresh_token
+        - user
+
+    UserDto:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: 550e8400-e29b-41d4-a716-446655440000
+        username:
+          type: string
+          example: john_doe
+        email:
+          type: string
+          format: email
+          example: john@example.com
+      required:
+        - id
+        - username
+        - email
+
+    RefreshRequest:
+      type: object
+      properties:
+        access_token:
+          type: string
+          description: The expired or soon-to-expire access token
+          example: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+        refresh_token:
+          type: string
+          description: Valid refresh token
+          example: a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6
+      required:
+        - access_token
+        - refresh_token
+
+    RefreshResponse:
+      type: object
+      properties:
+        access_token:
+          type: string
+          description: New JWT access token
+          example: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+      required:
+        - access_token
+
+    InitUploadRequest:
+      type: object
+      properties:
+        filename:
+          type: string
+          description: Original filename with extension
+          example: funny_cat.mp4
+        size_bytes:
+          type: integer
+          format: int64
+          description: File size in bytes
+          example: 5242880
+          minimum: 1
+      required:
+        - filename
+        - size_bytes
+
+    InitUploadResponse:
+      type: object
+      properties:
+        video_id:
+          type: string
+          format: uuid
+          description: Unique identifier for the video
+          example: 550e8400-e29b-41d4-a716-446655440000
+        upload_url:
+          type: string
+          format: uri
+          description: Presigned URL for direct upload to storage (valid for 1 hour)
+          example: http://localhost:9000/videos-raw/550e8400-e29b-41d4-a716-446655440000/video.mp4?X-Amz-Algorithm=...
+      required:
+        - video_id
+        - upload_url
+
+    VideoFeedItem:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: 550e8400-e29b-41d4-a716-446655440000
+        title:
+          type: string
+          nullable: true
+          example: Epic meme compilation
+        url:
+          type: string
+          format: uri
+          description: Public URL to the processed video
+          example: http://localhost:9000/videos-public/550e8400-e29b-41d4-a716-446655440000/video.mp4
+        like_count:
+          type: integer
+          format: int64
+          example: 42
+        created_at:
+          type: string
+          format: date-time
+          example: 2026-01-28T17:30:00Z
+      required:
+        - id
+        - url
+        - like_count
+        - created_at
+
+  responses:
+    UnauthorizedError:
+      description: Authentication required or token invalid/expired
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: Unauthorized
+
+    TooManyRequestsError:
+      description: Rate limit exceeded
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: Rate limit exceeded
+
+    NotFoundError:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: Not found
+
+    BadRequestError:
+      description: Invalid request parameters
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: Invalid request
+
+    InternalServerError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: Internal server error
+
+paths:
+  /health:
+    get:
+      tags:
+        - Health
+      summary: Health check
+      description: Returns OK if the server is running
+      operationId: healthCheck
+      responses:
+        '200':
+          description: Server is healthy
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: OK
+
+  /auth/google/login:
+    get:
+      tags:
+        - Authentication
+      summary: Initiate Google OAuth2 flow
+      description: |
+        Redirects the user to Google's OAuth2 consent page.
+        After authentication, Google redirects back to `/auth/google/callback`.
+        
+        **Note for API Testing:**
+        This endpoint is designed for browser-based flows and will redirect to Google's login page.
+        For API testing without a browser, use the `/auth/dev/login` endpoint instead (development only).
+      operationId: googleLogin
+      responses:
+        '302':
+          description: Redirect to Google OAuth2 consent page
+          headers:
+            Location:
+              schema:
+                type: string
+                format: uri
+                example: https://accounts.google.com/o/oauth2/v2/auth?client_id=...
+
+  /auth/dev/login:
+    post:
+      tags:
+        - Authentication
+      summary: Development login (bypasses Google OAuth)
+      description: |
+        **⚠️ DEVELOPMENT ONLY** - Only available when `RUST_LOG` contains "debug" or "trace".
+        
+        Creates or retrieves a test user and issues access/refresh tokens without Google OAuth.
+        Perfect for testing the API with Postman, curl, or other API clients.
+        
+        **Production Behavior:**
+        This endpoint returns 404 in production environments.
+      operationId: devLogin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                username:
+                  type: string
+                  example: test_user
+                email:
+                  type: string
+                  format: email
+                  example: test@example.com
+              required:
+                - username
+                - email
+      responses:
+        '200':
+          description: Successfully authenticated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '404':
+          description: Endpoint not available (production mode)
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /auth/google/callback:
+    get:
+      tags:
+        - Authentication
+      summary: Google OAuth2 callback
+      description: |
+        Handles the OAuth2 callback from Google.
+        Exchanges the authorization code for user information and issues access/refresh tokens.
+      operationId: googleCallback
+      parameters:
+        - name: code
+          in: query
+          required: true
+          description: Authorization code from Google
+          schema:
+            type: string
+            example: 4/0AY0e-g7...
+        - name: state
+          in: query
+          required: true
+          description: CSRF protection token
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Successfully authenticated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /auth/refresh:
+    post:
+      tags:
+        - Authentication
+      summary: Refresh access token
+      description: |
+        Exchanges a valid refresh token for a new access token.
+        The old access token (even if expired) must be provided to extract the user ID.
+      operationId: refreshToken
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshRequest'
+      responses:
+        '200':
+          description: New access token issued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RefreshResponse'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /auth/logout:
+    post:
+      tags:
+        - Authentication
+      summary: Logout (invalidate all refresh tokens)
+      description: |
+        Invalidates all refresh tokens for the authenticated user.
+        The user will need to re-authenticate via Google OAuth.
+      operationId: logout
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Successfully logged out
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /videos/init:
+    post:
+      tags:
+        - Videos
+      summary: Initialize video upload
+      description: |
+        Request a presigned URL for uploading a video file.
+        
+        **Upload Flow:**
+        1. Call this endpoint to get a `video_id` and `upload_url`
+        2. Upload the file directly to `upload_url` using HTTP PUT
+        3. Call `/videos/{id}/confirm` to trigger processing
+        
+        **Rate Limiting:**
+        - Max 50MB per hour per user (configurable)
+        - Limit is based on cumulative file size, not number of uploads
+      operationId: initUpload
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InitUploadRequest'
+      responses:
+        '200':
+          description: Upload initialized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InitUploadResponse'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '429':
+          $ref: '#/components/responses/TooManyRequestsError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /videos/{id}/confirm:
+    post:
+      tags:
+        - Videos
+      summary: Confirm video upload
+      description: |
+        Confirms that the file has been uploaded to the presigned URL.
+        Triggers background processing (compression, thumbnail generation).
+        
+        **Status Flow:**
+        - `DRAFT` → `PROCESSING` → `PUBLISHED` (or `FAILED`)
+      operationId: confirmUpload
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Video ID from `/videos/init`
+          schema:
+            type: string
+            format: uuid
+            example: 550e8400-e29b-41d4-a716-446655440000
+      responses:
+        '202':
+          description: Upload confirmed, processing started
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /videos/{id}/like:
+    post:
+      tags:
+        - Videos
+      summary: Like/Unlike a video
+      description: |
+        Toggles the like status for a video.
+        - If not liked: adds a like
+        - If already liked: removes the like
+        
+        The `like_count` is updated atomically.
+      operationId: likeVideo
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Video ID
+          schema:
+            type: string
+            format: uuid
+            example: 550e8400-e29b-41d4-a716-446655440000
+      responses:
+        '200':
+          description: Like status toggled
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /feed:
+    get:
+      tags:
+        - Feed
+      summary: Get video feed
+      description: |
+        Fetch a paginated list of published videos.
+        
+        **Sorting Options:**
+        - `random`: Random order (default)
+        - `latest`: Most recent first
+        - `popular`: Most liked first
+        
+        **Pagination:**
+        - Page size: 20 videos per page
+        - Pages are 0-indexed
+      operationId: getFeed
+      parameters:
+        - name: sort
+          in: query
+          required: false
+          description: Sort order
+          schema:
+            type: string
+            enum:
+              - random
+              - latest
+              - popular
+            default: random
+        - name: page
+          in: query
+          required: false
+          description: Page number (0-indexed)
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+            default: 0
+            example: 0
+      responses:
+        '200':
+          description: Feed retrieved successfully
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/VideoFeedItem'
+        '500':
+          $ref: '#/components/responses/InternalServerError'

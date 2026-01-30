@@ -4,8 +4,7 @@ use uuid::Uuid;
 #[derive(Deserialize)]
 pub struct GoogleCallbackQuery {
     pub code: String,
-    #[serde(rename = "state")]
-    pub _state: String,
+    pub state: String,
 }
 
 #[derive(Serialize)]
@@ -31,4 +30,10 @@ pub struct RefreshRequest {
 #[derive(Serialize)]
 pub struct RefreshResponse {
     pub access_token: String,
+}
+
+#[derive(Deserialize)]
+pub struct DevLoginRequest {
+    pub username: String,
+    pub email: String,
 }

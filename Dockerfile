@@ -1,29 +1,53 @@
-# Builder Stage
-FROM rust:1.93-slim-bookworm as builder
-
+# ============================================
+# CHEF STAGE (Shared - for cargo-chef)
+# ============================================
+FROM rust:1.93-slim-bookworm AS chef
+RUN cargo install cargo-chef
 WORKDIR /app
+
+# ============================================
+# PLANNER STAGE (Shared - analyzes dependencies)
+# ============================================
+FROM chef AS planner
 COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
 
-# Install build dependencies
-RUN apt-get update && apt-get install -y pkg-config libssl-dev protobuf-compiler
+# ============================================
+# BUILDER BASE (Shared - installs build deps & cooks dependencies)
+# ============================================
+FROM chef AS builder-base
+RUN apt-get update && apt-get install -y pkg-config libssl-dev protobuf-compiler && rm -rf /var/lib/apt/lists/*
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
 
-# Build API
-RUN cargo build --release -p api
+# ============================================
+# API BUILDER (Only builds API binary)
+# ============================================
+FROM builder-base AS builder-api
+COPY . .
+RUN cargo build --release -p api -vv
 
-# Build Worker
-RUN cargo build --release -p worker
+# ============================================
+# WORKER BUILDER (Only builds Worker binary)
+# ============================================
+FROM builder-base AS builder-worker
+COPY . .
+RUN cargo build --release -p worker -vv
 
-# Runtime Stage (API)
-FROM debian:bookworm-slim as api
+# ============================================
+# API RUNTIME (Final API image)
+# ============================================
+FROM debian:bookworm-slim AS api
 WORKDIR /app
 RUN apt-get update && apt-get install -y libssl3 ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /app/target/release/api /app/api
+COPY --from=builder-api /app/target/release/api /app/api
 CMD ["/app/api"]
 
-# Runtime Stage (Worker)
-FROM debian:bookworm-slim as worker
+# ============================================
+# WORKER RUNTIME (Final Worker image)
+# ============================================
+FROM debian:bookworm-slim AS worker
 WORKDIR /app
-# Install FFmpeg
 RUN apt-get update && apt-get install -y libssl3 ca-certificates ffmpeg && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /app/target/release/worker /app/worker
+COPY --from=builder-worker /app/target/release/worker /app/worker
 CMD ["/app/worker"]
