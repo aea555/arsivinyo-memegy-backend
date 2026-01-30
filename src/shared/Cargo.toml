@@ -22,7 +22,7 @@ anyhow = "1.0"
 url = "2.5"
 argon2 = "0.5.3"
 rand = "0.9.2"
-jsonwebtoken = "10.3.0"
+jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
 hex = "0.4.3"
 aws-config = "1.8.12"
 aws-sdk-s3 = "1.120.0"

@@ -1,11 +1,10 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, Context};
 use chrono::{Duration, Utc};
 use sea_orm::*; // Import everything
 use serde::Deserialize;
 use shared::entities::{refresh_tokens, users};
 use shared::security::{create_access_token, generate_refresh_token, hash_token, verify_token_hash};
 use uuid::Uuid;
-
 #[derive(Deserialize, Debug)]
 pub struct GoogleUserResult {
     pub id: String,
@@ -25,6 +24,14 @@ impl AuthService {
         client_secret: &str,
         redirect_uri: &str,
     ) -> Result<GoogleUserResult> {
+        // Trim credentials to avoid common copy-paste errors
+        let client_id = client_id.trim();
+        let client_secret = client_secret.trim();
+        let redirect_uri = redirect_uri.trim();
+
+        tracing::debug!("Verifying Google Code. ClientID: {}, Redirect: {}", client_id, redirect_uri);
+
+        // Use standard reqwest client (supports HTTP/2 by default)
         let client = reqwest::Client::new();
         
         // Exchange code for token
@@ -36,6 +43,8 @@ impl AuthService {
             ("redirect_uri", redirect_uri),
         ];
 
+        tracing::debug!("Sending Token Request to https://oauth2.googleapis.com/token");
+
         let token_res = client
             .post("https://oauth2.googleapis.com/token")
             .form(&params)
@@ -43,7 +52,10 @@ impl AuthService {
             .await?;
 
         if !token_res.status().is_success() {
-             return Err(anyhow!("Failed to exchange code for token: {:?}", token_res.text().await?));
+             let status = token_res.status();
+             let error_text = token_res.text().await?;
+             tracing::error!("Google Token Exchange Failed. Status: {}, Response: {}", status, error_text);
+             return Err(anyhow!("Failed to exchange code for token: {:?}", error_text));
         }
 
         #[derive(Deserialize)]
@@ -61,7 +73,9 @@ impl AuthService {
             .await?;
 
         if !user_res.status().is_success() {
-             return Err(anyhow!("Failed to fetch user info"));
+             let error_text = user_res.text().await?;
+             tracing::error!("Google User Info Failed. Response: {}", error_text);
+             return Err(anyhow!("Failed to fetch user info: {}", error_text));
         }
 
         let user_data: GoogleUserResult = user_res.json().await?;

@@ -19,7 +19,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Auth
 oauth2 = "4.4"
-jsonwebtoken = "9.3"
+jsonwebtoken = "10.3.0"
 axum-extra = { version = "0.9.0", features = ["cookie", "typed-header"] }
 reqwest = { version = "0.13.1", features = ["form", "json"] }
 sea-orm = "1.1.19"
