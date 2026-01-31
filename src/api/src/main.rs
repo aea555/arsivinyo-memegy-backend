@@ -10,7 +10,7 @@ use auth::revocation::TokenRevocationService;
 use axum::{
     http::StatusCode,
     response::{Html, IntoResponse},
-    routing::{get, post},
+    routing::{delete, get, patch, post},
     Router,
 };
 use cache::feed_cache::FeedCacheService;
@@ -135,6 +135,11 @@ async fn main() -> anyhow::Result<()> {
             post(videos::handlers::confirm_upload),
         )
         .route("/videos/:id/like", post(videos::handlers::like_video))
+        .route("/videos/:id", delete(videos::handlers::delete_video))
+        .route(
+            "/videos/:id",
+            patch(videos::handlers::update_video_metadata),
+        )
         .route("/feed", get(videos::handlers::get_feed))
         .layer(cors)
         .with_state(state.clone());

@@ -59,14 +59,18 @@ pub async fn get_feed(
         )
         .await
     {
-        Ok(Ok(_remaining)) => {} // Within limit
+        Ok(Ok(_)) => {
+            // Within limit, continue
+        }
         Ok(Err(count)) => {
             return Err(ApiErrorResponse::too_many_requests(format!(
-                "Feed rate limit exceeded ({} requests/minute)",
+                "Feed rate limit exceeded: {} requests/minute",
                 count
             )));
         }
-        Err(_) => {} // Redis error, fail open
+        Err(_) => {
+            // Redis error - fail open
+        }
     }
 
     let sort = query.sort.as_deref().unwrap_or("random");
@@ -89,7 +93,15 @@ pub async fn get_feed(
                     url: format!("{}/{}", base_url, c.url.split('/').last().unwrap_or(&c.url)),
                     like_count: c.like_count,
                     created_at: c.created_at,
-                    uploader: None, // TODO: Cache doesn't store user info yet, will be added in Phase 5
+                    // Phase 5: Map uploader from cache (respecting anonymity)
+                    uploader: if c.is_anonymous {
+                        None
+                    } else {
+                        c.uploader.map(|u| UploaderInfo {
+                            id: u.id,
+                            username: u.username,
+                        })
+                    },
                 })
                 .collect();
 
@@ -102,6 +114,7 @@ pub async fn get_feed(
 
     let mut select = videos::Entity::find()
         .filter(videos::Column::Status.eq("PUBLISHED"))
+        .filter(videos::Column::DeletedAt.is_null()) // Filter soft-deleted videos
         .find_also_related(users::Entity); // Left join users table
 
     match sort {
@@ -149,83 +162,41 @@ pub async fn get_feed(
         })
         .collect();
 
-    // Update cache (skip random)
+    // Update cache is skipped - will be implemented in Phase 5 with user info support
+
+    // Phase 5: Populate cache with full metadata
     if sort != "random" && !video_with_users.is_empty() {
         let cached_items: Vec<_> = video_with_users
-            .into_iter()
-            .map(|(v, _)| crate::cache::feed_cache::CachedVideoFeedItem {
+            .iter()
+            .map(|(v, u)| crate::cache::feed_cache::CachedVideoFeedItem {
                 id: v.id,
-                title: v.title,
-                url: v.s3_key,
+                title: v.title.clone(),
+                url: v.s3_key.clone(),
                 thumbnail_url: None,
                 like_count: v.like_count,
                 created_at: v.created_at,
+                deleted_at: v.deleted_at,
+                is_anonymous: v.is_anonymous,
+                uploader: if v.is_anonymous {
+                    None
+                } else {
+                    u.as_ref()
+                        .map(|user| crate::cache::feed_cache::CachedUploaderInfo {
+                            id: user.id,
+                            username: user.username.clone(),
+                        })
+                },
             })
             .collect();
 
+        // Cache with 5-minute TTL (300 seconds)
         let _ = state
             .feed_cache
-            .set_feed(
-                sort,
-                None,
-                page,
-                &cached_items,
-                state.config.feed_cache_ttl_secs,
-            )
+            .set_feed(sort, None, page, &cached_items, 300)
             .await;
     }
 
     Ok(Json(items))
-}
-
-pub async fn like_video(
-    State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
-    Path(video_id): Path<Uuid>,
-) -> ApiResult<StatusCode> {
-    // Transaction to ensure consistency
-    let txn = state.db.begin().await?;
-
-    // Check if already liked
-    let existing = likes::Entity::find()
-        .filter(likes::Column::UserId.eq(user_id))
-        .filter(likes::Column::VideoId.eq(video_id))
-        .one(&txn)
-        .await?;
-
-    if let Some(like) = existing {
-        // Unlike
-        like.delete(&txn).await?;
-
-        // Decrement count atomically
-        if let Some(_v) = videos::Entity::find_by_id(video_id).one(&txn).await? {
-            txn.execute(Statement::from_sql_and_values(
-                DbBackend::Postgres,
-                r#"UPDATE "videos" SET "like_count" = "like_count" - 1 WHERE "id" = $1"#,
-                [video_id.into()],
-            ))
-            .await?;
-        }
-    } else {
-        // Like
-        let new_like = likes::ActiveModel {
-            user_id: Set(user_id),
-            video_id: Set(video_id),
-            created_at: Set(Utc::now().into()),
-        };
-        new_like.insert(&txn).await?;
-
-        txn.execute(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            r#"UPDATE "videos" SET "like_count" = "like_count" + 1 WHERE "id" = $1"#,
-            [video_id.into()],
-        ))
-        .await?;
-    }
-
-    txn.commit().await?;
-
-    Ok(StatusCode::OK)
 }
 
 pub async fn init_upload(
@@ -236,7 +207,7 @@ pub async fn init_upload(
     // 1. Validate file size
     if payload.size_bytes > state.config.max_file_size_bytes {
         return Err(ApiErrorResponse::bad_request(format!(
-            "File size exceeds maximum allowed size of {} bytes",
+            "File too large. Max size: {} bytes",
             state.config.max_file_size_bytes
         )));
     }
@@ -374,37 +345,28 @@ pub async fn confirm_upload(
     AuthUser(user_id): AuthUser,
     Path(video_id): Path<Uuid>,
 ) -> ApiResult<StatusCode> {
-    // Use transaction with SELECT FOR UPDATE for idempotency
     let txn = state.db.begin().await?;
 
-    // 1. Fetch Video with lock to prevent concurrent confirmations
+    // 1. SELECT FOR UPDATE for idempotency
     let video = videos::Entity::find_by_id(video_id)
         .filter(videos::Column::UserId.eq(user_id))
-        .lock_exclusive() // SELECT FOR UPDATE
+        .lock_exclusive()
         .one(&txn)
         .await?
-        .ok_or_else(|| ApiErrorResponse::not_found("Video not found"))?;
+        .ok_or_else(|| ApiErrorResponse::not_found("Video not found or not owned by you"))?;
 
-    // 2. Idempotency check - if already processed, return success
+    // 2. Idempot: If already processing/published, return success
     if video.status != "DRAFT" {
         txn.commit().await?;
-        // If already PROCESSING or PUBLISHED, return 202 (idempotent)
-        // If FAILED, return error
-        return if video.status == "FAILED" {
-            Err(ApiErrorResponse::bad_request(
-                "Video processing failed previously",
-            ))
-        } else {
-            Ok(StatusCode::ACCEPTED)
-        };
+        return Ok(StatusCode::ACCEPTED);
     }
 
-    // 3. Check S3
+    // 3. Verify file exists in S3
     let exists = state
         .storage
-        .file_exists(&video.s3_bucket, &video.s3_key)
+        .file_exists(&state.config.minio_bucket_raw, &video.s3_key)
         .await
-        .map_err(|e| ApiErrorResponse::internal_error(format!("Failed to check file: {}", e)))?;
+        .unwrap_or(false);
 
     if !exists {
         txn.rollback().await?;
@@ -441,4 +403,217 @@ pub async fn confirm_upload(
     txn.commit().await?;
 
     Ok(StatusCode::ACCEPTED)
+}
+
+pub async fn like_video(
+    State(state): State<AppState>,
+    AuthUser(user_id): AuthUser,
+    Path(video_id): Path<Uuid>,
+) -> ApiResult<StatusCode> {
+    // Check if video exists and is published
+    let _video = videos::Entity::find_by_id(video_id)
+        .filter(videos::Column::Status.eq("PUBLISHED"))
+        .one(&state.db)
+        .await?
+        .ok_or_else(|| ApiErrorResponse::not_found("Video not found or not published"))?;
+
+    // Try to insert like
+    let like = likes::ActiveModel {
+        user_id: Set(user_id),
+        video_id: Set(video_id),
+        created_at: Set(Utc::now().into()),
+    };
+
+    match like.insert(&state.db).await {
+        Ok(_) => {
+            // Increment like count
+            videos::Entity::update_many()
+                .col_expr(
+                    videos::Column::LikeCount,
+                    sea_orm::sea_query::Expr::col(videos::Column::LikeCount).add(1),
+                )
+                .filter(videos::Column::Id.eq(video_id))
+                .exec(&state.db)
+                .await?;
+
+            Ok(StatusCode::CREATED)
+        }
+        Err(DbErr::RecordNotInserted) | Err(DbErr::Exec(_)) => {
+            // Already liked (duplicate key violation)
+            Ok(StatusCode::OK)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Delete video (soft delete with audit trail)
+pub async fn delete_video(
+    State(state): State<AppState>,
+    AuthUser(user_id): AuthUser,
+    Path(video_id): Path<Uuid>,
+) -> ApiResult<StatusCode> {
+    // Rate limiting for deletion (10/hour per user)
+    let delete_rate_key = format!("delete:{}:hourly", user_id);
+    match state
+        .rate_limiter
+        .check_and_increment(&delete_rate_key, 10, 3600) // 10 deletions per hour
+        .await
+    {
+        Ok(Ok(_)) => {
+            // Within limit, continue
+        }
+        Ok(Err(count)) => {
+            return Err(ApiErrorResponse::too_many_requests(format!(
+                "Deletion rate limit exceeded: {} deletions/hour. Contact support for bulk deletion.",
+                count
+            )));
+        }
+        Err(_) => {
+            // Redis error - fail open
+        }
+    }
+
+    let txn = state.db.begin().await?;
+
+    // 1. Fetch video with ownership verification
+    let video = videos::Entity::find_by_id(video_id)
+        .filter(videos::Column::UserId.eq(user_id))
+        .one(&txn)
+        .await?
+        .ok_or_else(|| ApiErrorResponse::not_found("Video not found or not owned by you"))?;
+
+    // 2. Prevent double-deletion (idempotency)
+    if video.deleted_at.is_some() {
+        txn.commit().await?;
+        return Ok(StatusCode::NO_CONTENT); // Already deleted
+    }
+
+    // 3. Check if video is published (needs cache invalidation)
+    let was_published = video.status == "PUBLISHED";
+
+    // 4. Soft delete
+    let mut active: videos::ActiveModel = video.into();
+    active.deleted_at = Set(Some(Utc::now().into()));
+    active.update(&txn).await?;
+
+    txn.commit().await?;
+
+    // 5. Invalidate feed cache ONLY if video was published
+    if was_published {
+        if let Err(e) = invalidate_feed_cache(&state).await {
+            tracing::warn!("Failed to invalidate feed cache after deletion: {:?}", e);
+            // Don't fail the request - cache will expire naturally
+        }
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Update video metadata (title, description, anonymity)
+pub async fn update_video_metadata(
+    State(state): State<AppState>,
+    AuthUser(user_id): AuthUser,
+    Path(video_id): Path<Uuid>,
+    Json(payload): Json<UpdateVideoRequest>,
+) -> ApiResult<StatusCode> {
+    // Rate limiting for updates (30/hour per user)
+    let update_rate_key = format!("update:{}:hourly", user_id);
+    match state
+        .rate_limiter
+        .check_and_increment(&update_rate_key, 30, 3600) // 30 updates per hour
+        .await
+    {
+        Ok(Ok(_)) => {
+            // Within limit, continue
+        }
+        Ok(Err(count)) => {
+            return Err(ApiErrorResponse::too_many_requests(format!(
+                "Update rate limit exceeded: {} updates/hour",
+                count
+            )));
+        }
+        Err(_) => {
+            // Redis error - fail open
+        }
+    }
+
+    // 1. Validate payload
+    if let Some(ref title) = payload.title {
+        if title.len() > 200 {
+            return Err(ApiErrorResponse::bad_request(
+                "Title too long. Maximum 200 characters.",
+            ));
+        }
+    }
+
+    if let Some(ref description) = payload.description {
+        if description.len() > 2000 {
+            return Err(ApiErrorResponse::bad_request(
+                "Description too long. Maximum 2000 characters.",
+            ));
+        }
+    }
+
+    // 2. Fetch video with ownership verification
+    let video = videos::Entity::find_by_id(video_id)
+        .filter(videos::Column::UserId.eq(user_id))
+        .filter(videos::Column::DeletedAt.is_null()) // Cannot update deleted videos
+        .one(&state.db)
+        .await?
+        .ok_or_else(|| ApiErrorResponse::not_found("Video not found or not owned by you"))?;
+
+    // 3. Check if video is published (needs cache invalidation)
+    let was_published = video.status == "PUBLISHED";
+
+    // 4. Apply updates
+    let mut active: videos::ActiveModel = video.into();
+    let mut has_changes = false;
+
+    if let Some(title) = payload.title {
+        active.title = Set(Some(title));
+        has_changes = true;
+    }
+
+    if let Some(description) = payload.description {
+        active.description = Set(Some(description));
+        has_changes = true;
+    }
+
+    if let Some(is_anonymous) = payload.is_anonymous {
+        active.is_anonymous = Set(is_anonymous);
+        has_changes = true;
+    }
+
+    // Early return if no changes
+    if !has_changes {
+        return Ok(StatusCode::OK);
+    }
+
+    active.updated_at = Set(Utc::now().into());
+    active.update(&state.db).await?;
+
+    // 5. Invalidate feed cache ONLY if video was published
+    if was_published {
+        if let Err(e) = invalidate_feed_cache(&state).await {
+            tracing::warn!("Failed to invalidate feed cache after update: {:?}", e);
+            // Don't fail the request - cache will expire naturally
+        }
+    }
+
+    Ok(StatusCode::OK)
+}
+
+/// Helper function to invalidate all feed cache keys
+async fn invalidate_feed_cache(state: &AppState) -> anyhow::Result<()> {
+    use redis::AsyncCommands;
+
+    let mut conn = state.queue.get_conn().await?;
+    let keys: Vec<String> = conn.keys("feed:*").await?;
+
+    if !keys.is_empty() {
+        let _: () = conn.del(&keys).await?; // Explicit type for never type fallback
+        tracing::info!("Invalidated {} feed cache keys", keys.len());
+    }
+
+    Ok(())
 }

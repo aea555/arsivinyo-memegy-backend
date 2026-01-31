@@ -40,3 +40,5 @@ Dockerfile
 .cargo/
 rust-toolchain.toml
 rust-toolchain
+
+docs/
