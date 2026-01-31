@@ -1,18 +1,24 @@
 use axum::{
-    extract::{Path, State, Query},
-    Json,
+    extract::{Path, Query, State},
     http::StatusCode,
+    Json,
 };
-use redis::AsyncCommands;
+use chrono::Utc;
 use sea_orm::*;
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use uuid::Uuid;
-use chrono::Utc;
-use serde::{Deserialize, Serialize};
 
-use crate::{state::AppState, auth::extractors::AuthUser, error::{ApiResult, ApiErrorResponse}};
-use shared::{entities::{videos, likes}, queue::VideoProcessJob};
 use super::dtos::*;
+use crate::{
+    auth::extractors::AuthUser,
+    error::{ApiErrorResponse, ApiResult},
+    state::AppState,
+};
+use shared::{
+    entities::{likes, videos},
+    queue::VideoProcessJob,
+};
 
 #[derive(Deserialize)]
 pub struct FeedQuery {
@@ -31,14 +37,38 @@ pub struct VideoFeedItem {
 
 pub async fn get_feed(
     State(state): State<AppState>,
+    AuthUser(_user_id): AuthUser,
     Query(query): Query<FeedQuery>,
 ) -> ApiResult<Json<Vec<VideoFeedItem>>> {
     let sort = query.sort.as_deref().unwrap_or("random");
     let page = query.page.unwrap_or(0);
-    let page_size = 20;
+    let page_size = state.config.feed_page_size;
 
-    let mut select = videos::Entity::find()
-        .filter(videos::Column::Status.eq("PUBLISHED"));
+    // Try cache first (skip for random to keep it truly random)
+    if sort != "random" {
+        if let Ok(Some(cached)) = state.feed_cache.get_feed(sort, None, page).await {
+            let base_url = format!(
+                "{}/{}",
+                state.config.minio_endpoint, state.config.minio_bucket_videos
+            );
+
+            let items: Vec<VideoFeedItem> = cached
+                .into_iter()
+                .map(|c| VideoFeedItem {
+                    id: c.id,
+                    title: c.title,
+                    url: format!("{}/{}", base_url, c.url.split('/').last().unwrap_or(&c.url)),
+                    like_count: c.like_count,
+                    created_at: c.created_at,
+                })
+                .collect();
+
+            return Ok(Json(items));
+        }
+    }
+
+    // Cache miss or random - query DB
+    let mut select = videos::Entity::find().filter(videos::Column::Status.eq("PUBLISHED"));
 
     match sort {
         "latest" => {
@@ -48,7 +78,10 @@ pub async fn get_feed(
             select = select.order_by_desc(videos::Column::LikeCount);
         }
         _ => {
-            select = select.order_by(sea_orm::sea_query::Expr::cust("RANDOM()"), sea_orm::Order::Asc);
+            select = select.order_by(
+                sea_orm::sea_query::Expr::cust("RANDOM()"),
+                sea_orm::Order::Asc,
+            );
         }
     }
 
@@ -57,15 +90,47 @@ pub async fn get_feed(
         .fetch_page(page)
         .await?;
 
-    let base_url = format!("{}/{}", state.config.minio_endpoint, state.config.minio_bucket_videos);
+    let base_url = format!(
+        "{}/{}",
+        state.config.minio_endpoint, state.config.minio_bucket_videos
+    );
 
-    let items = videos.into_iter().map(|v| VideoFeedItem {
-        id: v.id,
-        title: v.title,
-        url: format!("{}/{}", base_url, v.s3_key),
-        like_count: v.like_count,
-        created_at: v.created_at,
-    }).collect();
+    let items: Vec<VideoFeedItem> = videos
+        .iter()
+        .map(|v| VideoFeedItem {
+            id: v.id,
+            title: v.title.clone(),
+            url: format!("{}/{}", base_url, v.s3_key),
+            like_count: v.like_count,
+            created_at: v.created_at,
+        })
+        .collect();
+
+    // Update cache (skip random)
+    if sort != "random" && !videos.is_empty() {
+        let cached_items: Vec<_> = videos
+            .into_iter()
+            .map(|v| crate::cache::feed_cache::CachedVideoFeedItem {
+                id: v.id,
+                title: v.title,
+                url: v.s3_key,
+                thumbnail_url: None,
+                like_count: v.like_count,
+                created_at: v.created_at,
+            })
+            .collect();
+
+        let _ = state
+            .feed_cache
+            .set_feed(
+                sort,
+                None,
+                page,
+                &cached_items,
+                state.config.feed_cache_ttl_secs,
+            )
+            .await;
+    }
 
     Ok(Json(items))
 }
@@ -88,14 +153,15 @@ pub async fn like_video(
     if let Some(like) = existing {
         // Unlike
         like.delete(&txn).await?;
-        
+
         // Decrement count atomically
         if let Some(_v) = videos::Entity::find_by_id(video_id).one(&txn).await? {
-             txn.execute(Statement::from_sql_and_values(
-                 DbBackend::Postgres,
-                 r#"UPDATE "videos" SET "like_count" = "like_count" - 1 WHERE "id" = $1"#,
-                 [video_id.into()]
-             )).await?;
+            txn.execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                r#"UPDATE "videos" SET "like_count" = "like_count" - 1 WHERE "id" = $1"#,
+                [video_id.into()],
+            ))
+            .await?;
         }
     } else {
         // Like
@@ -107,10 +173,11 @@ pub async fn like_video(
         new_like.insert(&txn).await?;
 
         txn.execute(Statement::from_sql_and_values(
-             DbBackend::Postgres,
-             r#"UPDATE "videos" SET "like_count" = "like_count" + 1 WHERE "id" = $1"#,
-             [video_id.into()]
-         )).await?;
+            DbBackend::Postgres,
+            r#"UPDATE "videos" SET "like_count" = "like_count" + 1 WHERE "id" = $1"#,
+            [video_id.into()],
+        ))
+        .await?;
     }
 
     txn.commit().await?;
@@ -123,27 +190,31 @@ pub async fn init_upload(
     AuthUser(user_id): AuthUser,
     Json(payload): Json<InitUploadRequest>,
 ) -> ApiResult<Json<InitUploadResponse>> {
-    // 1. Rate Limiting Check
-    let key = format!("rate_limit:upload:{}", user_id);
-    let limit = state.config.limit_upload_bytes_hourly as i64;
-    
-    let mut conn = state.queue.get_conn().await
-        .map_err(|e| ApiErrorResponse::internal_error(format!("Redis connection failed: {}", e)))?;
-    
-    // Check current usage
-    let current_usage: i64 = conn.get(&key).await.unwrap_or(0);
-    
-    if current_usage + payload.size_bytes > limit {
-        return Err(ApiErrorResponse::too_many_requests("Upload rate limit exceeded. Please try again later."));
+    // 1. Validate file size
+    if payload.size_bytes > state.config.max_file_size_bytes {
+        return Err(ApiErrorResponse::bad_request(format!(
+            "File size exceeds maximum allowed size of {} bytes",
+            state.config.max_file_size_bytes
+        )));
     }
 
-    // 2. Create DB Record (DRAFT)
+    // 2. Rate Limiting Check (check only - increment on confirm)
+    let rate_key = crate::services::rate_limiter::RateLimiter::upload_bytes_key(&user_id);
+    let current_usage = state.rate_limiter.get_count(&rate_key).await.unwrap_or(0) as i64;
+
+    if current_usage + payload.size_bytes > state.config.limit_upload_bytes_hourly {
+        return Err(ApiErrorResponse::too_many_requests(
+            "Upload rate limit exceeded. Please try again later.",
+        ));
+    }
+
+    // 3. Create DB Record (DRAFT)
     let video_id = Uuid::new_v4();
     let ext = std::path::Path::new(&payload.filename)
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("bin");
-        
+
     let s3_key = format!("{}/{}.{}", user_id, video_id, ext);
 
     let new_video = videos::ActiveModel {
@@ -162,18 +233,18 @@ pub async fn init_upload(
 
     new_video.insert(&state.db).await?;
 
-    // 3. Generate Presigned URL
-    let upload_url = state.storage
-        .generate_presigned_put(&state.config.minio_bucket_raw, &s3_key, Duration::from_secs(3600))
+    // 4. Generate Presigned URL with configurable expiry
+    let upload_url = state
+        .storage
+        .generate_presigned_put(
+            &state.config.minio_bucket_raw,
+            &s3_key,
+            Duration::from_secs(state.config.presigned_url_expiry_secs),
+        )
         .await
-        .map_err(|e| ApiErrorResponse::internal_error(format!("Failed to generate upload URL: {}", e)))?;
-
-    // 4. Update Rate Limit
-    let _: () = conn.incr(&key, payload.size_bytes).await.unwrap_or(());
-    let ttl: i64 = conn.ttl(&key).await.unwrap_or(-1);
-    if ttl == -1 {
-         let _: () = conn.expire(&key, 3600).await.unwrap_or(());
-    }
+        .map_err(|e| {
+            ApiErrorResponse::internal_error(format!("Failed to generate upload URL: {}", e))
+        })?;
 
     Ok(Json(InitUploadResponse {
         video_id,
@@ -194,11 +265,14 @@ pub async fn confirm_upload(
         .ok_or_else(|| ApiErrorResponse::not_found("Video not found"))?;
 
     if video.status != "DRAFT" {
-        return Err(ApiErrorResponse::bad_request("Video is not in DRAFT status"));
+        return Err(ApiErrorResponse::bad_request(
+            "Video is not in DRAFT status",
+        ));
     }
 
     // 2. Check S3
-    let exists = state.storage
+    let exists = state
+        .storage
         .file_exists(&video.s3_bucket, &video.s3_key)
         .await
         .map_err(|e| ApiErrorResponse::internal_error(format!("Failed to check file: {}", e)))?;
@@ -207,13 +281,20 @@ pub async fn confirm_upload(
         return Err(ApiErrorResponse::bad_request("File not uploaded yet"));
     }
 
-    // 3. Update Status
+    // 3. Increment rate limit (only after verified upload)
+    let rate_key = crate::services::rate_limiter::RateLimiter::upload_bytes_key(&user_id);
+    let _ = state
+        .rate_limiter
+        .increment(&rate_key, state.config.rate_limit_window_secs)
+        .await;
+
+    // 4. Update Status
     let mut active_video: videos::ActiveModel = video.clone().into();
     active_video.status = Set("PROCESSING".to_string());
     active_video.updated_at = Set(Utc::now().into());
     active_video.update(&state.db).await?;
 
-    // 4. Queue Job
+    // 5. Queue Job
     let job = VideoProcessJob {
         video_id,
         user_id,
@@ -221,7 +302,10 @@ pub async fn confirm_upload(
         raw_key: video.s3_key,
     };
 
-    state.queue.push_video_job(job).await
+    state
+        .queue
+        .push_video_job(job)
+        .await
         .map_err(|e| ApiErrorResponse::internal_error(format!("Failed to queue job: {}", e)))?;
 
     Ok(StatusCode::ACCEPTED)

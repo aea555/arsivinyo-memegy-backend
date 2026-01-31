@@ -3,17 +3,20 @@ use axum::{
     response::{IntoResponse, Redirect},
     Json,
 };
+use axum_extra::{
+    extract::cookie::{Cookie, CookieJar, SameSite},
+    headers::{authorization::Bearer, Authorization},
+    TypedHeader,
+};
 use oauth2::{
     basic::BasicClient, AuthUrl, ClientId, ClientSecret, CsrfToken, RedirectUrl, Scope, TokenUrl,
 };
-use axum_extra::{
-    headers::{Authorization, authorization::Bearer}, 
-    TypedHeader,
-    extract::cookie::{Cookie, CookieJar, SameSite},
-};
 
-use crate::{state::AppState, error::{ApiResult, ApiErrorResponse}};
 use super::{dtos::*, service::AuthService};
+use crate::{
+    error::{ApiErrorResponse, ApiResult},
+    state::AppState,
+};
 
 // Helper to build OAuth Client
 fn oauth_client(state: &AppState) -> BasicClient {
@@ -24,8 +27,11 @@ fn oauth_client(state: &AppState) -> BasicClient {
         Some(TokenUrl::new("https://oauth2.googleapis.com/token".to_string()).unwrap()),
     )
     .set_redirect_uri(
-        RedirectUrl::new(format!("{}/auth/google/callback", state.config.oauth_redirect_base_url))
-            .expect("Invalid redirect URL"),
+        RedirectUrl::new(format!(
+            "{}/auth/google/callback",
+            state.config.oauth_redirect_base_url
+        ))
+        .expect("Invalid redirect URL"),
     )
 }
 
@@ -45,7 +51,7 @@ pub async fn google_login(
     cookie.set_path("/");
     cookie.set_http_only(true);
     cookie.set_same_site(SameSite::Lax); // Allow redirect from Google
-    // Set expiry (e.g., 10 minutes)
+                                         // Set expiry (e.g., 10 minutes)
     cookie.set_max_age(time::Duration::minutes(10));
 
     (jar.add(cookie), Redirect::to(auth_url.as_str()))
@@ -57,9 +63,8 @@ pub async fn google_callback(
     Query(query): Query<GoogleCallbackQuery>,
 ) -> ApiResult<(CookieJar, Json<AuthResponse>)> {
     // 1. Verify CSRF Token
-    let stored_state = jar.get("oauth_state")
-        .map(|c| c.value().to_string());
-        
+    let stored_state = jar.get("oauth_state").map(|c| c.value().to_string());
+
     // Clear the cookie regardless of outcome
     let jar = jar.remove(Cookie::from("oauth_state"));
 
@@ -69,22 +74,29 @@ pub async fn google_callback(
         }
         Some(_) => {
             tracing::error!("CSRF state mismatch");
-            return Err(ApiErrorResponse::bad_request("Invalid authentication state"));
+            return Err(ApiErrorResponse::bad_request(
+                "Invalid authentication state",
+            ));
         }
         None => {
             tracing::error!("Missing CSRF state cookie");
-            return Err(ApiErrorResponse::bad_request("Authentication session expired"));
+            return Err(ApiErrorResponse::bad_request(
+                "Authentication session expired",
+            ));
         }
     }
-    
+
     // Use the same redirect URI as in the authorization request
-    let redirect_uri = format!("{}/auth/google/callback", state.config.oauth_redirect_base_url);
+    let redirect_uri = format!(
+        "{}/auth/google/callback",
+        state.config.oauth_redirect_base_url
+    );
 
     let google_user = AuthService::verify_google_code(
         query.code,
         &state.config.google_client_id,
         &state.config.google_client_secret,
-        &redirect_uri
+        &redirect_uri,
     )
     .await
     .map_err(|e| {
@@ -95,7 +107,9 @@ pub async fn google_callback(
     let (access_token, refresh_token, user) = AuthService::login_or_register(
         &state.db,
         google_user,
-        &state.config.jwt_secret
+        &state.config.jwt_secret,
+        state.config.access_token_ttl_secs,
+        state.config.refresh_token_ttl_days,
     )
     .await
     .map_err(|e| {
@@ -103,32 +117,39 @@ pub async fn google_callback(
         ApiErrorResponse::internal_error("Failed to complete authentication")
     })?;
 
-    Ok((jar, Json(AuthResponse {
-        access_token,
-        refresh_token,
-        user: UserDto {
-            id: user.id,
-            username: user.username,
-            email: user.email,
-        },
-    })))
+    Ok((
+        jar,
+        Json(AuthResponse {
+            access_token,
+            refresh_token,
+            user: UserDto {
+                id: user.id,
+                username: user.username,
+                email: user.email,
+            },
+        }),
+    ))
 }
 
 pub async fn refresh_token(
     State(state): State<AppState>,
     Json(payload): Json<RefreshRequest>,
 ) -> ApiResult<Json<RefreshResponse>> {
-    let new_access_token = AuthService::refresh_access_token(
+    let (new_access_token, new_refresh_token) = AuthService::refresh_access_token(
         &state.db,
+        &state.token_revocation,
         &payload.access_token,
         &payload.refresh_token,
-        &state.config.jwt_secret
+        &state.config.jwt_secret,
+        state.config.access_token_ttl_secs,
+        state.config.refresh_token_ttl_days,
     )
     .await
     .map_err(|_| ApiErrorResponse::unauthorized("Invalid or expired tokens"))?;
 
     Ok(Json(RefreshResponse {
         access_token: new_access_token,
+        refresh_token: new_refresh_token,
     }))
 }
 
@@ -137,11 +158,10 @@ pub async fn logout(
     TypedHeader(auth): TypedHeader<Authorization<Bearer>>,
 ) -> ApiResult<()> {
     let token = auth.token();
-    let user_id = AuthService::get_user_id_from_expired_token(token, &state.config.jwt_secret)
+    let claims = AuthService::get_claims_from_token(token, &state.config.jwt_secret)
         .map_err(|_| ApiErrorResponse::unauthorized("Invalid token"))?;
 
-    AuthService::logout_all(&state.db, user_id)
-        .await?;
+    AuthService::logout_all(&state.db, claims.sub).await?;
 
     Ok(())
 }
@@ -158,16 +178,16 @@ pub async fn dev_login(
         return Err(ApiErrorResponse::not_found("Endpoint not available"));
     }
 
+    use chrono::{Duration, Utc};
     use sea_orm::*;
+    use shared::entities::refresh_tokens;
     use shared::entities::users;
     use shared::security::{create_access_token, generate_refresh_token, hash_token};
-    use shared::entities::refresh_tokens;
-    use chrono::{Duration, Utc};
     use uuid::Uuid;
 
     // Create or find dev user
     let google_id = format!("dev_{}", payload.email);
-    
+
     let user = users::Entity::find()
         .filter(users::Column::GoogleId.eq(&google_id))
         .one(&state.db)
@@ -187,12 +207,16 @@ pub async fn dev_login(
         }
     };
 
-    let access_token = create_access_token(user.id, &state.config.jwt_secret)?;
+    let access_token = create_access_token(
+        user.id,
+        &state.config.jwt_secret,
+        state.config.access_token_ttl_secs,
+    )?;
     let refresh_token = generate_refresh_token();
     let refresh_token_hash = hash_token(&refresh_token)?;
 
     let expires_at = Utc::now() + Duration::days(14);
-    
+
     let rt_model = refresh_tokens::ActiveModel {
         id: Set(Uuid::new_v4()),
         user_id: Set(user.id),

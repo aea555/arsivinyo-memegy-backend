@@ -35,11 +35,10 @@ pub fn verify_token_hash(token: &str, hash: &str) -> bool {
         .is_ok()
 }
 
-pub fn create_access_token(user_id: Uuid, secret: &str) -> Result<String> {
+pub fn create_access_token(user_id: Uuid, secret: &str, ttl_secs: usize) -> Result<String> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as usize;
 
-    // 15 Minutes TTL
-    let exp = now + (15 * 60);
+    let exp = now + ttl_secs;
 
     let claims = Claims {
         sub: user_id,

@@ -1,4 +1,5 @@
 pub mod dtos;
-pub mod handlers;
-pub mod service;
 pub mod extractors;
+pub mod handlers;
+pub mod revocation;
+pub mod service;

@@ -30,6 +30,7 @@ pub struct RefreshRequest {
 #[derive(Serialize)]
 pub struct RefreshResponse {
     pub access_token: String,
+    pub refresh_token: String,
 }
 
 #[derive(Deserialize)]
