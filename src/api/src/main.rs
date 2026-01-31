@@ -1,6 +1,7 @@
 mod auth;
 mod cache;
 mod error;
+mod middleware;
 mod services;
 mod state;
 mod videos;

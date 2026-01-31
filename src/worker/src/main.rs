@@ -40,13 +40,57 @@ async fn main() -> Result<()> {
         match queue.pop_video_job().await {
             Ok(Some(job)) => {
                 tracing::info!("Processing job: {:?}", job);
-                if let Err(e) = process_video(&db, &storage, &queue, &config, &job).await {
-                    tracing::error!("Failed to process video {}: {:?}", job.video_id, e);
-                    // Update status to FAILED
+
+                // Retry logic with exponential backoff
+                let mut attempt = 1;
+                let mut last_error = None;
+
+                while attempt <= config.worker_retry_max_attempts {
+                    match process_video(&db, &storage, &queue, &config, &job).await {
+                        Ok(()) => {
+                            tracing::info!(
+                                "Video {} processed successfully on attempt {}",
+                                job.video_id,
+                                attempt
+                            );
+                            break; // Success!
+                        }
+                        Err(e) => {
+                            last_error = Some(e);
+                            if attempt < config.worker_retry_max_attempts {
+                                let backoff_secs = config.worker_retry_backoff_base_secs
+                                    * (2_u64.pow(attempt as u32 - 1));
+                                tracing::warn!(
+                                    "Failed to process video {} (attempt {}/{}): {:?}. Retrying in {}s",
+                                    job.video_id, attempt, config.worker_retry_max_attempts, last_error, backoff_secs
+                                );
+                                tokio::time::sleep(std::time::Duration::from_secs(backoff_secs))
+                                    .await;
+                                attempt += 1;
+                            } else {
+                                tracing::error!(
+                                    "Failed to process video {} after {} attempts: {:?}",
+                                    job.video_id,
+                                    config.worker_retry_max_attempts,
+                                    last_error
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // If all retries failed update status to FAILED
+                if let Some(err) = last_error {
                     if let Ok(Some(v)) = videos::Entity::find_by_id(job.video_id).one(&db).await {
                         let mut active: videos::ActiveModel = v.into();
                         active.status = Set("FAILED".to_string());
                         let _ = active.update(&db).await;
+                        tracing::error!(
+                            "Marked video {} as FAILED after exhausting retries: {:?}",
+                            job.video_id,
+                            err
+                        );
                     }
                 }
             }

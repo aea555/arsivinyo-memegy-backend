@@ -37,9 +37,30 @@ pub struct VideoFeedItem {
 
 pub async fn get_feed(
     State(state): State<AppState>,
-    AuthUser(_user_id): AuthUser,
+    AuthUser(user_id): AuthUser,
     Query(query): Query<FeedQuery>,
 ) -> ApiResult<Json<Vec<VideoFeedItem>>> {
+    // Rate limiting for feed access
+    let feed_rate_key = crate::services::rate_limiter::RateLimiter::feed_rpm_key(&user_id);
+    match state
+        .rate_limiter
+        .check_and_increment(
+            &feed_rate_key,
+            state.config.limit_feed_rpm,
+            60, // 1 minute window for RPM
+        )
+        .await
+    {
+        Ok(Ok(_remaining)) => {} // Within limit
+        Ok(Err(count)) => {
+            return Err(ApiErrorResponse::too_many_requests(format!(
+                "Feed rate limit exceeded ({} requests/minute)",
+                count
+            )));
+        }
+        Err(_) => {} // Redis error, fail open
+    }
+
     let sort = query.sort.as_deref().unwrap_or("random");
     let page = query.page.unwrap_or(0);
     let page_size = state.config.feed_page_size;
@@ -257,20 +278,32 @@ pub async fn confirm_upload(
     AuthUser(user_id): AuthUser,
     Path(video_id): Path<Uuid>,
 ) -> ApiResult<StatusCode> {
-    // 1. Fetch Video
+    // Use transaction with SELECT FOR UPDATE for idempotency
+    let txn = state.db.begin().await?;
+
+    // 1. Fetch Video with lock to prevent concurrent confirmations
     let video = videos::Entity::find_by_id(video_id)
         .filter(videos::Column::UserId.eq(user_id))
-        .one(&state.db)
+        .lock_exclusive() // SELECT FOR UPDATE
+        .one(&txn)
         .await?
         .ok_or_else(|| ApiErrorResponse::not_found("Video not found"))?;
 
+    // 2. Idempotency check - if already processed, return success
     if video.status != "DRAFT" {
-        return Err(ApiErrorResponse::bad_request(
-            "Video is not in DRAFT status",
-        ));
+        txn.commit().await?;
+        // If already PROCESSING or PUBLISHED, return 202 (idempotent)
+        // If FAILED, return error
+        return if video.status == "FAILED" {
+            Err(ApiErrorResponse::bad_request(
+                "Video processing failed previously",
+            ))
+        } else {
+            Ok(StatusCode::ACCEPTED)
+        };
     }
 
-    // 2. Check S3
+    // 3. Check S3
     let exists = state
         .storage
         .file_exists(&video.s3_bucket, &video.s3_key)
@@ -278,23 +311,24 @@ pub async fn confirm_upload(
         .map_err(|e| ApiErrorResponse::internal_error(format!("Failed to check file: {}", e)))?;
 
     if !exists {
+        txn.rollback().await?;
         return Err(ApiErrorResponse::bad_request("File not uploaded yet"));
     }
 
-    // 3. Increment rate limit (only after verified upload)
+    // 4. Increment rate limit (only after verified upload)
     let rate_key = crate::services::rate_limiter::RateLimiter::upload_bytes_key(&user_id);
     let _ = state
         .rate_limiter
         .increment(&rate_key, state.config.rate_limit_window_secs)
         .await;
 
-    // 4. Update Status
+    // 5. Update Status
     let mut active_video: videos::ActiveModel = video.clone().into();
     active_video.status = Set("PROCESSING".to_string());
     active_video.updated_at = Set(Utc::now().into());
-    active_video.update(&state.db).await?;
+    active_video.update(&txn).await?;
 
-    // 5. Queue Job
+    // 6. Queue Job
     let job = VideoProcessJob {
         video_id,
         user_id,
@@ -302,11 +336,13 @@ pub async fn confirm_upload(
         raw_key: video.s3_key,
     };
 
-    state
-        .queue
-        .push_video_job(job)
-        .await
-        .map_err(|e| ApiErrorResponse::internal_error(format!("Failed to queue job: {}", e)))?;
+    state.queue.push_video_job(job).await.map_err(|e| {
+        // Job queue failure - don't commit transaction
+        ApiErrorResponse::internal_error(format!("Failed to queue job: {}", e))
+    })?;
+
+    // Commit transaction
+    txn.commit().await?;
 
     Ok(StatusCode::ACCEPTED)
 }
