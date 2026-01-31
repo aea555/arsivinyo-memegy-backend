@@ -109,6 +109,7 @@ impl FeedCacheService {
     }
 
     /// Invalidate all feed caches (call when video published/deleted)
+    #[allow(dead_code)]
     pub async fn invalidate_all(&self) -> Result<()> {
         match self.queue.get_conn().await {
             Ok(mut conn) => {

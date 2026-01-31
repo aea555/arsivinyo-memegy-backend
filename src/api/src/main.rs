@@ -159,6 +159,10 @@ async fn main() -> anyhow::Result<()> {
             get(videos::handlers::get_bulk_download_status),
         )
         .layer(cors)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            middleware::ip_rate_limit::ip_rate_limit,
+        ))
         .with_state(state.clone());
 
     // 9. Server
