@@ -11,6 +11,8 @@ pub struct Model {
     pub google_id: String,
     pub username: String,
     pub email: String,
+    pub avatar_url: Option<String>,
+    pub deleted_at: Option<DateTimeWithTimeZone>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
 }

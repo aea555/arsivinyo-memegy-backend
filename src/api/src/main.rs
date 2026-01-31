@@ -4,13 +4,14 @@ mod error;
 mod middleware;
 mod services;
 mod state;
+mod users;
 mod videos;
 
 use auth::revocation::TokenRevocationService;
 use axum::{
     http::StatusCode,
     response::{Html, IntoResponse},
-    routing::{delete, get, patch, post},
+    routing::{get, post},
     Router,
 };
 use cache::feed_cache::FeedCacheService;
@@ -67,7 +68,7 @@ async fn main() -> anyhow::Result<()> {
     // 6. State
     let state = AppState {
         db,
-        config: Arc::new(config),
+        config: Arc::new(config.clone()),
         storage,
         queue,
         token_revocation,
@@ -125,39 +126,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/auth/refresh", post(auth::handlers::refresh_token))
         .route("/auth/logout", post(auth::handlers::logout))
         .route("/auth/dev/login", post(auth::handlers::dev_login))
-        .route("/videos/init", post(videos::handlers::init_upload))
-        .route(
-            "/videos/init/anonymous",
-            post(videos::handlers::init_anonymous_upload),
-        )
-        .route(
-            "/videos/:id/confirm",
-            post(videos::handlers::confirm_upload),
-        )
-        .route("/videos/:id/like", post(videos::handlers::like_video))
-        .route(
-            "/videos/:id/download",
-            get(videos::handlers::download_video),
-        )
-        .route(
-            "/videos/:id/download/refresh",
-            get(videos::handlers::refresh_download_url),
-        )
-        .route("/videos/:id", delete(videos::handlers::delete_video))
-        .route(
-            "/videos/:id",
-            patch(videos::handlers::update_video_metadata),
-        )
-        .route("/feed", get(videos::handlers::get_feed))
-        .route("/videos/search", get(videos::handlers::search_videos))
-        .route(
-            "/videos/download/bulk",
-            post(videos::handlers::create_bulk_download),
-        )
-        .route(
-            "/videos/download/bulk/:id",
-            get(videos::handlers::get_bulk_download_status),
-        )
+        .merge(videos::router::videos_router(&config))
+        .nest("/users", users::router::users_router(&config))
         .layer(cors)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

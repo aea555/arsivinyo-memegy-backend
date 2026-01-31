@@ -126,6 +126,7 @@ pub async fn google_callback(
                 id: user.id,
                 username: user.username,
                 email: user.email,
+                avatar_url: user.avatar_url,
             },
         }),
     ))
@@ -234,6 +235,7 @@ pub async fn dev_login(
             id: user.id,
             username: user.username,
             email: user.email,
+            avatar_url: user.avatar_url,
         },
     }))
 }

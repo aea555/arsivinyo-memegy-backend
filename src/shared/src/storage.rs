@@ -39,6 +39,16 @@ impl StorageService {
         Self { client }
     }
 
+    pub async fn delete_file(&self, bucket: &str, key: &str) -> Result<()> {
+        self.client
+            .delete_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await?;
+        Ok(())
+    }
+
     pub async fn generate_presigned_put(
         &self,
         bucket: &str,

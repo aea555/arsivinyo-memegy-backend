@@ -36,6 +36,8 @@ tags:
     description: Video upload and management
   - name: Feed
     description: Video discovery and social features
+  - name: Users
+    description: User profile and account management
 
 components:
   securitySchemes:
@@ -87,6 +89,11 @@ components:
           type: string
           format: email
           example: john@example.com
+        avatar_url:
+          type: string
+          format: uri
+          nullable: true
+          example: https://lh3.googleusercontent.com/a/ACg8oc...
       required:
         - id
         - username
@@ -238,6 +245,18 @@ components:
       required:
         - download_url
         - expires_in_seconds
+
+    BulkDeleteRequest:
+      type: object
+      properties:
+        video_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: List of video IDs to delete
+      required:
+        - video_ids
 
   responses:
     UnauthorizedError:
@@ -1050,5 +1069,105 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /users/me:
+    get:
+      tags:
+        - Users
+      summary: Get user profile
+      description: Retrieve the authenticated user's profile information.
+      operationId: getMyProfile
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: User profile retrieved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserDto"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+    delete:
+      tags:
+        - Users
+      summary: Delete account (Soft delete)
+      description: |
+        Soft-delete the authenticated user's account.
+        - Marks user as deleted (`deleted_at`).
+        - Revokes all tokens.
+        - Hides all user content.
+        - Hard deletion occurs after 30 days.
+      operationId: deleteAccount
+      security:
+        - BearerAuth: []
+      responses:
+        "204":
+          description: Account scheduled for deletion
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /users/me/videos:
+    get:
+      tags:
+        - Users
+      summary: Get my videos
+      description: Retrieve a paginated list of videos uploaded by the authenticated user (excluding deleted ones).
+      operationId: getMyVideos
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 0
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 20
+      responses:
+        "200":
+          description: List of user videos
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/VideoFeedItem"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /videos/bulk-delete:
+    post:
+      tags:
+        - Videos
+      summary: Bulk delete videos
+      description: Soft-delete multiple videos owned by the authenticated user.
+      operationId: bulkDeleteVideos
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BulkDeleteRequest"
+      responses:
+        "200":
+          description: Videos deleted successfully
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
         "500":
           $ref: "#/components/responses/InternalServerError"

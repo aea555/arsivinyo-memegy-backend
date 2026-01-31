@@ -8,6 +8,7 @@ mod m20260131_000002_add_anonymous_videos;
 mod m20260131_000003_add_soft_delete;
 mod m20260131_175303_create_download_jobs;
 mod m20260131_210000_add_fulltext_search;
+mod m20260201_000001_add_user_deletion_and_avatar;
 
 pub struct Migrator;
 
@@ -23,6 +24,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260131_000003_add_soft_delete::Migration),
             Box::new(m20260131_175303_create_download_jobs::Migration),
             Box::new(m20260131_210000_add_fulltext_search::Migration),
+            Box::new(m20260201_000001_add_user_deletion_and_avatar::Migration),
         ]
     }
 }

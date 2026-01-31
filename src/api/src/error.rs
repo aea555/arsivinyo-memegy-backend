@@ -88,6 +88,10 @@ impl ApiErrorResponse {
     pub fn internal_error(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, message)
     }
+
+    pub fn db_error(err: sea_orm::DbErr) -> Self {
+        err.into()
+    }
 }
 
 impl IntoResponse for ApiErrorResponse {

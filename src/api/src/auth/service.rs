@@ -16,8 +16,7 @@ pub struct GoogleUserResult {
     pub email: String,
     pub verified_email: bool,
     pub name: String,
-    #[serde(rename = "picture")]
-    pub _picture: String,
+    pub picture: String,
 }
 
 pub struct AuthService;
@@ -115,13 +114,30 @@ impl AuthService {
             .await?;
 
         let user = match user {
-            Some(u) => u,
+            Some(u) => {
+                let mut active_model: users::ActiveModel = u.into();
+
+                // Account Recovery Logic: If deleted, reactivate
+                if active_model.deleted_at.as_ref().is_some() {
+                    tracing::info!(
+                        "Recovering soft-deleted account: {}",
+                        active_model.id.as_ref()
+                    );
+                    active_model.deleted_at = Set(None);
+                }
+
+                // Update immutable fields from Google (e.g. avatar might change)
+                active_model.avatar_url = Set(Some(google_user.picture));
+
+                active_model.update(db).await?
+            }
             None => {
                 let new_user = users::ActiveModel {
                     id: Set(Uuid::new_v4()),
                     google_id: Set(google_user.id),
-                    username: Set(google_user.name), // Basic username mapping
+                    username: Set(google_user.name),
                     email: Set(google_user.email),
+                    avatar_url: Set(Some(google_user.picture)),
                     ..Default::default()
                 };
                 new_user.insert(db).await?

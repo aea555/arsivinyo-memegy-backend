@@ -92,3 +92,8 @@ fn default_limit() -> u64 {
 fn default_sort() -> String {
     "relevance".to_string()
 }
+
+#[derive(Deserialize)]
+pub struct BulkDeleteRequest {
+    pub video_ids: Vec<Uuid>,
+}

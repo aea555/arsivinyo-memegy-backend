@@ -15,6 +15,9 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 mod bulk_download;
 use bulk_download::BulkDownloadWorker;
 
+mod account_cleanup;
+use account_cleanup::AccountCleanupWorker;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // 1. Logging
@@ -57,6 +60,15 @@ async fn main() -> Result<()> {
             if let Err(e) = cleanup_worker.cleanup_stale_jobs().await {
                 tracing::error!("Cleanup task error: {:?}", e);
             }
+        }
+    });
+
+    // 7. Account Cleanup Task
+    let account_cleaner = AccountCleanupWorker::new(db.clone(), storage.clone(), config.clone());
+
+    tokio::spawn(async move {
+        if let Err(e) = account_cleaner.run().await {
+            tracing::error!("Account cleanup worker error: {:?}", e);
         }
     });
 
