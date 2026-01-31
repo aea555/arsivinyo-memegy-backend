@@ -757,3 +757,298 @@ paths:
                   $ref: "#/components/schemas/VideoFeedItem"
         "500":
           $ref: "#/components/responses/InternalServerError"
+
+  /videos/search:
+    get:
+      tags:
+        - Videos
+      summary: Search videos
+      description: |
+        Full-text search using PostgreSQL FTS with multiple sort options.
+        Supports pagination and relevance ranking.
+      operationId: searchVideos
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: q
+          in: query
+          required: true
+          description: Search query (max 200 characters)
+          schema:
+            type: string
+            maxLength: 200
+            example: "funny cat"
+        - name: limit
+          in: query
+          required: false
+          description: "Max results per page (default: 20, max: 100)"
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: offset
+          in: query
+          required: false
+          description: Pagination offset
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: sort
+          in: query
+          required: false
+          description: Sort mode
+          schema:
+            type: string
+            enum:
+              - relevance
+              - recent
+              - popular
+            default: relevance
+      responses:
+        "200":
+          description: Search results
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/VideoFeedItem"
+        "400":
+          description: Invalid query parameters
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          description: Rate limit exceeded (30 searches/min)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /videos/{id}/download:
+    get:
+      tags:
+        - Videos
+      summary: Download video
+      description: |
+        Redirects to a presigned S3 URL (60s TTL) for video download.
+        Rate limits: 30/min +  500MB/hour bandwidth.
+      operationId: downloadVideo
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "302":
+          description: Redirect to presigned S3 URL
+          headers:
+            Location:
+              schema:
+                type: string
+                format: uri
+        "404":
+          description: Video not found or deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /videos/{id}/download/refresh:
+    get:
+      tags:
+        - Videos
+      summary: Refresh download URL
+      description: |
+        Generate a new presigned URL for an expired download link.
+        Rate limit: 10/min (higher than regular download).
+      operationId: refreshDownloadUrl
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: New presigned URL generated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  download_url:
+                    type: string
+                    format: uri
+                  expires_in_seconds:
+                    type: integer
+                    example: 60
+        "404":
+          description: Video not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          description: Rate limit exceeded (10/min)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /videos/download/bulk:
+    post:
+      tags:
+        - Videos
+      summary: Create bulk download job
+      description: |
+        Creates a background job to ZIP up to 10 videos.
+        Supports idempotency keys. Rate limits: 3 active jobs + 10 jobs/day.
+      operationId: createBulkDownload
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                video_ids:
+                  type: array
+                  items:
+                    type: string
+                    format: uuid
+                  minItems: 1
+                  maxItems: 10
+                idempotency_key:
+                  type: string
+                  description: Optional key to prevent duplicate jobs (auto-generated if omitted)
+              required:
+                - video_ids
+      responses:
+        "202":
+          description: Job created successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job_id:
+                    type: string
+                    format: uuid
+                  status:
+                    type: string
+                    enum: [PENDING, PROCESSING, COMPLETED, FAILED]
+                  video_count:
+                    type: integer
+                  created_at:
+                    type: string
+                    format: date-time
+                  expires_at:
+                    type: string
+                    format: date-time
+        "400":
+          description: Invalid request (too many videos, missing videos, etc.)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /videos/download/bulk/{id}:
+    get:
+      tags:
+        - Videos
+      summary: Get bulk download job status
+      description: |
+        Check the status of a bulk download job. Returns download URL when COMPLETED.
+      operationId: getBulkDownloadStatus
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Job status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job_id:
+                    type: string
+                    format: uuid
+                  status:
+                    type: string
+                    enum: [PENDING, PROCESSING, COMPLETED, FAILED]
+                  video_ids:
+                    type: array
+                    items:
+                      type: string
+                      format: uuid
+                  download_url:
+                    type: string
+                    format: uri
+                    description: Only present when status is COMPLETED
+                  zip_size_bytes:
+                    type: integer
+                    format: int64
+                    description: Only present when status is COMPLETED
+                  error_message:
+                    type: string
+                    description: Only present when status is FAILED
+                  completed_at:
+                    type: string
+                    format: date-time
+                    description: Only present when status is COMPLETED or FAILED
+                  expires_at:
+                    type: string
+                    format: date-time
+                  retry_count:
+                    type: integer
+                  created_at:
+                    type: string
+                    format: date-time
+        "404":
+          description: Job not found or not owned by user
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalServerError"

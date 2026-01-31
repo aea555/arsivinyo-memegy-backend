@@ -26,7 +26,7 @@ pub struct FeedQuery {
     pub page: Option<u64>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct VideoFeedItem {
     pub id: Uuid,
     pub title: Option<String>,
@@ -37,7 +37,7 @@ pub struct VideoFeedItem {
     pub uploader: Option<UploaderInfo>, // None if video is anonymous
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct UploaderInfo {
     pub id: Uuid,
     pub username: String,
@@ -1060,25 +1060,170 @@ pub async fn get_bulk_download_status(
 }
 
 // ============================================================================
-// SEARCH ENDPOINT
+// SEARCH ENDPOINT - PRODUCTION HARDENED
 // ============================================================================
 
+/// Search configuration parameters for validation
+#[derive(Clone, Copy)]
+pub struct SearchConfig {
+    pub max_tokens: usize,
+    pub max_token_length: usize,
+    pub max_query_chars: usize,
+    pub timeout_secs: u64,
+    pub cache_ttl_secs: usize,
+    pub rpm_limit: u64,
+}
+
+impl SearchConfig {
+    /// Create SearchConfig from shared::Config
+    pub fn from_config(config: &shared::config::Config) -> Self {
+        Self {
+            max_tokens: config.search_max_tokens,
+            max_token_length: config.search_max_token_length,
+            max_query_chars: config.search_max_query_chars,
+            timeout_secs: config.search_timeout_secs,
+            cache_ttl_secs: config.search_cache_ttl_secs,
+            rpm_limit: config.search_rpm_limit,
+        }
+    }
+}
+
+/// Validates search query complexity to prevent ReDoS attacks
+fn validate_search_query(query: &str, config: &SearchConfig) -> Result<String, ApiErrorResponse> {
+    // 1. Remove control characters and normalize whitespace
+    let normalized: String = query
+        .chars()
+        .filter(|c| !c.is_control() || *c == ' ')
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    // 2. Check if empty after normalization
+    if normalized.is_empty() {
+        return Err(ApiErrorResponse::bad_request("Query cannot be empty"));
+    }
+
+    // 3. Character count limit (Unicode-aware)
+    if normalized.chars().count() > config.max_query_chars {
+        return Err(ApiErrorResponse::bad_request(format!(
+            "Query too long (max {} characters)",
+            config.max_query_chars
+        )));
+    }
+
+    // 4. Token count limit (ReDoS protection)
+    let tokens: Vec<&str> = normalized.split_whitespace().collect();
+    if tokens.len() > config.max_tokens {
+        return Err(ApiErrorResponse::bad_request(format!(
+            "Too many search terms (max {})",
+            config.max_tokens
+        )));
+    }
+
+    // 5. Individual token length limit
+    for token in &tokens {
+        if token.chars().count() > config.max_token_length {
+            return Err(ApiErrorResponse::bad_request(format!(
+                "Search term too long (max {} characters per word)",
+                config.max_token_length
+            )));
+        }
+    }
+
+    Ok(normalized)
+}
+
+/// Logs suspicious search queries for security monitoring
+fn log_suspicious_query(user_id: Uuid, query: &str, reason: &str) {
+    tracing::warn!(
+        security = "suspicious_search",
+        user_id = %user_id,
+        query_length = query.len(),
+        query_preview = &query[..query.len().min(50)],
+        reason = reason,
+        "Suspicious search query detected"
+    );
+}
+
+/// Track search analytics in Redis
+async fn track_search_analytics(
+    queue: &shared::queue::QueueService,
+    user_id: Uuid,
+    query: &str,
+    result_count: usize,
+    cache_hit: bool,
+    duration_ms: u64,
+) {
+    if let Ok(mut conn) = queue.get_conn().await {
+        // Track popular queries (global)
+        let _: Result<(), redis::RedisError> = redis::cmd("ZINCRBY")
+            .arg("search:popular_queries")
+            .arg(1)
+            .arg(query.to_lowercase())
+            .query_async(&mut conn)
+            .await;
+
+        // Track per-user query count (for abuse detection)
+        let user_key = format!("search:user:{}:count", user_id);
+        let _: Result<(), redis::RedisError> = redis::cmd("INCR")
+            .arg(&user_key)
+            .query_async(&mut conn)
+            .await;
+        let _: Result<(), redis::RedisError> = redis::cmd("EXPIRE")
+            .arg(&user_key)
+            .arg(3600) // 1 hour window
+            .query_async(&mut conn)
+            .await;
+
+        // Log search metrics
+        tracing::info!(
+            event = "search_executed",
+            user_id = %user_id,
+            query_len = query.len(),
+            result_count = result_count,
+            cache_hit = cache_hit,
+            duration_ms = duration_ms,
+            "Search completed"
+        );
+    }
+}
+
 /// Search videos using PostgreSQL full-text search
+///
+/// Security features:
+/// - Query complexity validation (ReDoS protection)
+/// - Input normalization (control chars removed)
+/// - User-scoped cache (cache poisoning prevention)
+/// - Query timeout (resource exhaustion protection)
+/// - Rate limiting before cache (bypass prevention)
+/// - Suspicious query logging (abuse detection)
+/// - Analytics tracking (pattern analysis)
 pub async fn search_videos(
     State(state): State<AppState>,
     AuthUser(user_id): AuthUser,
     Query(params): Query<SearchVideosQuery>,
 ) -> ApiResult<Json<Vec<VideoFeedItem>>> {
-    use shared::entities::videos;
+    let start_time = std::time::Instant::now();
+    let search_config = SearchConfig::from_config(&state.config);
 
-    // 1. Rate limiting (30 searches/min)
+    // 1. RATE LIMITING (BEFORE cache - prevents bypass attacks)
     let search_key = format!("search:{}:rpm", user_id);
-    match state.rate_limiter.check_rate(&search_key, 30).await {
+    match state
+        .rate_limiter
+        .check_rate(&search_key, search_config.rpm_limit)
+        .await
+    {
         Ok(Ok(_remaining)) => {}
         Ok(Err(current)) => {
+            log_suspicious_query(
+                user_id,
+                &params.q,
+                &format!("rate_limit_exceeded:{}", current),
+            );
             return Err(ApiErrorResponse::too_many_requests(format!(
-                "Search rate limit exceeded (30 searches/minute). Current: {}",
-                current
+                "Search rate limit exceeded ({} searches/minute). Current: {}",
+                search_config.rpm_limit, current
             )));
         }
         Err(e) => {
@@ -1087,90 +1232,118 @@ pub async fn search_videos(
         }
     }
 
-    // 2. Validate & sanitize query
-    let query = params.q.trim();
-    if query.is_empty() {
-        return Err(ApiErrorResponse::bad_request("Query cannot be empty"));
-    }
-    if query.len() > 200 {
-        return Err(ApiErrorResponse::bad_request(
-            "Query too long (max 200 characters)",
-        ));
-    }
+    // 2. VALIDATE & NORMALIZE QUERY (ReDoS protection)
+    let query = validate_search_query(&params.q, &search_config)?;
 
-    // Sanitize for tsquery (remove special chars, escape quotes)
-    let sanitized_query = query
-        .replace(
-            &['\'', '"', '\\', '&', '|', '!', '(', ')', '<', '>', ':', '*'][..],
-            " ",
-        )
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" & ");
-
-    if sanitized_query.is_empty() {
-        return Err(ApiErrorResponse::bad_request("Invalid search query"));
+    // 3. Security logging for suspicious patterns
+    let token_count = query.split_whitespace().count();
+    if query.len() > 150 || token_count > 30 {
+        log_suspicious_query(
+            user_id,
+            &query,
+            &format!("high_complexity:len={},tokens={}", query.len(), token_count),
+        );
     }
 
-    // 3. Build query with FTS
-    let limit = params.limit.min(100); // Cap at 100
+    // 4. CACHE CHECK with user_id (prevents cache poisoning)
+    let limit = params.limit.min(100);
     let offset = params.offset;
+    let cache_key = format!(
+        "search:cache:{}:{}:{}:{}:{}",
+        user_id, // CRITICAL: User-scoped cache
+        query.to_lowercase(),
+        params.sort,
+        limit,
+        offset
+    );
 
-    // Execute raw SQL for FTS (SeaORM doesn't support ts_rank directly)
+    // Try cache AFTER rate limiting (prevents rate limit bypass)
+    if let Ok(mut redis_conn) = state.queue.get_conn().await {
+        if let Ok(cached_json) = redis::cmd("GET")
+            .arg(&cache_key)
+            .query_async::<String>(&mut redis_conn)
+            .await
+        {
+            if let Ok(results) = serde_json::from_str::<Vec<VideoFeedItem>>(&cached_json) {
+                let duration_ms = start_time.elapsed().as_millis() as u64;
+                track_search_analytics(
+                    &state.queue,
+                    user_id,
+                    &query,
+                    results.len(),
+                    true, // cache hit
+                    duration_ms,
+                )
+                .await;
+                return Ok(Json(results));
+            }
+        }
+    }
+
+    // 5. BUILD SQL with parameterized queries
     let sql = match params.sort.as_str() {
-        "recent" => format!(
+        "recent" => {
             r#"
             SELECT id, user_id, title, description, s3_bucket, s3_key, status, size_bytes, like_count, is_anonymous, created_at, updated_at
             FROM videos
-            WHERE search_vector @@ to_tsquery('english', '{}')
+            WHERE search_vector @@ plainto_tsquery('english', $1)
             AND deleted_at IS NULL
             AND status = 'PUBLISHED'
             ORDER BY created_at DESC
-            LIMIT {} OFFSET {}
-            "#,
-            sanitized_query, limit, offset
-        ),
-        "popular" => format!(
+            LIMIT $2 OFFSET $3
+            "#
+        }
+        "popular" => {
             r#"
             SELECT id, user_id, title, description, s3_bucket, s3_key, status, size_bytes, like_count, is_anonymous, created_at, updated_at
             FROM videos
-            WHERE search_vector @@ to_tsquery('english', '{}')
+            WHERE search_vector @@ plainto_tsquery('english', $1)
             AND deleted_at IS NULL
             AND status = 'PUBLISHED'
             ORDER BY like_count DESC, created_at DESC
-            LIMIT {} OFFSET {}
-            "#,
-            sanitized_query, limit, offset
-        ),
-        _ => format!(
-            // "relevance" (default)
+            LIMIT $2 OFFSET $3
+            "#
+        }
+        _ => {
             r#"
             SELECT id, user_id, title, description, s3_bucket, s3_key, status, size_bytes, like_count, is_anonymous, created_at, updated_at,
-                   ts_rank(search_vector, to_tsquery('english', '{}')) as rank
+                   ts_rank(search_vector, plainto_tsquery('english', $1)) as rank
             FROM videos
-            WHERE search_vector @@ to_tsquery('english', '{}')
+            WHERE search_vector @@ plainto_tsquery('english', $1)
             AND deleted_at IS NULL
             AND status = 'PUBLISHED'
             ORDER BY rank DESC, like_count DESC
-            LIMIT {} OFFSET {}
-            "#,
-            sanitized_query, sanitized_query, limit, offset
-        ),
+            LIMIT $2 OFFSET $3
+            "#
+        }
     };
 
-    let results = state
-        .db
-        .query_all(Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            sql,
-        ))
-        .await
-        .map_err(|e| {
-            tracing::error!("Search query failed: {:?}", e);
-            ApiErrorResponse::internal_error("Search failed")
-        })?;
+    // 6. EXECUTE WITH TIMEOUT (resource exhaustion protection)
+    let db_query = state.db.query_all(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        sql,
+        vec![
+            query.clone().into(),
+            (limit as i64).into(),
+            (offset as i64).into(),
+        ],
+    ));
 
-    // 4. Convert to VideoFeedItem
+    let results = tokio::time::timeout(
+        std::time::Duration::from_secs(search_config.timeout_secs),
+        db_query,
+    )
+    .await
+    .map_err(|_| {
+        log_suspicious_query(user_id, &query, "query_timeout");
+        ApiErrorResponse::internal_error("Search query timed out")
+    })?
+    .map_err(|e| {
+        tracing::error!("Search query failed: {:?}", e);
+        ApiErrorResponse::internal_error("Search failed")
+    })?;
+
+    // 7. CONVERT TO RESPONSE
     let mut feed = vec![];
     for row in results {
         let video_id: Uuid = row.try_get("", "id").map_err(|e| {
@@ -1210,26 +1383,29 @@ pub async fn search_videos(
         });
     }
 
-    // 5. Increment rate limit counter
+    // 8. CACHE RESULTS (user-scoped)
     if let Ok(mut conn) = state.queue.get_conn().await {
-        let _: Result<u64, redis::RedisError> = redis::cmd("INCR")
-            .arg(&search_key)
-            .query_async(&mut conn)
-            .await;
-
-        let _: Result<i64, redis::RedisError> = redis::cmd("EXPIRE")
-            .arg(&search_key)
-            .arg(60)
-            .query_async(&mut conn)
-            .await;
+        if let Ok(json) = serde_json::to_string(&feed) {
+            let _: Result<(), redis::RedisError> = redis::cmd("SETEX")
+                .arg(&cache_key)
+                .arg(search_config.cache_ttl_secs)
+                .arg(json)
+                .query_async(&mut conn)
+                .await;
+        }
     }
 
-    tracing::info!(
-        "Search: user={}, query='{}', results={}",
+    // 9. ANALYTICS TRACKING
+    let duration_ms = start_time.elapsed().as_millis() as u64;
+    track_search_analytics(
+        &state.queue,
         user_id,
-        query,
-        feed.len()
-    );
+        &query,
+        feed.len(),
+        false, // cache miss
+        duration_ms,
+    )
+    .await;
 
     Ok(Json(feed))
 }

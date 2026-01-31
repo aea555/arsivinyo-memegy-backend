@@ -149,6 +149,7 @@ async fn main() -> anyhow::Result<()> {
             patch(videos::handlers::update_video_metadata),
         )
         .route("/feed", get(videos::handlers::get_feed))
+        .route("/videos/search", get(videos::handlers::search_videos))
         .route(
             "/videos/download/bulk",
             post(videos::handlers::create_bulk_download),

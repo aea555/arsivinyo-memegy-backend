@@ -48,6 +48,14 @@ pub struct Config {
     pub rate_limit_window_secs: usize,
     pub ip_rate_limit_rpm: u64,
 
+    // Search Configuration
+    pub search_max_tokens: usize,
+    pub search_max_token_length: usize,
+    pub search_max_query_chars: usize,
+    pub search_timeout_secs: u64,
+    pub search_cache_ttl_secs: usize,
+    pub search_rpm_limit: u64,
+
     // Worker
     pub draft_video_cleanup_hours: u16,
     pub worker_retry_max_attempts: u8,
@@ -132,6 +140,26 @@ impl Config {
                 .unwrap_or_else(|_| "3600".to_string()) // 1 hour
                 .parse()?,
             ip_rate_limit_rpm: env::var("IP_RATE_LIMIT_RPM")
+                .unwrap_or_else(|_| "30".to_string())
+                .parse()?,
+
+            // Search Configuration
+            search_max_tokens: env::var("SEARCH_MAX_TOKENS")
+                .unwrap_or_else(|_| "50".to_string())
+                .parse()?,
+            search_max_token_length: env::var("SEARCH_MAX_TOKEN_LENGTH")
+                .unwrap_or_else(|_| "50".to_string())
+                .parse()?,
+            search_max_query_chars: env::var("SEARCH_MAX_QUERY_CHARS")
+                .unwrap_or_else(|_| "200".to_string())
+                .parse()?,
+            search_timeout_secs: env::var("SEARCH_TIMEOUT_SECS")
+                .unwrap_or_else(|_| "5".to_string())
+                .parse()?,
+            search_cache_ttl_secs: env::var("SEARCH_CACHE_TTL_SECS")
+                .unwrap_or_else(|_| "10".to_string())
+                .parse()?,
+            search_rpm_limit: env::var("SEARCH_RPM_LIMIT")
                 .unwrap_or_else(|_| "30".to_string())
                 .parse()?,
 
