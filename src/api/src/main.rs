@@ -127,6 +127,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/auth/dev/login", post(auth::handlers::dev_login))
         .route("/videos/init", post(videos::handlers::init_upload))
         .route(
+            "/videos/init/anonymous",
+            post(videos::handlers::init_anonymous_upload),
+        )
+        .route(
             "/videos/:id/confirm",
             post(videos::handlers::confirm_upload),
         )

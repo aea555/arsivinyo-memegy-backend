@@ -10,6 +10,10 @@ pub struct Config {
     pub oauth_redirect_base_url: String,
     pub cors_allowed_origins: String,
 
+    // Environment
+    pub environment: String, // "production", "staging", "development"
+    pub require_cloudflare_headers: bool, // Force CF header validation
+
     // Database & Redis
     pub database_url: String,
     pub valkey_url: String,
@@ -66,6 +70,13 @@ impl Config {
                 .trim_end_matches('/')
                 .to_string(),
             cors_allowed_origins: env::var("CORS_ALLOWED_ORIGINS").unwrap_or_default(),
+
+            // Environment
+            environment: env::var("ENVIRONMENT").unwrap_or_else(|_| "development".to_string()),
+            require_cloudflare_headers: env::var("REQUIRE_CLOUDFLARE_HEADERS")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse()
+                .unwrap_or(false),
 
             // Database & Redis
             database_url: env::var("DATABASE_URL").expect("DATABASE_URL must be set"),

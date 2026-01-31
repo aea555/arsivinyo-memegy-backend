@@ -4,6 +4,8 @@ mod m20220101_000001_create_table;
 mod m20260128_171456_m20220101_000002_create_videos_table;
 mod m20260128_171917_m20220101_000003_create_likes_table;
 mod m20260131_000001_add_indexes;
+mod m20260131_000002_add_anonymous_videos;
+mod m20260131_000003_add_soft_delete;
 
 pub struct Migrator;
 
@@ -15,6 +17,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260128_171456_m20220101_000002_create_videos_table::Migration),
             Box::new(m20260128_171917_m20220101_000003_create_likes_table::Migration),
             Box::new(m20260131_000001_add_indexes::Migration),
+            Box::new(m20260131_000002_add_anonymous_videos::Migration),
+            Box::new(m20260131_000003_add_soft_delete::Migration),
         ]
     }
 }

@@ -15,6 +15,8 @@ pub struct Model {
     pub status: String,
     pub size_bytes: i64,
     pub like_count: i64,
+    pub is_anonymous: bool,
+    pub deleted_at: Option<DateTimeWithTimeZone>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
 }

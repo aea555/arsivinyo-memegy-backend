@@ -33,6 +33,14 @@ pub struct VideoFeedItem {
     pub url: String, // Public URL
     pub like_count: i64,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uploader: Option<UploaderInfo>, // None if video is anonymous
+}
+
+#[derive(Serialize)]
+pub struct UploaderInfo {
+    pub id: Uuid,
+    pub username: String,
 }
 
 pub async fn get_feed(
@@ -81,6 +89,7 @@ pub async fn get_feed(
                     url: format!("{}/{}", base_url, c.url.split('/').last().unwrap_or(&c.url)),
                     like_count: c.like_count,
                     created_at: c.created_at,
+                    uploader: None, // TODO: Cache doesn't store user info yet, will be added in Phase 5
                 })
                 .collect();
 
@@ -88,8 +97,12 @@ pub async fn get_feed(
         }
     }
 
-    // Cache miss or random - query DB
-    let mut select = videos::Entity::find().filter(videos::Column::Status.eq("PUBLISHED"));
+    // Cache miss or random - query DB with user join for non-anonymous videos
+    use shared::entities::users;
+
+    let mut select = videos::Entity::find()
+        .filter(videos::Column::Status.eq("PUBLISHED"))
+        .find_also_related(users::Entity); // Left join users table
 
     match sort {
         "latest" => {
@@ -106,7 +119,7 @@ pub async fn get_feed(
         }
     }
 
-    let videos = select
+    let video_with_users: Vec<(videos::Model, Option<users::Model>)> = select
         .paginate(&state.db, page_size)
         .fetch_page(page)
         .await?;
@@ -116,22 +129,31 @@ pub async fn get_feed(
         state.config.minio_endpoint, state.config.minio_bucket_videos
     );
 
-    let items: Vec<VideoFeedItem> = videos
+    let items: Vec<VideoFeedItem> = video_with_users
         .iter()
-        .map(|v| VideoFeedItem {
+        .map(|(v, u)| VideoFeedItem {
             id: v.id,
             title: v.title.clone(),
             url: format!("{}/{}", base_url, v.s3_key),
             like_count: v.like_count,
             created_at: v.created_at,
+            // Only include uploader for non-anonymous videos
+            uploader: if v.is_anonymous {
+                None
+            } else {
+                u.as_ref().map(|user| UploaderInfo {
+                    id: user.id,
+                    username: user.username.clone(),
+                })
+            },
         })
         .collect();
 
     // Update cache (skip random)
-    if sort != "random" && !videos.is_empty() {
-        let cached_items: Vec<_> = videos
+    if sort != "random" && !video_with_users.is_empty() {
+        let cached_items: Vec<_> = video_with_users
             .into_iter()
-            .map(|v| crate::cache::feed_cache::CachedVideoFeedItem {
+            .map(|(v, _)| crate::cache::feed_cache::CachedVideoFeedItem {
                 id: v.id,
                 title: v.title,
                 url: v.s3_key,
@@ -248,6 +270,80 @@ pub async fn init_upload(
         status: Set("DRAFT".to_string()),
         size_bytes: Set(payload.size_bytes),
         like_count: Set(0),
+        is_anonymous: Set(false), // Regular upload, not anonymous
+        deleted_at: Set(None),    // Not deleted
+        created_at: Set(Utc::now().into()),
+        updated_at: Set(Utc::now().into()),
+    };
+
+    new_video.insert(&state.db).await?;
+
+    // 4. Generate Presigned URL with configurable expiry
+    let upload_url = state
+        .storage
+        .generate_presigned_put(
+            &state.config.minio_bucket_raw,
+            &s3_key,
+            Duration::from_secs(state.config.presigned_url_expiry_secs),
+        )
+        .await
+        .map_err(|e| {
+            ApiErrorResponse::internal_error(format!("Failed to generate upload URL: {}", e))
+        })?;
+
+    Ok(Json(InitUploadResponse {
+        video_id,
+        upload_url,
+    }))
+}
+
+/// Initialize anonymous video upload (hidden identity in public feed)
+pub async fn init_anonymous_upload(
+    State(state): State<AppState>,
+    AuthUser(user_id): AuthUser,
+    Json(payload): Json<InitUploadRequest>,
+) -> ApiResult<Json<InitUploadResponse>> {
+    // 1. Validate file size
+    if payload.size_bytes > state.config.max_file_size_bytes {
+        return Err(ApiErrorResponse::bad_request(format!(
+            "File too large. Max size: {} bytes",
+            state.config.max_file_size_bytes
+        )));
+    }
+
+    // 2. Stricter Rate Limiting for Anonymous Uploads
+    // Anonymous uploads have 50% lower quota to prevent abuse
+    let rate_key = crate::services::rate_limiter::RateLimiter::upload_bytes_key(&user_id);
+    let current_usage = state.rate_limiter.get_count(&rate_key).await.unwrap_or(0) as i64;
+
+    let anonymous_limit = state.config.limit_upload_bytes_hourly / 2; // 128 MB instead of 256 MB
+    if current_usage + payload.size_bytes > anonymous_limit {
+        return Err(ApiErrorResponse::too_many_requests(
+            "Anonymous upload rate limit exceeded. Please try again later.",
+        ));
+    }
+
+    // 3. Create DB Record (DRAFT, ANONYMOUS)
+    let video_id = Uuid::new_v4();
+    let ext = std::path::Path::new(&payload.filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("bin");
+
+    let s3_key = format!("{}/{}.{}", user_id, video_id, ext);
+
+    let new_video = videos::ActiveModel {
+        id: Set(video_id),
+        user_id: Set(user_id),
+        title: Set(None),
+        description: Set(None),
+        s3_bucket: Set(state.config.minio_bucket_raw.clone()),
+        s3_key: Set(s3_key.clone()),
+        status: Set("DRAFT".to_string()),
+        size_bytes: Set(payload.size_bytes),
+        like_count: Set(0),
+        is_anonymous: Set(true), // ANONYMOUS upload
+        deleted_at: Set(None),   // Not deleted
         created_at: Set(Utc::now().into()),
         updated_at: Set(Utc::now().into()),
     };
