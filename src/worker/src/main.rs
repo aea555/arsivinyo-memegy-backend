@@ -12,6 +12,9 @@ use std::process::Command;
 use tempfile::TempDir;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+mod bulk_download;
+use bulk_download::BulkDownloadWorker;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // 1. Logging
@@ -33,6 +36,29 @@ async fn main() -> Result<()> {
 
     let storage = StorageService::new(&config).await;
     let queue = QueueService::new(&config)?;
+
+    // 5. Start bulk download worker in background
+    let bulk_worker =
+        BulkDownloadWorker::new(db.clone(), queue.clone(), storage.clone(), config.clone());
+
+    tokio::spawn(async move {
+        if let Err(e) = bulk_worker.run().await {
+            tracing::error!("Bulk download worker error: {:?}", e);
+        }
+    });
+
+    // 6. Periodic cleanup task
+    let cleanup_worker =
+        BulkDownloadWorker::new(db.clone(), queue.clone(), storage.clone(), config.clone());
+
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await; // Every hour
+            if let Err(e) = cleanup_worker.cleanup_stale_jobs().await {
+                tracing::error!("Cleanup task error: {:?}", e);
+            }
+        }
+    });
 
     tracing::info!("Worker started, waiting for jobs...");
 

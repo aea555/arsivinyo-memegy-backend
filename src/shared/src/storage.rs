@@ -1,3 +1,4 @@
+use anyhow::Result;
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_s3::{
     config::{Credentials, SharedCredentialsProvider},
@@ -5,9 +6,8 @@ use aws_sdk_s3::{
     primitives::ByteStream,
     Client,
 };
-use std::time::Duration;
 use std::path::Path;
-use anyhow::Result;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
 use crate::config::Config;
@@ -58,6 +58,25 @@ impl StorageService {
         Ok(presigned_request.uri().to_string())
     }
 
+    pub async fn generate_presigned_get(
+        &self,
+        bucket: &str,
+        key: &str,
+        expires_in: Duration,
+    ) -> Result<String> {
+        let presigning_config = PresigningConfig::expires_in(expires_in)?;
+
+        let presigned_request = self
+            .client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .presigned(presigning_config)
+            .await?;
+
+        Ok(presigned_request.uri().to_string())
+    }
+
     pub async fn file_exists(&self, bucket: &str, key: &str) -> Result<bool> {
         match self
             .client
@@ -95,7 +114,13 @@ impl StorageService {
         Ok(())
     }
 
-    pub async fn upload_file(&self, bucket: &str, key: &str, src_path: &Path, content_type: &str) -> Result<()> {
+    pub async fn upload_file(
+        &self,
+        bucket: &str,
+        key: &str,
+        src_path: &Path,
+        content_type: &str,
+    ) -> Result<()> {
         let body = ByteStream::from_path(src_path).await?;
         self.client
             .put_object()

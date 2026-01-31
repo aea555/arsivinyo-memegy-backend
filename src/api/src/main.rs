@@ -135,12 +135,28 @@ async fn main() -> anyhow::Result<()> {
             post(videos::handlers::confirm_upload),
         )
         .route("/videos/:id/like", post(videos::handlers::like_video))
+        .route(
+            "/videos/:id/download",
+            get(videos::handlers::download_video),
+        )
+        .route(
+            "/videos/:id/download/refresh",
+            get(videos::handlers::refresh_download_url),
+        )
         .route("/videos/:id", delete(videos::handlers::delete_video))
         .route(
             "/videos/:id",
             patch(videos::handlers::update_video_metadata),
         )
         .route("/feed", get(videos::handlers::get_feed))
+        .route(
+            "/videos/download/bulk",
+            post(videos::handlers::create_bulk_download),
+        )
+        .route(
+            "/videos/download/bulk/:id",
+            get(videos::handlers::get_bulk_download_status),
+        )
         .layer(cors)
         .with_state(state.clone());
 

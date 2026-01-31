@@ -617,3 +617,619 @@ async fn invalidate_feed_cache(state: &AppState) -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// ============================================================================
+// DOWNLOAD ENDPOINTS
+// ============================================================================
+
+/// Download a single video
+/// Returns 302 redirect to S3 presigned GET URL (60s TTL)
+pub async fn download_video(
+    State(state): State<AppState>,
+    AuthUser(user_id): AuthUser,
+    Path(video_id): Path<Uuid>,
+) -> ApiResult<axum::response::Response> {
+    use axum::response::{IntoResponse, Redirect};
+
+    // 1. Check rate limits FIRST (before DB query)
+    // Request-based limit: 30/min
+    let request_key = format!("download:{}:rpm", user_id);
+    match state.rate_limiter.check_rate(&request_key, 30).await {
+        Ok(Ok(_remaining)) => {} // Under limit, proceed
+        Ok(Err(current)) => {
+            return Err(ApiErrorResponse::too_many_requests(format!(
+                "Download rate limit exceeded (30 downloads/minute). Current: {}",
+                current
+            )));
+        }
+        Err(e) => {
+            tracing::error!("Rate limit check failed: {:?}", e);
+            return Err(ApiErrorResponse::internal_error("Rate limit check failed"));
+        }
+    }
+
+    // 2. Fetch video with soft-delete and status checks
+    let video = videos::Entity::find_by_id(video_id)
+        .filter(videos::Column::DeletedAt.is_null())
+        .filter(videos::Column::Status.eq("PUBLISHED"))
+        .one(&state.db)
+        .await
+        .map_err(|e| {
+            tracing::error!("Database error fetching video: {:?}", e);
+            ApiErrorResponse::internal_error("Failed to fetch video")
+        })?
+        .ok_or_else(|| ApiErrorResponse::not_found("Video not found or has been deleted"))?;
+
+    // 3. Check bandwidth limit: 500MB/hour
+    let bandwidth_key = format!("download:{}:bandwidth", user_id);
+    let mut conn = state.queue.get_conn().await.map_err(|e| {
+        tracing::warn!("Redis connection failed for bandwidth check: {:?}", e);
+        // Allow download if Redis is down (fail-open for bandwidth, not security)
+        ApiErrorResponse::internal_error("Bandwidth tracking unavailable")
+    })?;
+
+    let current_bandwidth: i64 = redis::cmd("GET")
+        .arg(&bandwidth_key)
+        .query_async(&mut conn)
+        .await
+        .unwrap_or(Some(0i64))
+        .unwrap_or(0);
+
+    let bandwidth_limit_mb = 500;
+    let bandwidth_limit_bytes = bandwidth_limit_mb * 1024 * 1024;
+
+    if current_bandwidth + video.size_bytes > bandwidth_limit_bytes {
+        return Err(ApiErrorResponse::too_many_requests(format!(
+            "Bandwidth limit exceeded ({} MB/hour). Current usage: {} MB",
+            bandwidth_limit_mb,
+            current_bandwidth / (1024 * 1024)
+        )));
+    }
+
+    // 4. Generate presigned GET URL (60 second TTL)
+    let presigned_url = state
+        .storage
+        .generate_presigned_get(
+            &state.config.minio_bucket_videos,
+            &video.s3_key,
+            Duration::from_secs(60),
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to generate presigned URL: {:?}", e);
+            ApiErrorResponse::internal_error("Failed to generate download URL")
+        })?;
+
+    // 5. Increment bandwidth counter (3600s = 1 hour TTL)
+    let new_total: i64 = redis::cmd("INCRBY")
+        .arg(&bandwidth_key)
+        .arg(video.size_bytes)
+        .query_async(&mut conn)
+        .await
+        .unwrap_or(video.size_bytes);
+
+    // Set expiry if this is the first increment
+    if new_total == video.size_bytes {
+        let _: Result<(), redis::RedisError> = redis::cmd("EXPIRE")
+            .arg(&bandwidth_key)
+            .arg(3600)
+            .query_async(&mut conn)
+            .await;
+    }
+
+    // 6. Increment request counter (60s = 1 minute TTL)
+    let _: Result<u64, redis::RedisError> = redis::cmd("INCR")
+        .arg(&request_key)
+        .query_async(&mut conn)
+        .await;
+
+    let _: Result<i64, redis::RedisError> = redis::cmd("EXPIRE")
+        .arg(&request_key)
+        .arg(60)
+        .query_async(&mut conn)
+        .await;
+
+    // 7. Log download event (analytics)
+    tracing::info!(
+        "Download: user={}, video={}, size={} bytes",
+        user_id,
+        video_id,
+        video.size_bytes
+    );
+
+    // 8. Return 302 redirect to presigned URL
+    Ok(Redirect::temporary(&presigned_url).into_response())
+}
+
+/// Refresh an expired download URL
+/// Returns new presigned URL for same video (higher rate limit)
+pub async fn refresh_download_url(
+    State(state): State<AppState>,
+    AuthUser(user_id): AuthUser,
+    Path(video_id): Path<Uuid>,
+) -> ApiResult<Json<RefreshDownloadResponse>> {
+    // Rate limit: 10/min (higher than regular downloads)
+    let refresh_key = format!("download:{}:refresh:rpm", user_id);
+    match state.rate_limiter.check_rate(&refresh_key, 10).await {
+        Ok(Ok(_remaining)) => {} // Under limit, proceed
+        Ok(Err(current)) => {
+            return Err(ApiErrorResponse::too_many_requests(format!(
+                "URL refresh rate limit exceeded (10 refreshes/minute). Current: {}",
+                current
+            )));
+        }
+        Err(e) => {
+            tracing::error!("Rate limit check failed: {:?}", e);
+            return Err(ApiErrorResponse::internal_error("Rate limit check failed"));
+        }
+    }
+
+    // Fetch video (same validations as download)
+    let video = videos::Entity::find_by_id(video_id)
+        .filter(videos::Column::DeletedAt.is_null())
+        .filter(videos::Column::Status.eq("PUBLISHED"))
+        .one(&state.db)
+        .await
+        .map_err(|e| {
+            tracing::error!("Database error fetching video: {:?}", e);
+            ApiErrorResponse::internal_error("Failed to fetch video")
+        })?
+        .ok_or_else(|| ApiErrorResponse::not_found("Video not found or has been deleted"))?;
+
+    // Generate new presigned URL (60s TTL)
+    let presigned_url = state
+        .storage
+        .generate_presigned_get(
+            &state.config.minio_bucket_videos,
+            &video.s3_key,
+            Duration::from_secs(60),
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to generate presigned URL: {:?}", e);
+            ApiErrorResponse::internal_error("Failed to generate download URL")
+        })?;
+
+    // Increment counter for rate limiting
+    if let Ok(mut conn) = state.queue.get_conn().await {
+        let _: Result<u64, redis::RedisError> = redis::cmd("INCR")
+            .arg(&refresh_key)
+            .query_async(&mut conn)
+            .await;
+
+        let _: Result<i64, redis::RedisError> = redis::cmd("EXPIRE")
+            .arg(&refresh_key)
+            .arg(60)
+            .query_async(&mut conn)
+            .await;
+    }
+
+    tracing::info!(
+        "Download URL refreshed: user={}, video={}",
+        user_id,
+        video_id
+    );
+
+    Ok(Json(RefreshDownloadResponse {
+        download_url: presigned_url,
+        expires_in_seconds: 60,
+    }))
+}
+
+// ============================================================================
+// BULK DOWNLOAD ENDPOINTS
+// ============================================================================
+
+/// Create a bulk download job
+pub async fn create_bulk_download(
+    State(state): State<AppState>,
+    AuthUser(user_id): AuthUser,
+    Json(req): Json<CreateBulkDownloadRequest>,
+) -> ApiResult<Json<BulkDownloadJobResponse>> {
+    use shared::entities::{download_jobs, videos};
+
+    // 1. Validate video count (max 10)
+    if req.video_ids.is_empty() {
+        return Err(ApiErrorResponse::bad_request("No video IDs provided"));
+    }
+    if req.video_ids.len() > 10 {
+        return Err(ApiErrorResponse::bad_request(
+            "Maximum 10 videos per bulk download",
+        ));
+    }
+
+    // 2. Generate or use provided idempotency key
+    let idempotency_key = req
+        .idempotency_key
+        .unwrap_or_else(|| format!("bulk:{}:{}", user_id, Uuid::new_v4()));
+
+    // 3. Check idempotency (24h cache)
+    let idempotency_cache_key = format!("bulk_download:idempotency:{}", idempotency_key);
+    if let Ok(mut conn) = state.queue.get_conn().await {
+        let existing_job_id: Option<String> = redis::cmd("GET")
+            .arg(&idempotency_cache_key)
+            .query_async(&mut conn)
+            .await
+            .ok()
+            .flatten();
+
+        if let Some(job_id_str) = existing_job_id {
+            if let Ok(job_id) = Uuid::parse_str(&job_id_str) {
+                // Return existing job
+                if let Ok(Some(existing_job)) = download_jobs::Entity::find_by_id(job_id)
+                    .one(&state.db)
+                    .await
+                {
+                    tracing::info!(
+                        "Returning existing bulk download job: {} (idempotency)",
+                        job_id
+                    );
+                    return Ok(Json(BulkDownloadJobResponse {
+                        job_id: existing_job.id,
+                        status: existing_job.status,
+                        video_count: existing_job.video_ids.len(),
+                        created_at: existing_job.created_at,
+                        download_url: existing_job.zip_url,
+                        zip_size_bytes: existing_job.zip_size_bytes,
+                        error_message: existing_job.error_message,
+                        completed_at: existing_job.completed_at,
+                        expires_at: existing_job.expires_at,
+                    }));
+                }
+            }
+        }
+    }
+
+    // 4. Check active jobs limit (3 concurrent per user)
+    let active_count = download_jobs::Entity::find()
+        .filter(download_jobs::Column::UserId.eq(user_id))
+        .filter(download_jobs::Column::Status.is_in(["PENDING", "PROCESSING"]))
+        .count(&state.db)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to count active jobs: {:?}", e);
+            ApiErrorResponse::internal_error("Failed to check job limits")
+        })?;
+
+    if active_count >= 3 {
+        return Err(ApiErrorResponse::too_many_requests(
+            "Maximum 3 active bulk download jobs. Please wait for existing jobs to complete.",
+        ));
+    }
+
+    // 5. Check daily limit (10 jobs/day)
+    let today_start = Utc::now()
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc()
+        .fixed_offset();
+
+    let daily_count = download_jobs::Entity::find()
+        .filter(download_jobs::Column::UserId.eq(user_id))
+        .filter(download_jobs::Column::CreatedAt.gte(today_start))
+        .count(&state.db)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to count daily jobs: {:?}", e);
+            ApiErrorResponse::internal_error("Failed to check job limits")
+        })?;
+
+    if daily_count >= 10 {
+        return Err(ApiErrorResponse::too_many_requests(
+            "Daily limit of 10 bulk downloads reached. Resets at midnight UTC.",
+        ));
+    }
+
+    // 6. Validate all videos exist, are published, and not deleted (CHECKPOINT 1)
+    let videos_found = videos::Entity::find()
+        .filter(videos::Column::Id.is_in(req.video_ids.clone()))
+        .filter(videos::Column::DeletedAt.is_null())
+        .filter(videos::Column::Status.eq("PUBLISHED"))
+        .all(&state.db)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to fetch videos: {:?}", e);
+            ApiErrorResponse::internal_error("Failed to validate videos")
+        })?;
+
+    if videos_found.len() != req.video_ids.len() {
+        let found_ids: std::collections::HashSet<_> = videos_found.iter().map(|v| v.id).collect();
+        let missing: Vec<_> = req
+            .video_ids
+            .iter()
+            .filter(|id| !found_ids.contains(id))
+            .collect();
+
+        return Err(ApiErrorResponse::bad_request(format!(
+            "Some videos are not available: {:?}",
+            missing
+        )));
+    }
+
+    // 7. Create job record
+    let job_id = Uuid::new_v4();
+    let now = Utc::now().fixed_offset();
+    let expires_at = now + chrono::Duration::days(7);
+
+    let new_job = download_jobs::ActiveModel {
+        id: Set(job_id),
+        user_id: Set(user_id),
+        video_ids: Set(req.video_ids.clone()),
+        status: Set("PENDING".to_string()),
+        idempotency_key: Set(Some(idempotency_key.clone())),
+        zip_s3_key: Set(None),
+        zip_url: Set(None),
+        zip_size_bytes: Set(None),
+        error_message: Set(None),
+        partial_manifest: Set(None),
+        retry_count: Set(0),
+        created_at: Set(now),
+        updated_at: Set(None),
+        completed_at: Set(None),
+        expires_at: Set(Some(expires_at)),
+    };
+
+    let job = new_job.insert(&state.db).await.map_err(|e| {
+        tracing::error!("Failed to create bulk download job: {:?}", e);
+        ApiErrorResponse::internal_error("Failed to create download job")
+    })?;
+
+    // 8. Cache idempotency key (24h TTL)
+    if let Ok(mut conn) = state.queue.get_conn().await {
+        let _: Result<(), redis::RedisError> = redis::cmd("SETEX")
+            .arg(&idempotency_cache_key)
+            .arg(86400) // 24 hours
+            .arg(job_id.to_string())
+            .query_async(&mut conn)
+            .await;
+    }
+
+    // 9. Enqueue job to worker (Redis queue)
+    if let Ok(mut conn) = state.queue.get_conn().await {
+        let job_payload = serde_json::json!({
+            "job_id": job_id,
+            "user_id": user_id,
+            "video_ids": req.video_ids,
+        });
+
+        let _: Result<(), redis::RedisError> = redis::cmd("LPUSH")
+            .arg("bulk_download_queue")
+            .arg(job_payload.to_string())
+            .query_async(&mut conn)
+            .await;
+
+        tracing::info!(
+            "Enqueued bulk download job: {} ({} videos)",
+            job_id,
+            req.video_ids.len()
+        );
+    }
+
+    // 10. Return job response
+    Ok(Json(BulkDownloadJobResponse {
+        job_id: job.id,
+        status: job.status,
+        video_count: job.video_ids.len(),
+        created_at: job.created_at,
+        download_url: None,
+        zip_size_bytes: None,
+        error_message: None,
+        completed_at: None,
+        expires_at: job.expires_at,
+    }))
+}
+
+/// Get bulk download job status  
+pub async fn get_bulk_download_status(
+    State(state): State<AppState>,
+    AuthUser(user_id): AuthUser,
+    Path(job_id): Path<Uuid>,
+) -> ApiResult<Json<BulkDownloadStatus>> {
+    use shared::entities::download_jobs;
+
+    // Fetch job
+    let job = download_jobs::Entity::find_by_id(job_id)
+        .one(&state.db)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to fetch job: {:?}", e);
+            ApiErrorResponse::internal_error("Failed to fetch job status")
+        })?
+        .ok_or_else(|| ApiErrorResponse::not_found("Download job not found"))?;
+
+    // Verify ownership
+    if job.user_id != user_id {
+        return Err(ApiErrorResponse::not_found("Download job not found"));
+    }
+
+    // Return status
+    Ok(Json(BulkDownloadStatus {
+        job_id: job.id,
+        status: job.status,
+        video_ids: job.video_ids,
+        created_at: job.created_at,
+        download_url: job.zip_url,
+        zip_size_bytes: job.zip_size_bytes,
+        error_message: job.error_message,
+        partial_manifest: job.partial_manifest,
+        completed_at: job.completed_at,
+        expires_at: job.expires_at,
+        retry_count: job.retry_count,
+    }))
+}
+
+// ============================================================================
+// SEARCH ENDPOINT
+// ============================================================================
+
+/// Search videos using PostgreSQL full-text search
+pub async fn search_videos(
+    State(state): State<AppState>,
+    AuthUser(user_id): AuthUser,
+    Query(params): Query<SearchVideosQuery>,
+) -> ApiResult<Json<Vec<VideoFeedItem>>> {
+    use shared::entities::videos;
+
+    // 1. Rate limiting (30 searches/min)
+    let search_key = format!("search:{}:rpm", user_id);
+    match state.rate_limiter.check_rate(&search_key, 30).await {
+        Ok(Ok(_remaining)) => {}
+        Ok(Err(current)) => {
+            return Err(ApiErrorResponse::too_many_requests(format!(
+                "Search rate limit exceeded (30 searches/minute). Current: {}",
+                current
+            )));
+        }
+        Err(e) => {
+            tracing::error!("Rate limit check failed: {:?}", e);
+            return Err(ApiErrorResponse::internal_error("Rate limit check failed"));
+        }
+    }
+
+    // 2. Validate & sanitize query
+    let query = params.q.trim();
+    if query.is_empty() {
+        return Err(ApiErrorResponse::bad_request("Query cannot be empty"));
+    }
+    if query.len() > 200 {
+        return Err(ApiErrorResponse::bad_request(
+            "Query too long (max 200 characters)",
+        ));
+    }
+
+    // Sanitize for tsquery (remove special chars, escape quotes)
+    let sanitized_query = query
+        .replace(
+            &['\'', '"', '\\', '&', '|', '!', '(', ')', '<', '>', ':', '*'][..],
+            " ",
+        )
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" & ");
+
+    if sanitized_query.is_empty() {
+        return Err(ApiErrorResponse::bad_request("Invalid search query"));
+    }
+
+    // 3. Build query with FTS
+    let limit = params.limit.min(100); // Cap at 100
+    let offset = params.offset;
+
+    // Execute raw SQL for FTS (SeaORM doesn't support ts_rank directly)
+    let sql = match params.sort.as_str() {
+        "recent" => format!(
+            r#"
+            SELECT id, user_id, title, description, s3_bucket, s3_key, status, size_bytes, like_count, is_anonymous, created_at, updated_at
+            FROM videos
+            WHERE search_vector @@ to_tsquery('english', '{}')
+            AND deleted_at IS NULL
+            AND status = 'PUBLISHED'
+            ORDER BY created_at DESC
+            LIMIT {} OFFSET {}
+            "#,
+            sanitized_query, limit, offset
+        ),
+        "popular" => format!(
+            r#"
+            SELECT id, user_id, title, description, s3_bucket, s3_key, status, size_bytes, like_count, is_anonymous, created_at, updated_at
+            FROM videos
+            WHERE search_vector @@ to_tsquery('english', '{}')
+            AND deleted_at IS NULL
+            AND status = 'PUBLISHED'
+            ORDER BY like_count DESC, created_at DESC
+            LIMIT {} OFFSET {}
+            "#,
+            sanitized_query, limit, offset
+        ),
+        _ => format!(
+            // "relevance" (default)
+            r#"
+            SELECT id, user_id, title, description, s3_bucket, s3_key, status, size_bytes, like_count, is_anonymous, created_at, updated_at,
+                   ts_rank(search_vector, to_tsquery('english', '{}')) as rank
+            FROM videos
+            WHERE search_vector @@ to_tsquery('english', '{}')
+            AND deleted_at IS NULL
+            AND status = 'PUBLISHED'
+            ORDER BY rank DESC, like_count DESC
+            LIMIT {} OFFSET {}
+            "#,
+            sanitized_query, sanitized_query, limit, offset
+        ),
+    };
+
+    let results = state
+        .db
+        .query_all(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            sql,
+        ))
+        .await
+        .map_err(|e| {
+            tracing::error!("Search query failed: {:?}", e);
+            ApiErrorResponse::internal_error("Search failed")
+        })?;
+
+    // 4. Convert to VideoFeedItem
+    let mut feed = vec![];
+    for row in results {
+        let video_id: Uuid = row.try_get("", "id").map_err(|e| {
+            tracing::error!("Failed to parse video ID: {:?}", e);
+            ApiErrorResponse::internal_error("Failed to parse results")
+        })?;
+
+        let uploader_id: Uuid = row.try_get("", "user_id")?;
+        let is_anonymous: bool = row.try_get("", "is_anonymous")?;
+
+        // Fetch uploader username if not anonymous
+        let uploader = if is_anonymous {
+            None
+        } else {
+            shared::entities::users::Entity::find_by_id(uploader_id)
+                .one(&state.db)
+                .await
+                .ok()
+                .flatten()
+                .map(|u| UploaderInfo {
+                    id: u.id,
+                    username: u.username,
+                })
+        };
+
+        feed.push(VideoFeedItem {
+            id: video_id,
+            title: row.try_get("", "title")?,
+            url: format!(
+                "http://{}/videos-public/{}",
+                state.config.minio_endpoint,
+                row.try_get::<String>("", "s3_key")?
+            ),
+            like_count: row.try_get("", "like_count")?,
+            created_at: row.try_get("", "created_at")?,
+            uploader,
+        });
+    }
+
+    // 5. Increment rate limit counter
+    if let Ok(mut conn) = state.queue.get_conn().await {
+        let _: Result<u64, redis::RedisError> = redis::cmd("INCR")
+            .arg(&search_key)
+            .query_async(&mut conn)
+            .await;
+
+        let _: Result<i64, redis::RedisError> = redis::cmd("EXPIRE")
+            .arg(&search_key)
+            .arg(60)
+            .query_async(&mut conn)
+            .await;
+    }
+
+    tracing::info!(
+        "Search: user={}, query='{}', results={}",
+        user_id,
+        query,
+        feed.len()
+    );
+
+    Ok(Json(feed))
+}

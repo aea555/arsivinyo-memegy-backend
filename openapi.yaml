@@ -223,6 +223,22 @@ components:
         - like_count
         - created_at
 
+    RefreshDownloadResponse:
+      type: object
+      properties:
+        download_url:
+          type: string
+          format: uri
+          description: Fresh presigned S3 GET URL (60s TTL)
+          example: http://localhost:9000/videos-public/550e8400.../video.mp4?X-Amz-...
+        expires_in_seconds:
+          type: integer
+          description: URL expiry time in seconds
+          example: 60
+      required:
+        - download_url
+        - expires_in_seconds
+
   responses:
     UnauthorizedError:
       description: Authentication required or token invalid/expired

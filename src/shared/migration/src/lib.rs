@@ -6,6 +6,8 @@ mod m20260128_171917_m20220101_000003_create_likes_table;
 mod m20260131_000001_add_indexes;
 mod m20260131_000002_add_anonymous_videos;
 mod m20260131_000003_add_soft_delete;
+mod m20260131_175303_create_download_jobs;
+mod m20260131_210000_add_fulltext_search;
 
 pub struct Migrator;
 
@@ -19,6 +21,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260131_000001_add_indexes::Migration),
             Box::new(m20260131_000002_add_anonymous_videos::Migration),
             Box::new(m20260131_000003_add_soft_delete::Migration),
+            Box::new(m20260131_175303_create_download_jobs::Migration),
+            Box::new(m20260131_210000_add_fulltext_search::Migration),
         ]
     }
 }
