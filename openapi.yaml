@@ -5,14 +5,17 @@ info:
   description: |
     A high-performance meme archive backend built with Rust. 
     This API allows users to upload, like, and discover short meme videos.
-    
+
     ## Authentication
     This API uses **Bearer Token** authentication via JWT. Obtain tokens through the Google OAuth flow.
-    
+
     ## Rate Limits
-    - **Upload**: 50MB per hour per user (configurable)
-    - **Feed**: 60 requests per minute (configurable)
-    
+    - **Regular Upload**: 256 MB per hour per user
+    - **Anonymous Upload**: 128 MB per hour per user (stricter due to abuse risk)
+    - **Feed Access**: 30 requests per minute
+    - **Video Deletion**: 10 deletions per hour per user
+    - **Metadata Updates**: 30 updates per hour per user
+
   contact:
     name: Arsivinyo Team
   license:
@@ -64,7 +67,7 @@ components:
           description: Opaque refresh token (valid for 14 days)
           example: a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6
         user:
-          $ref: '#/components/schemas/UserDto'
+          $ref: "#/components/schemas/UserDto"
       required:
         - access_token
         - refresh_token
@@ -148,6 +151,43 @@ components:
         - video_id
         - upload_url
 
+    UploaderInfo:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: User ID
+          example: 550e8400-e29b-41d4-a716-446655440000
+        username:
+          type: string
+          description: Username
+          example: john_doe
+      required:
+        - id
+        - username
+
+    UpdateVideoRequest:
+      type: object
+      properties:
+        title:
+          type: string
+          maxLength: 200
+          nullable: true
+          description: Video title (max 200 characters)
+          example: My Awesome Video
+        description:
+          type: string
+          maxLength: 2000
+          nullable: true
+          description: Video description (max 2000 characters)
+          example: This is a longer description of my video...
+        is_anonymous:
+          type: boolean
+          nullable: true
+          description: Toggle anonymity (hides uploader info in feed)
+          example: false
+
     VideoFeedItem:
       type: object
       properties:
@@ -172,6 +212,11 @@ components:
           type: string
           format: date-time
           example: 2026-01-28T17:30:00Z
+        uploader:
+          allOf:
+            - $ref: "#/components/schemas/UploaderInfo"
+          nullable: true
+          description: Uploader information (null if video is anonymous)
       required:
         - id
         - url
@@ -184,7 +229,7 @@ components:
       content:
         application/json:
           schema:
-            $ref: '#/components/schemas/ErrorResponse'
+            $ref: "#/components/schemas/ErrorResponse"
           example:
             error: Unauthorized
 
@@ -193,7 +238,7 @@ components:
       content:
         application/json:
           schema:
-            $ref: '#/components/schemas/ErrorResponse'
+            $ref: "#/components/schemas/ErrorResponse"
           example:
             error: Rate limit exceeded
 
@@ -202,7 +247,7 @@ components:
       content:
         application/json:
           schema:
-            $ref: '#/components/schemas/ErrorResponse'
+            $ref: "#/components/schemas/ErrorResponse"
           example:
             error: Not found
 
@@ -211,7 +256,7 @@ components:
       content:
         application/json:
           schema:
-            $ref: '#/components/schemas/ErrorResponse'
+            $ref: "#/components/schemas/ErrorResponse"
           example:
             error: Invalid request
 
@@ -220,7 +265,7 @@ components:
       content:
         application/json:
           schema:
-            $ref: '#/components/schemas/ErrorResponse'
+            $ref: "#/components/schemas/ErrorResponse"
           example:
             error: Internal server error
 
@@ -233,7 +278,7 @@ paths:
       description: Returns OK if the server is running
       operationId: healthCheck
       responses:
-        '200':
+        "200":
           description: Server is healthy
           content:
             text/plain:
@@ -249,13 +294,13 @@ paths:
       description: |
         Redirects the user to Google's OAuth2 consent page.
         After authentication, Google redirects back to `/auth/google/callback`.
-        
+
         **Note for API Testing:**
         This endpoint is designed for browser-based flows and will redirect to Google's login page.
         For API testing without a browser, use the `/auth/dev/login` endpoint instead (development only).
       operationId: googleLogin
       responses:
-        '302':
+        "302":
           description: Redirect to Google OAuth2 consent page
           headers:
             Location:
@@ -271,10 +316,10 @@ paths:
       summary: Development login (bypasses Google OAuth)
       description: |
         **⚠️ DEVELOPMENT ONLY** - Only available when `RUST_LOG` contains "debug" or "trace".
-        
+
         Creates or retrieves a test user and issues access/refresh tokens without Google OAuth.
         Perfect for testing the API with Postman, curl, or other API clients.
-        
+
         **Production Behavior:**
         This endpoint returns 404 in production environments.
       operationId: devLogin
@@ -296,16 +341,16 @@ paths:
                 - username
                 - email
       responses:
-        '200':
+        "200":
           description: Successfully authenticated
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/AuthResponse'
-        '404':
+                $ref: "#/components/schemas/AuthResponse"
+        "404":
           description: Endpoint not available (production mode)
-        '500':
-          $ref: '#/components/responses/InternalServerError'
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /auth/google/callback:
     get:
@@ -331,16 +376,16 @@ paths:
           schema:
             type: string
       responses:
-        '200':
+        "200":
           description: Successfully authenticated
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/AuthResponse'
-        '401':
-          $ref: '#/components/responses/UnauthorizedError'
-        '500':
-          $ref: '#/components/responses/InternalServerError'
+                $ref: "#/components/schemas/AuthResponse"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /auth/refresh:
     post:
@@ -356,18 +401,18 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/RefreshRequest'
+              $ref: "#/components/schemas/RefreshRequest"
       responses:
-        '200':
+        "200":
           description: New access token issued
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/RefreshResponse'
-        '401':
-          $ref: '#/components/responses/UnauthorizedError'
-        '500':
-          $ref: '#/components/responses/InternalServerError'
+                $ref: "#/components/schemas/RefreshResponse"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /auth/logout:
     post:
@@ -381,12 +426,12 @@ paths:
       security:
         - BearerAuth: []
       responses:
-        '200':
+        "200":
           description: Successfully logged out
-        '401':
-          $ref: '#/components/responses/UnauthorizedError'
-        '500':
-          $ref: '#/components/responses/InternalServerError'
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /videos/init:
     post:
@@ -395,12 +440,12 @@ paths:
       summary: Initialize video upload
       description: |
         Request a presigned URL for uploading a video file.
-        
+
         **Upload Flow:**
         1. Call this endpoint to get a `video_id` and `upload_url`
         2. Upload the file directly to `upload_url` using HTTP PUT
         3. Call `/videos/{id}/confirm` to trigger processing
-        
+
         **Rate Limiting:**
         - Max 50MB per hour per user (configurable)
         - Limit is based on cumulative file size, not number of uploads
@@ -412,20 +457,20 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/InitUploadRequest'
+              $ref: "#/components/schemas/InitUploadRequest"
       responses:
-        '200':
+        "200":
           description: Upload initialized
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/InitUploadResponse'
-        '401':
-          $ref: '#/components/responses/UnauthorizedError'
-        '429':
-          $ref: '#/components/responses/TooManyRequestsError'
-        '500':
-          $ref: '#/components/responses/InternalServerError'
+                $ref: "#/components/schemas/InitUploadResponse"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "429":
+          $ref: "#/components/responses/TooManyRequestsError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /videos/{id}/confirm:
     post:
@@ -435,7 +480,7 @@ paths:
       description: |
         Confirms that the file has been uploaded to the presigned URL.
         Triggers background processing (compression, thumbnail generation).
-        
+
         **Status Flow:**
         - `DRAFT` → `PROCESSING` → `PUBLISHED` (or `FAILED`)
       operationId: confirmUpload
@@ -451,16 +496,61 @@ paths:
             format: uuid
             example: 550e8400-e29b-41d4-a716-446655440000
       responses:
-        '202':
+        "202":
           description: Upload confirmed, processing started
-        '400':
-          $ref: '#/components/responses/BadRequestError'
-        '401':
-          $ref: '#/components/responses/UnauthorizedError'
-        '404':
-          $ref: '#/components/responses/NotFoundError'
-        '500':
-          $ref: '#/components/responses/InternalServerError'
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /videos/init/anonymous:
+    post:
+      tags:
+        - Videos
+      summary: Initialize anonymous video upload
+      description: |
+        Request a presigned URL for uploading an anonymous video file.
+        Anonymous videos do not expose the uploader's identity in the feed.
+
+        **Differences from Regular Upload:**
+        - Stricter rate limit: 128 MB/hour (50% of regular limit)
+        - No uploader info shown in feed responses
+        - User still owns the video (can delete/update via ownership)
+
+        **Upload Flow:**
+        1. Call this endpoint to get a `video_id` and `upload_url`
+        2. Upload the file directly to `upload_url` using HTTP PUT
+        3. Call `/videos/{id}/confirm` to trigger processing
+
+        **Rate Limiting:**
+        - Max 128 MB per hour per user (half of regular limit)
+        - Limit is based on cumulative file size
+      operationId: initAnonymousUpload
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InitUploadRequest"
+      responses:
+        "200":
+          description: Anonymous upload initialized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InitUploadResponse"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "429":
+          $ref: "#/components/responses/TooManyRequestsError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /videos/{id}/like:
     post:
@@ -471,7 +561,7 @@ paths:
         Toggles the like status for a video.
         - If not liked: adds a like
         - If already liked: removes the like
-        
+
         The `like_count` is updated atomically.
       operationId: likeVideo
       security:
@@ -486,14 +576,118 @@ paths:
             format: uuid
             example: 550e8400-e29b-41d4-a716-446655440000
       responses:
-        '200':
+        "200":
           description: Like status toggled
-        '401':
-          $ref: '#/components/responses/UnauthorizedError'
-        '404':
-          $ref: '#/components/responses/NotFoundError'
-        '500':
-          $ref: '#/components/responses/InternalServerError'
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /videos/{id}:
+    delete:
+      tags:
+        - Videos
+      summary: Delete video (soft-delete)
+      description: |
+        Soft-delete a video by setting the `deleted_at` timestamp.
+
+        **Behavior:**
+        - Video is removed from feed immediately
+        - Database record is preserved for audit trail
+        - Idempotent: deleting an already-deleted video returns 204
+        - Only the owner can delete their video
+        - Cache is invalidated if video was published
+
+        **Rate Limiting:**
+        - Max 10 deletions per hour per user
+        - Contact support for bulk deletions
+      operationId: deleteVideo
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Video ID
+          schema:
+            type: string
+            format: uuid
+            example: 550e8400-e29b-41d4-a716-446655440000
+      responses:
+        "204":
+          description: Video deleted successfully (or already deleted)
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "429":
+          $ref: "#/components/responses/TooManyRequestsError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+    patch:
+      tags:
+        - Videos
+      summary: Update video metadata
+      description: |
+        Update the title, description, or anonymity status of a video.
+
+        **Features:**
+        - Partial updates (only send fields you want to change)
+        - Validation: title ≤200 chars, description ≤2000 chars
+        - Retroactive anonymity toggle supported
+        - Only the owner can update metadata
+        - Cache is invalidated if video was published
+
+        **Rate Limiting:**
+        - Max 30 updates per hour per user
+      operationId: updateVideoMetadata
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Video ID
+          schema:
+            type: string
+            format: uuid
+            example: 550e8400-e29b-41d4-a716-446655440000
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateVideoRequest"
+            examples:
+              updateTitle:
+                summary: Update title only
+                value:
+                  title: My New Video Title
+              toggleAnonymity:
+                summary: Make video anonymous retroactively
+                value:
+                  is_anonymous: true
+              fullUpdate:
+                summary: Update all fields
+                value:
+                  title: Complete Update
+                  description: Updated description
+                  is_anonymous: false
+      responses:
+        "200":
+          description: Metadata updated successfully
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "429":
+          $ref: "#/components/responses/TooManyRequestsError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /feed:
     get:
@@ -502,16 +696,18 @@ paths:
       summary: Get video feed
       description: |
         Fetch a paginated list of published videos.
-        
+
         **Sorting Options:**
         - `random`: Random order (default)
         - `latest`: Most recent first
         - `popular`: Most liked first
-        
+
         **Pagination:**
         - Page size: 20 videos per page
         - Pages are 0-indexed
       operationId: getFeed
+      security:
+        - BearerAuth: []
       parameters:
         - name: sort
           in: query
@@ -535,13 +731,13 @@ paths:
             default: 0
             example: 0
       responses:
-        '200':
+        "200":
           description: Feed retrieved successfully
           content:
             application/json:
               schema:
                 type: array
                 items:
-                  $ref: '#/components/schemas/VideoFeedItem'
-        '500':
-          $ref: '#/components/responses/InternalServerError'
+                  $ref: "#/components/schemas/VideoFeedItem"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
