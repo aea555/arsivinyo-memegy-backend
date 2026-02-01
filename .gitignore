@@ -3,6 +3,7 @@ docs/
 **/*.rs.bk
 Cargo.lock
 .env
+.env.*
 .idea/
 .vscode/
 .DS_Store
