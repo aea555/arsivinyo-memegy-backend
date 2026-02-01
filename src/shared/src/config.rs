@@ -74,7 +74,7 @@ impl Config {
                 .parse()
                 .expect("SERVER_PORT must be a number"),
             oauth_redirect_base_url: env::var("OAUTH_REDIRECT_BASE_URL")
-                .unwrap_or_else(|_| "http://localhost:3000".to_string())
+                .unwrap_or_else(|_| "http://localhost:80".to_string())
                 .trim_end_matches('/')
                 .to_string(),
             cors_allowed_origins: env::var("CORS_ALLOWED_ORIGINS").unwrap_or_default(),

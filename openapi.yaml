@@ -22,7 +22,7 @@ info:
     name: MIT
 
 servers:
-  - url: http://localhost:3000
+  - url: http://localhost:80
     description: Local development server
   - url: https://api.memegy.arsivinyo.com
     description: Production server
@@ -121,8 +121,13 @@ components:
           type: string
           description: New JWT access token
           example: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+        refresh_token:
+          type: string
+          description: New refresh token (Old one is invalidated)
+          example: a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6
       required:
         - access_token
+        - refresh_token
 
     InitUploadRequest:
       type: object
@@ -500,10 +505,10 @@ paths:
     post:
       tags:
         - Authentication
-      summary: Refresh access token
+      summary: Refresh Access Token
       description: |
-        Exchanges a valid refresh token for a new access token.
-        The old access token (even if expired) must be provided to extract the user ID.
+        Use a valid refresh token to get a new access token.
+        **Rotation enforced:** A new refresh token is also issued, and the old one is immediately invalidated (deleted).
       operationId: refreshToken
       requestBody:
         required: true

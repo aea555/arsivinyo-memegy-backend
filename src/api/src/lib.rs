@@ -17,15 +17,22 @@ use state::AppState;
 use tower_http::cors::{Any, CorsLayer};
 
 async fn serve_docs() -> impl IntoResponse {
-    Html(include_str!("../../../static/docs.html"))
+    match std::fs::read_to_string("static/docs.html") {
+        Ok(content) => Html(content).into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "Docs not found").into_response(),
+    }
 }
 
 async fn serve_openapi() -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        [("content-type", "application/yaml")],
-        include_str!("../../../openapi.yaml"),
-    )
+    match std::fs::read_to_string("openapi.yaml") {
+        Ok(content) => (
+            StatusCode::OK,
+            [("content-type", "application/yaml")],
+            content,
+        )
+            .into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "OpenAPI definition not found").into_response(),
+    }
 }
 
 pub fn create_router(state: AppState) -> Router {

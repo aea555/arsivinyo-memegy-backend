@@ -24,14 +24,16 @@ RUN cargo chef cook --release --recipe-path recipe.json
 # API BUILDER (Only builds API binary)
 # ============================================
 FROM builder-base AS builder-api
-COPY . .
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
 RUN cargo build --release -p api -vv
 
 # ============================================
 # WORKER BUILDER (Only builds Worker binary)
 # ============================================
 FROM builder-base AS builder-worker
-COPY . .
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
 RUN cargo build --release -p worker -vv
 
 # ============================================
@@ -41,6 +43,8 @@ FROM debian:bookworm-slim AS api
 WORKDIR /app
 RUN apt-get update && apt-get install -y libssl3 ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=builder-api /app/target/release/api /app/api
+COPY openapi.yaml /app/openapi.yaml
+COPY static /app/static
 CMD ["/app/api"]
 
 # ============================================
