@@ -1,0 +1,249 @@
+services:
+  db:
+    image: postgres:18.1-alpine3.23
+    container_name: memegy_staging_db
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - ./data/staging/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  cache:
+    image: valkey/valkey:9.0.1-alpine
+    container_name: memegy_staging_cache
+    restart: always
+    command: valkey-server --requirepass "${VALKEY_PASSWORD}"
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - ./data/staging/valkey:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-a", "${VALKEY_PASSWORD}", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: memegy_staging_minio
+    restart: always
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    command: server /data --console-address ":9001"
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - ./data/staging/minio:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  minio-setup:
+    image: minio/mc:RELEASE.2025-01-17T23-25-50Z
+    container_name: memegy_staging_minio_setup
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      /usr/bin/mc alias set myminio http://minio:9000 '${MINIO_ROOT_USER}' '${MINIO_ROOT_PASSWORD}';
+      /usr/bin/mc mb myminio/${MINIO_BUCKET_VIDEOS} || true;
+      /usr/bin/mc mb myminio/${MINIO_BUCKET_RAW} || true;
+      /usr/bin/mc anonymous set public myminio/${MINIO_BUCKET_VIDEOS};
+      exit 0;
+      "
+
+  nginx:
+    image: nginx:1.28.1-alpine
+    container_name: memegy_staging_nginx
+    restart: always
+    ports:
+      - "127.0.0.1:8088:80"
+    volumes:
+      - ./nginx/templates:/etc/nginx/templates:Z
+    environment:
+      - NGINX_PORT=80
+      - ENVIRONMENT=${ENVIRONMENT}
+      - API_HOST=api
+      - SERVER_PORT=${SERVER_PORT}
+    depends_on:
+      - api
+
+  api:
+    build:
+      context: .
+      target: api
+    container_name: memegy_staging_api
+    restart: always
+    depends_on:
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      # Server
+      RUST_LOG: ${RUST_LOG}
+      SERVER_HOST: 0.0.0.0
+      SERVER_PORT: 3000
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS}
+      JWT_SECRET: ${JWT_SECRET}
+      ENVIRONMENT: ${ENVIRONMENT}
+      REQUIRE_CLOUDFLARE_HEADERS: ${REQUIRE_CLOUDFLARE_HEADERS}
+
+      # Token TTLs
+      ACCESS_TOKEN_TTL_SECS: ${ACCESS_TOKEN_TTL_SECS}
+      REFRESH_TOKEN_TTL_DAYS: ${REFRESH_TOKEN_TTL_DAYS}
+
+      # Auth
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+
+      # Database
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+
+      # Cache
+      VALKEY_URL: redis://:${VALKEY_PASSWORD}@cache:6379
+
+      # Storage
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_PUBLIC_ENDPOINT: ${MINIO_PUBLIC_ENDPOINT}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_BUCKET_VIDEOS: ${MINIO_BUCKET_VIDEOS}
+      MINIO_BUCKET_RAW: ${MINIO_BUCKET_RAW}
+      PRESIGNED_URL_EXPIRY_SECS: ${PRESIGNED_URL_EXPIRY_SECS}
+
+      # Limits
+      MAX_FILE_SIZE_BYTES: ${MAX_FILE_SIZE_BYTES}
+      LIMIT_UPLOAD_BYTES_HOURLY: ${LIMIT_UPLOAD_BYTES_HOURLY}
+      LIMIT_FEED_RPM: ${LIMIT_FEED_RPM}
+      RATE_LIMIT_WINDOW_SECS: ${RATE_LIMIT_WINDOW_SECS}
+      IP_RATE_LIMIT_RPM: ${IP_RATE_LIMIT_RPM}
+
+      # Feed
+      FEED_PAGE_SIZE: ${FEED_PAGE_SIZE}
+      FEED_CACHE_TTL_SECS: ${FEED_CACHE_TTL_SECS}
+
+      # Worker
+      DRAFT_VIDEO_CLEANUP_HOURS: ${DRAFT_VIDEO_CLEANUP_HOURS}
+      WORKER_RETRY_MAX_ATTEMPTS: ${WORKER_RETRY_MAX_ATTEMPTS}
+      WORKER_RETRY_BACKOFF_BASE_SECS: ${WORKER_RETRY_BACKOFF_BASE_SECS}
+
+      # Search
+      SEARCH_MAX_TOKENS: ${SEARCH_MAX_TOKENS}
+      SEARCH_MAX_TOKEN_LENGTH: ${SEARCH_MAX_TOKEN_LENGTH}
+      SEARCH_MAX_QUERY_CHARS: ${SEARCH_MAX_QUERY_CHARS}
+      SEARCH_TIMEOUT_SECS: ${SEARCH_TIMEOUT_SECS}
+      SEARCH_CACHE_TTL_SECS: ${SEARCH_CACHE_TTL_SECS}
+      SEARCH_RPM_LIMIT: ${SEARCH_RPM_LIMIT}
+
+      # Download
+      DOWNLOAD_RPM_LIMIT: ${DOWNLOAD_RPM_LIMIT}
+      DOWNLOAD_BANDWIDTH_HOURLY_MB: ${DOWNLOAD_BANDWIDTH_HOURLY_MB}
+      PRESIGNED_DOWNLOAD_URL_EXPIRY_SECS: ${PRESIGNED_DOWNLOAD_URL_EXPIRY_SECS}
+      DOWNLOAD_REFRESH_RPM_LIMIT: ${DOWNLOAD_REFRESH_RPM_LIMIT}
+
+      # Bulk Download
+      MAX_BULK_DOWNLOAD_COUNT: ${MAX_BULK_DOWNLOAD_COUNT}
+      BULK_DOWNLOAD_ACTIVE_JOBS_LIMIT: ${BULK_DOWNLOAD_ACTIVE_JOBS_LIMIT}
+      BULK_DOWNLOAD_DAILY_LIMIT: ${BULK_DOWNLOAD_DAILY_LIMIT}
+      MINIO_BUCKET_DOWNLOADS: ${MINIO_BUCKET_DOWNLOADS}
+      BULK_DOWNLOAD_ZIP_EXPIRY_DAYS: ${BULK_DOWNLOAD_ZIP_EXPIRY_DAYS}
+
+  worker:
+    build:
+      context: .
+      target: worker
+    container_name: memegy_staging_worker
+    restart: always
+    depends_on:
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      # Server
+      RUST_LOG: ${RUST_LOG}
+      SERVER_HOST: 0.0.0.0
+      SERVER_PORT: 3000
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS}
+      JWT_SECRET: ${JWT_SECRET}
+      ENVIRONMENT: ${ENVIRONMENT}
+      REQUIRE_CLOUDFLARE_HEADERS: ${REQUIRE_CLOUDFLARE_HEADERS}
+
+      # Token TTLs
+      ACCESS_TOKEN_TTL_SECS: ${ACCESS_TOKEN_TTL_SECS}
+      REFRESH_TOKEN_TTL_DAYS: ${REFRESH_TOKEN_TTL_DAYS}
+
+      # Auth
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+
+      # Database
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+
+      # Cache
+      VALKEY_URL: redis://:${VALKEY_PASSWORD}@cache:6379
+
+      # Storage
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_PUBLIC_ENDPOINT: ${MINIO_PUBLIC_ENDPOINT}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_BUCKET_VIDEOS: ${MINIO_BUCKET_VIDEOS}
+      MINIO_BUCKET_RAW: ${MINIO_BUCKET_RAW}
+      PRESIGNED_URL_EXPIRY_SECS: ${PRESIGNED_URL_EXPIRY_SECS}
+
+      # Limits
+      MAX_FILE_SIZE_BYTES: ${MAX_FILE_SIZE_BYTES}
+      LIMIT_UPLOAD_BYTES_HOURLY: ${LIMIT_UPLOAD_BYTES_HOURLY}
+      LIMIT_FEED_RPM: ${LIMIT_FEED_RPM}
+      RATE_LIMIT_WINDOW_SECS: ${RATE_LIMIT_WINDOW_SECS}
+      IP_RATE_LIMIT_RPM: ${IP_RATE_LIMIT_RPM}
+
+      # Feed
+      FEED_PAGE_SIZE: ${FEED_PAGE_SIZE}
+      FEED_CACHE_TTL_SECS: ${FEED_CACHE_TTL_SECS}
+
+      # Worker
+      DRAFT_VIDEO_CLEANUP_HOURS: ${DRAFT_VIDEO_CLEANUP_HOURS}
+      WORKER_RETRY_MAX_ATTEMPTS: ${WORKER_RETRY_MAX_ATTEMPTS}
+      WORKER_RETRY_BACKOFF_BASE_SECS: ${WORKER_RETRY_BACKOFF_BASE_SECS}
+
+      # Search
+      SEARCH_MAX_TOKENS: ${SEARCH_MAX_TOKENS}
+      SEARCH_MAX_TOKEN_LENGTH: ${SEARCH_MAX_TOKEN_LENGTH}
+      SEARCH_MAX_QUERY_CHARS: ${SEARCH_MAX_QUERY_CHARS}
+      SEARCH_TIMEOUT_SECS: ${SEARCH_TIMEOUT_SECS}
+      SEARCH_CACHE_TTL_SECS: ${SEARCH_CACHE_TTL_SECS}
+      SEARCH_RPM_LIMIT: ${SEARCH_RPM_LIMIT}
+
+      # Download
+      DOWNLOAD_RPM_LIMIT: ${DOWNLOAD_RPM_LIMIT}
+      DOWNLOAD_BANDWIDTH_HOURLY_MB: ${DOWNLOAD_BANDWIDTH_HOURLY_MB}
+      PRESIGNED_DOWNLOAD_URL_EXPIRY_SECS: ${PRESIGNED_DOWNLOAD_URL_EXPIRY_SECS}
+      DOWNLOAD_REFRESH_RPM_LIMIT: ${DOWNLOAD_REFRESH_RPM_LIMIT}
+
+      # Bulk Download
+      MAX_BULK_DOWNLOAD_COUNT: ${MAX_BULK_DOWNLOAD_COUNT}
+      BULK_DOWNLOAD_ACTIVE_JOBS_LIMIT: ${BULK_DOWNLOAD_ACTIVE_JOBS_LIMIT}
+      BULK_DOWNLOAD_DAILY_LIMIT: ${BULK_DOWNLOAD_DAILY_LIMIT}
+      MINIO_BUCKET_DOWNLOADS: ${MINIO_BUCKET_DOWNLOADS}
+      BULK_DOWNLOAD_ZIP_EXPIRY_DAYS: ${BULK_DOWNLOAD_ZIP_EXPIRY_DAYS}
