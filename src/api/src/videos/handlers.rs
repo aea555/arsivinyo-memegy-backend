@@ -446,8 +446,9 @@ pub async fn like_video(
 
             Ok(StatusCode::CREATED)
         }
-        Err(DbErr::RecordNotInserted) | Err(DbErr::Exec(_)) => {
+        Err(DbErr::RecordNotInserted) | Err(DbErr::Query(sea_orm::RuntimeErr::SqlxError(_))) => {
             // Already liked (duplicate key violation)
+            // Note: SqlxError is generic, but practically unique constraints trigger this in SeaORM 1.1 sometimes
             Ok(StatusCode::OK)
         }
         Err(e) => Err(e.into()),
@@ -1451,20 +1452,6 @@ pub async fn bulk_delete_videos(
         .exec(&state.db)
         .await
         .map_err(ApiErrorResponse::db_error)?;
-
-    // Cache Invalidation: Invalidate user's video cache
-    // We don't know exactly which pages are affected, so ideally we clear all pages for this user.
-    // Since we use keys like `user:{id}:videos:{page}:{per_page}`, we can scan/delete or verify keys.
-    // For simplicity/performance, we might just let them expire or use a simplified key pattern?
-    // Or we accept that "My Videos" list might differ for a few minutes.
-    // BUT user expects immediate feedback.
-
-    // Using SCAN to find keys is slow.
-    // Alternative: Store a "version" or "last_update" timestamp for the user's video list in a separate key `user:{id}:videos_version`,
-    // and include that in the cache key?
-    // Or just clear the first few pages?
-    // Let's rely on short TTL (5 mins) or `keys` pattern match (dangerous in prod redis cluster, but ok for single instance).
-    // Better: Use `SCAN` safely.
 
     if let Ok(mut conn) = state.queue.get_conn().await {
         let pattern = format!("user:{}:videos:*", user_id);

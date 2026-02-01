@@ -81,7 +81,7 @@ pub async fn get_me(
 pub async fn delete_account(
     State(state): State<AppState>,
     TypedHeader(auth): TypedHeader<Authorization<Bearer>>,
-) -> ApiResult<()> {
+) -> ApiResult<axum::http::StatusCode> {
     let token = auth.token();
     let claims = AuthService::validate_token(token, &state.config.jwt_secret)
         .map_err(|_| ApiErrorResponse::unauthorized("Invalid token"))?;
@@ -121,7 +121,7 @@ pub async fn delete_account(
         let _: Result<(), _> = conn.del(&format!("user:{}:profile", user_id)).await;
     }
 
-    Ok(())
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 /// GET /users/me/videos

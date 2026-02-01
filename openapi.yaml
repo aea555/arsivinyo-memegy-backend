@@ -246,6 +246,8 @@ components:
         - download_url
         - expires_in_seconds
 
+        - video_ids
+
     BulkDeleteRequest:
       type: object
       properties:
@@ -256,6 +258,78 @@ components:
             format: uuid
           description: List of video IDs to delete
       required:
+        - video_ids
+
+    CreateBulkDownloadRequest:
+      type: object
+      properties:
+        video_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+          minItems: 1
+          maxItems: 10
+        idempotency_key:
+          type: string
+          nullable: true
+          description: Optional key to prevent duplicate jobs
+      required:
+        - video_ids
+
+    BulkDownloadJobResponse:
+      type: object
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [PENDING, PROCESSING, COMPLETED, FAILED]
+        video_count:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+      required:
+        - job_id
+        - status
+        - video_count
+        - created_at
+
+    BulkDownloadStatus:
+      type: object
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+        video_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+        download_url:
+          type: string
+          format: uri
+          nullable: true
+        zip_size_bytes:
+          type: integer
+          format: int64
+          nullable: true
+        error_message:
+          type: string
+          nullable: true
+        retry_count:
+          type: integer
+      required:
+        - job_id
+        - status
         - video_ids
 
   responses:
@@ -891,7 +965,7 @@ paths:
           $ref: "#/components/responses/InternalServerError"
 
   /videos/{id}/download/refresh:
-    get:
+    post:
       tags:
         - Videos
       summary: Refresh download URL
@@ -1171,3 +1245,55 @@ paths:
           $ref: "#/components/responses/UnauthorizedError"
         "500":
           $ref: "#/components/responses/InternalServerError"
+
+  # /videos/download/bulk:
+  #   post:
+  #     tags:
+  #       - Videos
+  #     summary: Create bulk download job
+  #     description: Create a ZIP download job for multiple videos (max 10).
+  #     operationId: createBulkDownload
+  #     security:
+  #       - BearerAuth: []
+  #     requestBody:
+  #       required: true
+  #       content:
+  #         application/json:
+  #           schema:
+  #             $ref: "#/components/schemas/CreateBulkDownloadRequest"
+  #     responses:
+  #       "200":
+  #         description: Job created
+  #         content:
+  #           application/json:
+  #             schema:
+  #               $ref: "#/components/schemas/BulkDownloadJobResponse"
+  #       "429":
+  #         $ref: "#/components/responses/TooManyRequestsError"
+  #       "500":
+  #         $ref: "#/components/responses/InternalServerError"
+
+  # /videos/download/bulk/{id}:
+  #   get:
+  #     tags:
+  #       - Videos
+  #     summary: Get bulk download job status
+  #     operationId: getBulkDownloadStatus
+  #     security:
+  #       - BearerAuth: []
+  #     parameters:
+  #       - name: id
+  #         in: path
+  #         required: true
+  #         schema:
+  #           type: string
+  #           format: uuid
+  #     responses:
+  #       "200":
+  #         description: Job status retrieved
+  #         content:
+  #           application/json:
+  #             schema:
+  #               $ref: "#/components/schemas/BulkDownloadStatus"
+  #       "404":
+  #         $ref: "#/components/responses/NotFoundError"
