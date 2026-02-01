@@ -43,10 +43,7 @@ impl Related<super::likes::Entity> for Entity {
 
 impl Related<super::users::Entity> for Entity {
     fn to() -> RelationDef {
-        super::likes::Relation::Users.def()
-    }
-    fn via() -> Option<RelationDef> {
-        Some(super::likes::Relation::Videos.def().rev())
+        Relation::Users.def()
     }
 }
 

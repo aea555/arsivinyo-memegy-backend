@@ -7,18 +7,18 @@ use sea_orm_migration::MigratorTrait;
 use shared::{config::Config, queue::QueueService, storage::StorageBackend};
 use std::sync::Arc;
 use std::time::Duration;
-use testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt};
+use testcontainers::{runners::AsyncRunner, ContainerAsync};
 use testcontainers_modules::{postgres::Postgres, redis::Redis};
 use tokio::net::TcpListener;
 
 pub struct TestApp {
     pub address: String,
     pub db: sea_orm::DatabaseConnection, // Exposed for assertions
-    pub config: Config,                  // Exposed for assertions
+    pub _config: Config,                 // Keep alive / potential use
 
     // Containers kept alive
-    pub pg_container: ContainerAsync<Postgres>,
-    pub redis_container: ContainerAsync<Redis>,
+    pub _pg_container: ContainerAsync<Postgres>,
+    pub _redis_container: ContainerAsync<Redis>,
 }
 
 #[derive(Clone)]
@@ -177,9 +177,9 @@ pub async fn spawn_app() -> TestApp {
     TestApp {
         address,
         db,
-        config,
-        pg_container,
-        redis_container,
+        _config: config,
+        _pg_container: pg_container,
+        _redis_container: redis_container,
     }
 }
 
@@ -209,5 +209,90 @@ impl TestApp {
             .as_str()
             .expect("Token missing")
             .to_string()
+    }
+
+    pub async fn init_upload(
+        &self,
+        token: &str,
+        filename: &str,
+        size_bytes: i64,
+    ) -> (String, String) {
+        let client = reqwest::Client::new();
+        let response = client
+            .post(&format!("{}/videos/init", self.address))
+            .header("Authorization", format!("Bearer {}", token))
+            .json(&serde_json::json!({
+                "filename": filename,
+                "size_bytes": size_bytes
+            }))
+            .send()
+            .await
+            .expect("Init upload request failed");
+
+        if !response.status().is_success() {
+            panic!(
+                "Init upload failed: status={}, body={}",
+                response.status(),
+                response.text().await.unwrap_or_default()
+            );
+        }
+
+        let body: serde_json::Value = response.json().await.expect("Failed to parse json");
+        let video_id = body["video_id"]
+            .as_str()
+            .expect("video_id missing")
+            .to_string();
+        let upload_url = body["upload_url"]
+            .as_str()
+            .expect("upload_url missing")
+            .to_string();
+        (video_id, upload_url)
+    }
+
+    pub async fn confirm_upload(&self, token: &str, video_id: &str) {
+        let client = reqwest::Client::new();
+        let response = client
+            .post(&format!("{}/videos/{}/confirm", self.address, video_id))
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await
+            .expect("Confirm upload request failed");
+
+        if !response.status().is_success() {
+            panic!(
+                "Confirm upload failed: status={}, body={}",
+                response.status(),
+                response.text().await.unwrap_or_default()
+            );
+        }
+    }
+
+    /// Helper to directly insert a published video into the DB for testing feeds/deletion
+    pub async fn create_dummy_video(&self, user_id: uuid::Uuid, is_anonymous: bool) -> uuid::Uuid {
+        use sea_orm::{ActiveModelTrait, Set};
+        use shared::entities::videos;
+
+        let video_id = uuid::Uuid::new_v4();
+        let video = videos::ActiveModel {
+            id: Set(video_id),
+            user_id: Set(user_id),
+            title: Set(Some(format!("Test Video {}", video_id))),
+            description: Set(Some("Description".to_string())),
+            s3_bucket: Set("raw".to_string()),
+            s3_key: Set(format!("{}/{}.mp4", user_id, video_id)),
+            status: Set("PUBLISHED".to_string()), // Directly published
+            size_bytes: Set(1024),
+            like_count: Set(0),
+            is_anonymous: Set(is_anonymous),
+            deleted_at: Set(None),
+            created_at: Set(chrono::Utc::now().into()),
+            updated_at: Set(chrono::Utc::now().into()),
+        };
+
+        video
+            .insert(&self.db)
+            .await
+            .expect("Failed to insert dummy video");
+        video_id
     }
 }

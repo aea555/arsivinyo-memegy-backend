@@ -80,7 +80,9 @@ pub async fn get_feed(
     }
 
     let sort = query.sort.as_deref().unwrap_or("random");
-    let page = query.page.unwrap_or(0);
+    // Standardize on 1-based pagination for API
+    let page = query.page.unwrap_or(1);
+    let page = if page > 0 { page - 1 } else { 0 };
     let page_size = state.config.feed_page_size;
 
     // Try cache first (skip for random to keep it truly random)

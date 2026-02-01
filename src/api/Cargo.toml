@@ -25,7 +25,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 oauth2 = "4.4"
 jsonwebtoken = "10.3.0"
 axum-extra = { version = "0.9.0", features = ["cookie", "typed-header"] }
-reqwest = { version = "0.13.1", features = ["form", "json"] }
+reqwest = { version = "0.13.1", features = ["form", "json", "query"] }
 sea-orm = "1.1.19"
 sea-orm-migration = "1.1.19"
 redis = { version = "1.0.2", features = ["tokio-comp"] }
@@ -39,7 +39,7 @@ time = "0.3.46"
 async-trait = "0.1.89"
 
 [dev-dependencies]
-reqwest = "0.13.1"
+reqwest = { version = "0.13.1", features = ["json", "multipart", "form", "query"] }
 serde_json = "1.0"
 testcontainers = "0.26.3"
 testcontainers-modules = { version = "0.14.0", features = ["postgres", "redis"] }

@@ -42,3 +42,5 @@ rust-toolchain.toml
 rust-toolchain
 
 docs/
+
+src/api/tests/
