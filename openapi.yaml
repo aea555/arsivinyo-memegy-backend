@@ -5,21 +5,24 @@ info:
   description: |
     A high-performance meme archive backend built with Rust. 
     This API allows users to upload, like, and discover short meme videos.
-    
+
     ## Authentication
     This API uses **Bearer Token** authentication via JWT. Obtain tokens through the Google OAuth flow.
-    
+
     ## Rate Limits
-    - **Upload**: 50MB per hour per user (configurable)
-    - **Feed**: 60 requests per minute (configurable)
-    
+    - **Regular Upload**: 256 MB per hour per user
+    - **Anonymous Upload**: 128 MB per hour per user (stricter due to abuse risk)
+    - **Feed Access**: 30 requests per minute
+    - **Video Deletion**: 10 deletions per hour per user
+    - **Metadata Updates**: 30 updates per hour per user
+
   contact:
     name: Arsivinyo Team
   license:
     name: MIT
 
 servers:
-  - url: http://localhost:3000
+  - url: http://localhost:80
     description: Local development server
   - url: https://api.memegy.arsivinyo.com
     description: Production server
@@ -33,6 +36,8 @@ tags:
     description: Video upload and management
   - name: Feed
     description: Video discovery and social features
+  - name: Users
+    description: User profile and account management
 
 components:
   securitySchemes:
@@ -64,7 +69,7 @@ components:
           description: Opaque refresh token (valid for 14 days)
           example: a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6
         user:
-          $ref: '#/components/schemas/UserDto'
+          $ref: "#/components/schemas/UserDto"
       required:
         - access_token
         - refresh_token
@@ -84,6 +89,11 @@ components:
           type: string
           format: email
           example: john@example.com
+        avatar_url:
+          type: string
+          format: uri
+          nullable: true
+          example: https://lh3.googleusercontent.com/a/ACg8oc...
       required:
         - id
         - username
@@ -111,8 +121,13 @@ components:
           type: string
           description: New JWT access token
           example: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+        refresh_token:
+          type: string
+          description: New refresh token (Old one is invalidated)
+          example: a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6
       required:
         - access_token
+        - refresh_token
 
     InitUploadRequest:
       type: object
@@ -148,6 +163,43 @@ components:
         - video_id
         - upload_url
 
+    UploaderInfo:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: User ID
+          example: 550e8400-e29b-41d4-a716-446655440000
+        username:
+          type: string
+          description: Username
+          example: john_doe
+      required:
+        - id
+        - username
+
+    UpdateVideoRequest:
+      type: object
+      properties:
+        title:
+          type: string
+          maxLength: 200
+          nullable: true
+          description: Video title (max 200 characters)
+          example: My Awesome Video
+        description:
+          type: string
+          maxLength: 2000
+          nullable: true
+          description: Video description (max 2000 characters)
+          example: This is a longer description of my video...
+        is_anonymous:
+          type: boolean
+          nullable: true
+          description: Toggle anonymity (hides uploader info in feed)
+          example: false
+
     VideoFeedItem:
       type: object
       properties:
@@ -172,11 +224,118 @@ components:
           type: string
           format: date-time
           example: 2026-01-28T17:30:00Z
+        uploader:
+          allOf:
+            - $ref: "#/components/schemas/UploaderInfo"
+          nullable: true
+          description: Uploader information (null if video is anonymous)
       required:
         - id
         - url
         - like_count
         - created_at
+
+    RefreshDownloadResponse:
+      type: object
+      properties:
+        download_url:
+          type: string
+          format: uri
+          description: Fresh presigned S3 GET URL (60s TTL)
+          example: http://localhost:9000/videos-public/550e8400.../video.mp4?X-Amz-...
+        expires_in_seconds:
+          type: integer
+          description: URL expiry time in seconds
+          example: 60
+      required:
+        - download_url
+        - expires_in_seconds
+
+        - video_ids
+
+    BulkDeleteRequest:
+      type: object
+      properties:
+        video_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: List of video IDs to delete
+      required:
+        - video_ids
+
+    CreateBulkDownloadRequest:
+      type: object
+      properties:
+        video_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+          minItems: 1
+          maxItems: 10
+        idempotency_key:
+          type: string
+          nullable: true
+          description: Optional key to prevent duplicate jobs
+      required:
+        - video_ids
+
+    BulkDownloadJobResponse:
+      type: object
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [PENDING, PROCESSING, COMPLETED, FAILED]
+        video_count:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+      required:
+        - job_id
+        - status
+        - video_count
+        - created_at
+
+    BulkDownloadStatus:
+      type: object
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+        video_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+        download_url:
+          type: string
+          format: uri
+          nullable: true
+        zip_size_bytes:
+          type: integer
+          format: int64
+          nullable: true
+        error_message:
+          type: string
+          nullable: true
+        retry_count:
+          type: integer
+      required:
+        - job_id
+        - status
+        - video_ids
 
   responses:
     UnauthorizedError:
@@ -184,7 +343,7 @@ components:
       content:
         application/json:
           schema:
-            $ref: '#/components/schemas/ErrorResponse'
+            $ref: "#/components/schemas/ErrorResponse"
           example:
             error: Unauthorized
 
@@ -193,7 +352,7 @@ components:
       content:
         application/json:
           schema:
-            $ref: '#/components/schemas/ErrorResponse'
+            $ref: "#/components/schemas/ErrorResponse"
           example:
             error: Rate limit exceeded
 
@@ -202,7 +361,7 @@ components:
       content:
         application/json:
           schema:
-            $ref: '#/components/schemas/ErrorResponse'
+            $ref: "#/components/schemas/ErrorResponse"
           example:
             error: Not found
 
@@ -211,7 +370,7 @@ components:
       content:
         application/json:
           schema:
-            $ref: '#/components/schemas/ErrorResponse'
+            $ref: "#/components/schemas/ErrorResponse"
           example:
             error: Invalid request
 
@@ -220,7 +379,7 @@ components:
       content:
         application/json:
           schema:
-            $ref: '#/components/schemas/ErrorResponse'
+            $ref: "#/components/schemas/ErrorResponse"
           example:
             error: Internal server error
 
@@ -233,7 +392,7 @@ paths:
       description: Returns OK if the server is running
       operationId: healthCheck
       responses:
-        '200':
+        "200":
           description: Server is healthy
           content:
             text/plain:
@@ -249,13 +408,13 @@ paths:
       description: |
         Redirects the user to Google's OAuth2 consent page.
         After authentication, Google redirects back to `/auth/google/callback`.
-        
+
         **Note for API Testing:**
         This endpoint is designed for browser-based flows and will redirect to Google's login page.
         For API testing without a browser, use the `/auth/dev/login` endpoint instead (development only).
       operationId: googleLogin
       responses:
-        '302':
+        "302":
           description: Redirect to Google OAuth2 consent page
           headers:
             Location:
@@ -271,10 +430,10 @@ paths:
       summary: Development login (bypasses Google OAuth)
       description: |
         **⚠️ DEVELOPMENT ONLY** - Only available when `RUST_LOG` contains "debug" or "trace".
-        
+
         Creates or retrieves a test user and issues access/refresh tokens without Google OAuth.
         Perfect for testing the API with Postman, curl, or other API clients.
-        
+
         **Production Behavior:**
         This endpoint returns 404 in production environments.
       operationId: devLogin
@@ -296,16 +455,16 @@ paths:
                 - username
                 - email
       responses:
-        '200':
+        "200":
           description: Successfully authenticated
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/AuthResponse'
-        '404':
+                $ref: "#/components/schemas/AuthResponse"
+        "404":
           description: Endpoint not available (production mode)
-        '500':
-          $ref: '#/components/responses/InternalServerError'
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /auth/google/callback:
     get:
@@ -331,43 +490,43 @@ paths:
           schema:
             type: string
       responses:
-        '200':
+        "200":
           description: Successfully authenticated
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/AuthResponse'
-        '401':
-          $ref: '#/components/responses/UnauthorizedError'
-        '500':
-          $ref: '#/components/responses/InternalServerError'
+                $ref: "#/components/schemas/AuthResponse"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /auth/refresh:
     post:
       tags:
         - Authentication
-      summary: Refresh access token
+      summary: Refresh Access Token
       description: |
-        Exchanges a valid refresh token for a new access token.
-        The old access token (even if expired) must be provided to extract the user ID.
+        Use a valid refresh token to get a new access token.
+        **Rotation enforced:** A new refresh token is also issued, and the old one is immediately invalidated (deleted).
       operationId: refreshToken
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/RefreshRequest'
+              $ref: "#/components/schemas/RefreshRequest"
       responses:
-        '200':
+        "200":
           description: New access token issued
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/RefreshResponse'
-        '401':
-          $ref: '#/components/responses/UnauthorizedError'
-        '500':
-          $ref: '#/components/responses/InternalServerError'
+                $ref: "#/components/schemas/RefreshResponse"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /auth/logout:
     post:
@@ -381,12 +540,12 @@ paths:
       security:
         - BearerAuth: []
       responses:
-        '200':
+        "200":
           description: Successfully logged out
-        '401':
-          $ref: '#/components/responses/UnauthorizedError'
-        '500':
-          $ref: '#/components/responses/InternalServerError'
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /videos/init:
     post:
@@ -395,12 +554,12 @@ paths:
       summary: Initialize video upload
       description: |
         Request a presigned URL for uploading a video file.
-        
+
         **Upload Flow:**
         1. Call this endpoint to get a `video_id` and `upload_url`
         2. Upload the file directly to `upload_url` using HTTP PUT
         3. Call `/videos/{id}/confirm` to trigger processing
-        
+
         **Rate Limiting:**
         - Max 50MB per hour per user (configurable)
         - Limit is based on cumulative file size, not number of uploads
@@ -412,20 +571,20 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/InitUploadRequest'
+              $ref: "#/components/schemas/InitUploadRequest"
       responses:
-        '200':
+        "200":
           description: Upload initialized
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/InitUploadResponse'
-        '401':
-          $ref: '#/components/responses/UnauthorizedError'
-        '429':
-          $ref: '#/components/responses/TooManyRequestsError'
-        '500':
-          $ref: '#/components/responses/InternalServerError'
+                $ref: "#/components/schemas/InitUploadResponse"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "429":
+          $ref: "#/components/responses/TooManyRequestsError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /videos/{id}/confirm:
     post:
@@ -435,7 +594,7 @@ paths:
       description: |
         Confirms that the file has been uploaded to the presigned URL.
         Triggers background processing (compression, thumbnail generation).
-        
+
         **Status Flow:**
         - `DRAFT` → `PROCESSING` → `PUBLISHED` (or `FAILED`)
       operationId: confirmUpload
@@ -451,16 +610,61 @@ paths:
             format: uuid
             example: 550e8400-e29b-41d4-a716-446655440000
       responses:
-        '202':
+        "202":
           description: Upload confirmed, processing started
-        '400':
-          $ref: '#/components/responses/BadRequestError'
-        '401':
-          $ref: '#/components/responses/UnauthorizedError'
-        '404':
-          $ref: '#/components/responses/NotFoundError'
-        '500':
-          $ref: '#/components/responses/InternalServerError'
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /videos/init/anonymous:
+    post:
+      tags:
+        - Videos
+      summary: Initialize anonymous video upload
+      description: |
+        Request a presigned URL for uploading an anonymous video file.
+        Anonymous videos do not expose the uploader's identity in the feed.
+
+        **Differences from Regular Upload:**
+        - Stricter rate limit: 128 MB/hour (50% of regular limit)
+        - No uploader info shown in feed responses
+        - User still owns the video (can delete/update via ownership)
+
+        **Upload Flow:**
+        1. Call this endpoint to get a `video_id` and `upload_url`
+        2. Upload the file directly to `upload_url` using HTTP PUT
+        3. Call `/videos/{id}/confirm` to trigger processing
+
+        **Rate Limiting:**
+        - Max 128 MB per hour per user (half of regular limit)
+        - Limit is based on cumulative file size
+      operationId: initAnonymousUpload
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InitUploadRequest"
+      responses:
+        "200":
+          description: Anonymous upload initialized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InitUploadResponse"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "429":
+          $ref: "#/components/responses/TooManyRequestsError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /videos/{id}/like:
     post:
@@ -471,7 +675,7 @@ paths:
         Toggles the like status for a video.
         - If not liked: adds a like
         - If already liked: removes the like
-        
+
         The `like_count` is updated atomically.
       operationId: likeVideo
       security:
@@ -486,14 +690,118 @@ paths:
             format: uuid
             example: 550e8400-e29b-41d4-a716-446655440000
       responses:
-        '200':
+        "200":
           description: Like status toggled
-        '401':
-          $ref: '#/components/responses/UnauthorizedError'
-        '404':
-          $ref: '#/components/responses/NotFoundError'
-        '500':
-          $ref: '#/components/responses/InternalServerError'
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /videos/{id}:
+    delete:
+      tags:
+        - Videos
+      summary: Delete video (soft-delete)
+      description: |
+        Soft-delete a video by setting the `deleted_at` timestamp.
+
+        **Behavior:**
+        - Video is removed from feed immediately
+        - Database record is preserved for audit trail
+        - Idempotent: deleting an already-deleted video returns 204
+        - Only the owner can delete their video
+        - Cache is invalidated if video was published
+
+        **Rate Limiting:**
+        - Max 10 deletions per hour per user
+        - Contact support for bulk deletions
+      operationId: deleteVideo
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Video ID
+          schema:
+            type: string
+            format: uuid
+            example: 550e8400-e29b-41d4-a716-446655440000
+      responses:
+        "204":
+          description: Video deleted successfully (or already deleted)
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "429":
+          $ref: "#/components/responses/TooManyRequestsError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+    patch:
+      tags:
+        - Videos
+      summary: Update video metadata
+      description: |
+        Update the title, description, or anonymity status of a video.
+
+        **Features:**
+        - Partial updates (only send fields you want to change)
+        - Validation: title ≤200 chars, description ≤2000 chars
+        - Retroactive anonymity toggle supported
+        - Only the owner can update metadata
+        - Cache is invalidated if video was published
+
+        **Rate Limiting:**
+        - Max 30 updates per hour per user
+      operationId: updateVideoMetadata
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Video ID
+          schema:
+            type: string
+            format: uuid
+            example: 550e8400-e29b-41d4-a716-446655440000
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateVideoRequest"
+            examples:
+              updateTitle:
+                summary: Update title only
+                value:
+                  title: My New Video Title
+              toggleAnonymity:
+                summary: Make video anonymous retroactively
+                value:
+                  is_anonymous: true
+              fullUpdate:
+                summary: Update all fields
+                value:
+                  title: Complete Update
+                  description: Updated description
+                  is_anonymous: false
+      responses:
+        "200":
+          description: Metadata updated successfully
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "429":
+          $ref: "#/components/responses/TooManyRequestsError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /feed:
     get:
@@ -502,16 +810,18 @@ paths:
       summary: Get video feed
       description: |
         Fetch a paginated list of published videos.
-        
+
         **Sorting Options:**
         - `random`: Random order (default)
         - `latest`: Most recent first
         - `popular`: Most liked first
-        
+
         **Pagination:**
         - Page size: 20 videos per page
         - Pages are 0-indexed
       operationId: getFeed
+      security:
+        - BearerAuth: []
       parameters:
         - name: sort
           in: query
@@ -535,13 +845,460 @@ paths:
             default: 0
             example: 0
       responses:
-        '200':
+        "200":
           description: Feed retrieved successfully
           content:
             application/json:
               schema:
                 type: array
                 items:
-                  $ref: '#/components/schemas/VideoFeedItem'
-        '500':
-          $ref: '#/components/responses/InternalServerError'
+                  $ref: "#/components/schemas/VideoFeedItem"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /videos/search:
+    get:
+      tags:
+        - Videos
+      summary: Search videos
+      description: |
+        Full-text search using PostgreSQL FTS with multiple sort options.
+        Supports pagination and relevance ranking.
+      operationId: searchVideos
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: q
+          in: query
+          required: true
+          description: Search query (max 200 characters)
+          schema:
+            type: string
+            maxLength: 200
+            example: "funny cat"
+        - name: limit
+          in: query
+          required: false
+          description: "Max results per page (default: 20, max: 100)"
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: offset
+          in: query
+          required: false
+          description: Pagination offset
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: sort
+          in: query
+          required: false
+          description: Sort mode
+          schema:
+            type: string
+            enum:
+              - relevance
+              - recent
+              - popular
+            default: relevance
+      responses:
+        "200":
+          description: Search results
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/VideoFeedItem"
+        "400":
+          description: Invalid query parameters
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          description: Rate limit exceeded (30 searches/min)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /videos/{id}/download:
+    get:
+      tags:
+        - Videos
+      summary: Download video
+      description: |
+        Redirects to a presigned S3 URL (60s TTL) for video download.
+        Rate limits: 30/min +  500MB/hour bandwidth.
+      operationId: downloadVideo
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "302":
+          description: Redirect to presigned S3 URL
+          headers:
+            Location:
+              schema:
+                type: string
+                format: uri
+        "404":
+          description: Video not found or deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /videos/{id}/download/refresh:
+    post:
+      tags:
+        - Videos
+      summary: Refresh download URL
+      description: |
+        Generate a new presigned URL for an expired download link.
+        Rate limit: 10/min (higher than regular download).
+      operationId: refreshDownloadUrl
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: New presigned URL generated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  download_url:
+                    type: string
+                    format: uri
+                  expires_in_seconds:
+                    type: integer
+                    example: 60
+        "404":
+          description: Video not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          description: Rate limit exceeded (10/min)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /videos/download/bulk:
+    post:
+      tags:
+        - Videos
+      summary: Create bulk download job
+      description: |
+        Creates a background job to ZIP up to 10 videos.
+        Supports idempotency keys. Rate limits: 3 active jobs + 10 jobs/day.
+      operationId: createBulkDownload
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                video_ids:
+                  type: array
+                  items:
+                    type: string
+                    format: uuid
+                  minItems: 1
+                  maxItems: 10
+                idempotency_key:
+                  type: string
+                  description: Optional key to prevent duplicate jobs (auto-generated if omitted)
+              required:
+                - video_ids
+      responses:
+        "202":
+          description: Job created successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job_id:
+                    type: string
+                    format: uuid
+                  status:
+                    type: string
+                    enum: [PENDING, PROCESSING, COMPLETED, FAILED]
+                  video_count:
+                    type: integer
+                  created_at:
+                    type: string
+                    format: date-time
+                  expires_at:
+                    type: string
+                    format: date-time
+        "400":
+          description: Invalid request (too many videos, missing videos, etc.)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /videos/download/bulk/{id}:
+    get:
+      tags:
+        - Videos
+      summary: Get bulk download job status
+      description: |
+        Check the status of a bulk download job. Returns download URL when COMPLETED.
+      operationId: getBulkDownloadStatus
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Job status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job_id:
+                    type: string
+                    format: uuid
+                  status:
+                    type: string
+                    enum: [PENDING, PROCESSING, COMPLETED, FAILED]
+                  video_ids:
+                    type: array
+                    items:
+                      type: string
+                      format: uuid
+                  download_url:
+                    type: string
+                    format: uri
+                    description: Only present when status is COMPLETED
+                  zip_size_bytes:
+                    type: integer
+                    format: int64
+                    description: Only present when status is COMPLETED
+                  error_message:
+                    type: string
+                    description: Only present when status is FAILED
+                  completed_at:
+                    type: string
+                    format: date-time
+                    description: Only present when status is COMPLETED or FAILED
+                  expires_at:
+                    type: string
+                    format: date-time
+                  retry_count:
+                    type: integer
+                  created_at:
+                    type: string
+                    format: date-time
+        "404":
+          description: Job not found or not owned by user
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /users/me:
+    get:
+      tags:
+        - Users
+      summary: Get user profile
+      description: Retrieve the authenticated user's profile information.
+      operationId: getMyProfile
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: User profile retrieved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserDto"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+    delete:
+      tags:
+        - Users
+      summary: Delete account (Soft delete)
+      description: |
+        Soft-delete the authenticated user's account.
+        - Marks user as deleted (`deleted_at`).
+        - Revokes all tokens.
+        - Hides all user content.
+        - Hard deletion occurs after 30 days.
+      operationId: deleteAccount
+      security:
+        - BearerAuth: []
+      responses:
+        "204":
+          description: Account scheduled for deletion
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /users/me/videos:
+    get:
+      tags:
+        - Users
+      summary: Get my videos
+      description: Retrieve a paginated list of videos uploaded by the authenticated user (excluding deleted ones).
+      operationId: getMyVideos
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 0
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 20
+      responses:
+        "200":
+          description: List of user videos
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/VideoFeedItem"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /videos/bulk-delete:
+    post:
+      tags:
+        - Videos
+      summary: Bulk delete videos
+      description: Soft-delete multiple videos owned by the authenticated user.
+      operationId: bulkDeleteVideos
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BulkDeleteRequest"
+      responses:
+        "200":
+          description: Videos deleted successfully
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  # /videos/download/bulk:
+  #   post:
+  #     tags:
+  #       - Videos
+  #     summary: Create bulk download job
+  #     description: Create a ZIP download job for multiple videos (max 10).
+  #     operationId: createBulkDownload
+  #     security:
+  #       - BearerAuth: []
+  #     requestBody:
+  #       required: true
+  #       content:
+  #         application/json:
+  #           schema:
+  #             $ref: "#/components/schemas/CreateBulkDownloadRequest"
+  #     responses:
+  #       "200":
+  #         description: Job created
+  #         content:
+  #           application/json:
+  #             schema:
+  #               $ref: "#/components/schemas/BulkDownloadJobResponse"
+  #       "429":
+  #         $ref: "#/components/responses/TooManyRequestsError"
+  #       "500":
+  #         $ref: "#/components/responses/InternalServerError"
+
+  # /videos/download/bulk/{id}:
+  #   get:
+  #     tags:
+  #       - Videos
+  #     summary: Get bulk download job status
+  #     operationId: getBulkDownloadStatus
+  #     security:
+  #       - BearerAuth: []
+  #     parameters:
+  #       - name: id
+  #         in: path
+  #         required: true
+  #         schema:
+  #           type: string
+  #           format: uuid
+  #     responses:
+  #       "200":
+  #         description: Job status retrieved
+  #         content:
+  #           application/json:
+  #             schema:
+  #               $ref: "#/components/schemas/BulkDownloadStatus"
+  #       "404":
+  #         $ref: "#/components/responses/NotFoundError"

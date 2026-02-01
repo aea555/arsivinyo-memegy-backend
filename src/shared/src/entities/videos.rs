@@ -15,6 +15,8 @@ pub struct Model {
     pub status: String,
     pub size_bytes: i64,
     pub like_count: i64,
+    pub is_anonymous: bool,
+    pub deleted_at: Option<DateTimeWithTimeZone>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
 }
@@ -41,10 +43,7 @@ impl Related<super::likes::Entity> for Entity {
 
 impl Related<super::users::Entity> for Entity {
     fn to() -> RelationDef {
-        super::likes::Relation::Users.def()
-    }
-    fn via() -> Option<RelationDef> {
-        Some(super::likes::Relation::Videos.def().rev())
+        Relation::Users.def()
     }
 }
 

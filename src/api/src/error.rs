@@ -67,16 +67,18 @@ impl ApiErrorResponse {
         Self::new(StatusCode::UNAUTHORIZED, message)
     }
 
+    #[allow(dead_code)]
     pub fn forbidden(message: impl Into<String>) -> Self {
-        Self::new(StatusCode::FORBIDDEN, message)
+        Self::new(StatusCode::FORBIDDEN, message.into())
     }
 
     pub fn not_found(message: impl Into<String>) -> Self {
-        Self::new(StatusCode::NOT_FOUND, message)
+        Self::new(StatusCode::NOT_FOUND, message.into())
     }
 
+    #[allow(dead_code)]
     pub fn conflict(message: impl Into<String>) -> Self {
-        Self::new(StatusCode::CONFLICT, message)
+        Self::new(StatusCode::CONFLICT, message.into())
     }
 
     pub fn too_many_requests(message: impl Into<String>) -> Self {
@@ -85,6 +87,10 @@ impl ApiErrorResponse {
 
     pub fn internal_error(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, message)
+    }
+
+    pub fn db_error(err: sea_orm::DbErr) -> Self {
+        err.into()
     }
 }
 

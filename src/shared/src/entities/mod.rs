@@ -2,6 +2,7 @@
 
 pub mod prelude;
 
+pub mod download_jobs;
 pub mod likes;
 pub mod refresh_tokens;
 pub mod users;

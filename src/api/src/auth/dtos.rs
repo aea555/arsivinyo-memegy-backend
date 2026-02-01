@@ -14,11 +14,12 @@ pub struct AuthResponse {
     pub user: UserDto,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct UserDto {
     pub id: Uuid,
     pub username: String,
     pub email: String,
+    pub avatar_url: Option<String>,
 }
 
 #[derive(Deserialize)]

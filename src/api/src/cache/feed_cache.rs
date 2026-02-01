@@ -3,6 +3,13 @@ use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use shared::queue::QueueService;
 
+/// Uploader information for cached feed items
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CachedUploaderInfo {
+    pub id: uuid::Uuid,
+    pub username: String,
+}
+
 /// Cached video feed item (lightweight for Redis storage)
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CachedVideoFeedItem {
@@ -12,6 +19,10 @@ pub struct CachedVideoFeedItem {
     pub thumbnail_url: Option<String>,
     pub like_count: i64,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
+    // Phase 5: New fields for soft-delete and anonymity support
+    pub deleted_at: Option<chrono::DateTime<chrono::FixedOffset>>,
+    pub is_anonymous: bool,
+    pub uploader: Option<CachedUploaderInfo>, // None if anonymous
 }
 
 /// Service for caching feed metadata in Redis.
@@ -48,7 +59,14 @@ impl FeedCacheService {
                 match cached {
                     Some(json) => {
                         let items: Vec<CachedVideoFeedItem> = serde_json::from_str(&json)?;
-                        Ok(Some(items))
+
+                        // Phase 5: Client-side filtering for soft-deleted videos
+                        let filtered: Vec<CachedVideoFeedItem> = items
+                            .into_iter()
+                            .filter(|item| item.deleted_at.is_none())
+                            .collect();
+
+                        Ok(Some(filtered))
                     }
                     None => Ok(None),
                 }
@@ -91,6 +109,7 @@ impl FeedCacheService {
     }
 
     /// Invalidate all feed caches (call when video published/deleted)
+    #[allow(dead_code)]
     pub async fn invalidate_all(&self) -> Result<()> {
         match self.queue.get_conn().await {
             Ok(mut conn) => {

@@ -5,12 +5,19 @@ use shared::{
     config::Config,
     entities::videos,
     queue::{QueueService, VideoProcessJob},
-    storage::StorageService,
+    storage::{S3Storage, StorageBackend},
 };
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
 use tempfile::TempDir;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+mod bulk_download;
+use bulk_download::BulkDownloadWorker;
+
+mod account_cleanup;
+use account_cleanup::AccountCleanupWorker;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -31,8 +38,40 @@ async fn main() -> Result<()> {
     migration::Migrator::up(&db, None).await?;
     tracing::info!("Database migrations completed");
 
-    let storage = StorageService::new(&config).await;
+    let storage: Arc<dyn StorageBackend + Send + Sync> = Arc::new(S3Storage::new(&config).await);
     let queue = QueueService::new(&config)?;
+
+    // 5. Start bulk download worker in background
+    let bulk_worker =
+        BulkDownloadWorker::new(db.clone(), queue.clone(), storage.clone(), config.clone());
+
+    tokio::spawn(async move {
+        if let Err(e) = bulk_worker.run().await {
+            tracing::error!("Bulk download worker error: {:?}", e);
+        }
+    });
+
+    // 6. Periodic cleanup task
+    let cleanup_worker =
+        BulkDownloadWorker::new(db.clone(), queue.clone(), storage.clone(), config.clone());
+
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await; // Every hour
+            if let Err(e) = cleanup_worker.cleanup_stale_jobs().await {
+                tracing::error!("Cleanup task error: {:?}", e);
+            }
+        }
+    });
+
+    // 7. Account Cleanup Task
+    let account_cleaner = AccountCleanupWorker::new(db.clone(), storage.clone(), config.clone());
+
+    tokio::spawn(async move {
+        if let Err(e) = account_cleaner.run().await {
+            tracing::error!("Account cleanup worker error: {:?}", e);
+        }
+    });
 
     tracing::info!("Worker started, waiting for jobs...");
 
@@ -40,13 +79,57 @@ async fn main() -> Result<()> {
         match queue.pop_video_job().await {
             Ok(Some(job)) => {
                 tracing::info!("Processing job: {:?}", job);
-                if let Err(e) = process_video(&db, &storage, &queue, &config, &job).await {
-                    tracing::error!("Failed to process video {}: {:?}", job.video_id, e);
-                    // Update status to FAILED
+
+                // Retry logic with exponential backoff
+                let mut attempt = 1;
+                let mut last_error = None;
+
+                while attempt <= config.worker_retry_max_attempts {
+                    match process_video(&db, storage.clone(), &queue, &config, &job).await {
+                        Ok(()) => {
+                            tracing::info!(
+                                "Video {} processed successfully on attempt {}",
+                                job.video_id,
+                                attempt
+                            );
+                            break; // Success!
+                        }
+                        Err(e) => {
+                            last_error = Some(e);
+                            if attempt < config.worker_retry_max_attempts {
+                                let backoff_secs = config.worker_retry_backoff_base_secs
+                                    * (2_u64.pow(attempt as u32 - 1));
+                                tracing::warn!(
+                                    "Failed to process video {} (attempt {}/{}): {:?}. Retrying in {}s",
+                                    job.video_id, attempt, config.worker_retry_max_attempts, last_error, backoff_secs
+                                );
+                                tokio::time::sleep(std::time::Duration::from_secs(backoff_secs))
+                                    .await;
+                                attempt += 1;
+                            } else {
+                                tracing::error!(
+                                    "Failed to process video {} after {} attempts: {:?}",
+                                    job.video_id,
+                                    config.worker_retry_max_attempts,
+                                    last_error
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // If all retries failed update status to FAILED
+                if let Some(err) = last_error {
                     if let Ok(Some(v)) = videos::Entity::find_by_id(job.video_id).one(&db).await {
                         let mut active: videos::ActiveModel = v.into();
                         active.status = Set("FAILED".to_string());
                         let _ = active.update(&db).await;
+                        tracing::error!(
+                            "Marked video {} as FAILED after exhausting retries: {:?}",
+                            job.video_id,
+                            err
+                        );
                     }
                 }
             }
@@ -64,7 +147,7 @@ async fn main() -> Result<()> {
 
 async fn process_video(
     db: &sea_orm::DatabaseConnection,
-    storage: &StorageService,
+    storage: Arc<dyn StorageBackend + Send + Sync>,
     queue: &QueueService,
     config: &Config,
     job: &VideoProcessJob,

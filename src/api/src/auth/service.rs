@@ -16,8 +16,7 @@ pub struct GoogleUserResult {
     pub email: String,
     pub verified_email: bool,
     pub name: String,
-    #[serde(rename = "picture")]
-    pub _picture: String,
+    pub picture: String,
 }
 
 pub struct AuthService;
@@ -115,13 +114,30 @@ impl AuthService {
             .await?;
 
         let user = match user {
-            Some(u) => u,
+            Some(u) => {
+                let mut active_model: users::ActiveModel = u.into();
+
+                // Account Recovery Logic: If deleted, reactivate
+                if active_model.deleted_at.as_ref().is_some() {
+                    tracing::info!(
+                        "Recovering soft-deleted account: {}",
+                        active_model.id.as_ref()
+                    );
+                    active_model.deleted_at = Set(None);
+                }
+
+                // Update immutable fields from Google (e.g. avatar might change)
+                active_model.avatar_url = Set(Some(google_user.picture));
+
+                active_model.update(db).await?
+            }
             None => {
                 let new_user = users::ActiveModel {
                     id: Set(Uuid::new_v4()),
                     google_id: Set(google_user.id),
-                    username: Set(google_user.name), // Basic username mapping
+                    username: Set(google_user.name),
                     email: Set(google_user.email),
+                    avatar_url: Set(Some(google_user.picture)),
                     ..Default::default()
                 };
                 new_user.insert(db).await?
@@ -160,7 +176,7 @@ impl AuthService {
         refresh_token_ttl_days: u16,
     ) -> Result<(String, String)> {
         // 1. Get claims from old token (even if expired)
-        let old_claims = Self::get_claims_from_token(old_access_token, jwt_secret)?;
+        let old_claims = Self::get_claims_ignoring_expiry(old_access_token, jwt_secret)?;
         let user_id = old_claims.sub;
 
         // 2. Find and validate the refresh token (with lock to prevent concurrent refresh)
@@ -245,9 +261,24 @@ impl AuthService {
         Ok(())
     }
 
+    /// Validate access token and extract claims (Enforces Expiry)
+    pub fn validate_token(token: &str, secret: &str) -> Result<Claims> {
+        use jsonwebtoken::{Algorithm, DecodingKey, Validation};
+        let validation = Validation::new(Algorithm::HS256);
+        // validate_exp is true by default
+
+        let token_data = jsonwebtoken::decode::<Claims>(
+            token,
+            &DecodingKey::from_secret(secret.as_bytes()),
+            &validation,
+        )?;
+
+        Ok(token_data.claims)
+    }
+
     /// Extract claims from token WITHOUT validating expiry.
     /// Used for token refresh when access token may be expired.
-    pub fn get_claims_from_token(token: &str, secret: &str) -> Result<Claims> {
+    pub fn get_claims_ignoring_expiry(token: &str, secret: &str) -> Result<Claims> {
         use jsonwebtoken::{Algorithm, DecodingKey, Validation};
         let mut validation = Validation::new(Algorithm::HS256);
         validation.validate_exp = false; // Ignore expiry

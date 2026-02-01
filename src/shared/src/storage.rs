@@ -1,3 +1,4 @@
+use anyhow::Result;
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_s3::{
     config::{Credentials, SharedCredentialsProvider},
@@ -5,19 +6,46 @@ use aws_sdk_s3::{
     primitives::ByteStream,
     Client,
 };
-use std::time::Duration;
 use std::path::Path;
-use anyhow::Result;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
 use crate::config::Config;
 
-#[derive(Clone)]
-pub struct StorageService {
-    client: Client,
+#[async_trait::async_trait]
+pub trait StorageBackend: Send + Sync {
+    async fn delete_file(&self, bucket: &str, key: &str) -> Result<()>;
+    async fn generate_presigned_put(
+        &self,
+        bucket: &str,
+        key: &str,
+        expires_in: Duration,
+    ) -> Result<String>;
+    async fn generate_presigned_get(
+        &self,
+        bucket: &str,
+        key: &str,
+        expires_in: Duration,
+    ) -> Result<String>;
+    async fn file_exists(&self, bucket: &str, key: &str) -> Result<bool>;
+    async fn get_file_size(&self, bucket: &str, key: &str) -> Result<u64>;
+    async fn download_file(&self, bucket: &str, key: &str, dest_path: &Path) -> Result<()>;
+    async fn upload_file(
+        &self,
+        bucket: &str,
+        key: &str,
+        src_path: &Path,
+        content_type: &str,
+    ) -> Result<()>;
 }
 
-impl StorageService {
+#[derive(Clone)]
+pub struct S3Storage {
+    client: Client,
+    public_client: Client,
+}
+
+impl S3Storage {
     pub async fn new(config: &Config) -> Self {
         let credentials = Credentials::new(
             &config.minio_access_key,
@@ -28,7 +56,7 @@ impl StorageService {
         );
 
         let s3_config = aws_sdk_s3::Config::builder()
-            .credentials_provider(SharedCredentialsProvider::new(credentials))
+            .credentials_provider(SharedCredentialsProvider::new(credentials.clone()))
             .endpoint_url(&config.minio_endpoint)
             .region(Region::new("us-east-1")) // MinIO defaults
             .behavior_version(BehaviorVersion::latest())
@@ -36,10 +64,38 @@ impl StorageService {
             .build();
 
         let client = Client::from_conf(s3_config);
-        Self { client }
+
+        // Separate client for Presigned URLs (Client sees this endpoint)
+        let s3_public_config = aws_sdk_s3::Config::builder()
+            .credentials_provider(SharedCredentialsProvider::new(credentials))
+            .endpoint_url(&config.minio_public_endpoint)
+            .region(Region::new("us-east-1"))
+            .behavior_version(BehaviorVersion::latest())
+            .force_path_style(true)
+            .build();
+
+        let public_client = Client::from_conf(s3_public_config);
+
+        Self {
+            client,
+            public_client,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl StorageBackend for S3Storage {
+    async fn delete_file(&self, bucket: &str, key: &str) -> Result<()> {
+        self.client
+            .delete_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await?;
+        Ok(())
     }
 
-    pub async fn generate_presigned_put(
+    async fn generate_presigned_put(
         &self,
         bucket: &str,
         key: &str,
@@ -48,7 +104,7 @@ impl StorageService {
         let presigning_config = PresigningConfig::expires_in(expires_in)?;
 
         let presigned_request = self
-            .client
+            .public_client
             .put_object()
             .bucket(bucket)
             .key(key)
@@ -58,7 +114,26 @@ impl StorageService {
         Ok(presigned_request.uri().to_string())
     }
 
-    pub async fn file_exists(&self, bucket: &str, key: &str) -> Result<bool> {
+    async fn generate_presigned_get(
+        &self,
+        bucket: &str,
+        key: &str,
+        expires_in: Duration,
+    ) -> Result<String> {
+        let presigning_config = PresigningConfig::expires_in(expires_in)?;
+
+        let presigned_request = self
+            .public_client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .presigned(presigning_config)
+            .await?;
+
+        Ok(presigned_request.uri().to_string())
+    }
+
+    async fn file_exists(&self, bucket: &str, key: &str) -> Result<bool> {
         match self
             .client
             .head_object()
@@ -79,7 +154,19 @@ impl StorageService {
         }
     }
 
-    pub async fn download_file(&self, bucket: &str, key: &str, dest_path: &Path) -> Result<()> {
+    async fn get_file_size(&self, bucket: &str, key: &str) -> Result<u64> {
+        let output = self
+            .client
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await?;
+
+        Ok(output.content_length.unwrap_or(0) as u64)
+    }
+
+    async fn download_file(&self, bucket: &str, key: &str, dest_path: &Path) -> Result<()> {
         let mut object = self
             .client
             .get_object()
@@ -95,7 +182,13 @@ impl StorageService {
         Ok(())
     }
 
-    pub async fn upload_file(&self, bucket: &str, key: &str, src_path: &Path, content_type: &str) -> Result<()> {
+    async fn upload_file(
+        &self,
+        bucket: &str,
+        key: &str,
+        src_path: &Path,
+        content_type: &str,
+    ) -> Result<()> {
         let body = ByteStream::from_path(src_path).await?;
         self.client
             .put_object()

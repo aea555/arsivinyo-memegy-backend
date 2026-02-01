@@ -10,6 +10,10 @@ pub struct Config {
     pub oauth_redirect_base_url: String,
     pub cors_allowed_origins: String,
 
+    // Environment
+    pub environment: String, // "production", "staging", "development"
+    pub require_cloudflare_headers: bool, // Force CF header validation
+
     // Database & Redis
     pub database_url: String,
     pub valkey_url: String,
@@ -29,6 +33,7 @@ pub struct Config {
     pub minio_secret_key: String,
     pub minio_bucket_videos: String,
     pub minio_bucket_raw: String,
+    pub minio_public_endpoint: String,
     pub presigned_url_expiry_secs: u64,
 
     // File Upload Limits
@@ -43,6 +48,14 @@ pub struct Config {
     // Rate Limiting
     pub rate_limit_window_secs: usize,
     pub ip_rate_limit_rpm: u64,
+
+    // Search Configuration
+    pub search_max_tokens: usize,
+    pub search_max_token_length: usize,
+    pub search_max_query_chars: usize,
+    pub search_timeout_secs: u64,
+    pub search_cache_ttl_secs: usize,
+    pub search_rpm_limit: u64,
 
     // Worker
     pub draft_video_cleanup_hours: u16,
@@ -62,10 +75,17 @@ impl Config {
                 .parse()
                 .expect("SERVER_PORT must be a number"),
             oauth_redirect_base_url: env::var("OAUTH_REDIRECT_BASE_URL")
-                .unwrap_or_else(|_| "http://localhost:3000".to_string())
+                .unwrap_or_else(|_| "http://localhost:80".to_string())
                 .trim_end_matches('/')
                 .to_string(),
             cors_allowed_origins: env::var("CORS_ALLOWED_ORIGINS").unwrap_or_default(),
+
+            // Environment
+            environment: env::var("ENVIRONMENT").unwrap_or_else(|_| "development".to_string()),
+            require_cloudflare_headers: env::var("REQUIRE_CLOUDFLARE_HEADERS")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse()
+                .unwrap_or(false),
 
             // Database & Redis
             database_url: env::var("DATABASE_URL").expect("DATABASE_URL must be set"),
@@ -93,6 +113,9 @@ impl Config {
             minio_bucket_videos: env::var("MINIO_BUCKET_VIDEOS")
                 .expect("MINIO_BUCKET_VIDEOS must be set"),
             minio_bucket_raw: env::var("MINIO_BUCKET_RAW").expect("MINIO_BUCKET_RAW must be set"),
+            minio_public_endpoint: env::var("MINIO_PUBLIC_ENDPOINT").unwrap_or_else(|_| {
+                env::var("MINIO_ENDPOINT").expect("MINIO_ENDPOINT must be set")
+            }),
             presigned_url_expiry_secs: env::var("PRESIGNED_URL_EXPIRY_SECS")
                 .unwrap_or_else(|_| "3600".to_string()) // 1 hour
                 .parse()?,
@@ -121,6 +144,26 @@ impl Config {
                 .unwrap_or_else(|_| "3600".to_string()) // 1 hour
                 .parse()?,
             ip_rate_limit_rpm: env::var("IP_RATE_LIMIT_RPM")
+                .unwrap_or_else(|_| "30".to_string())
+                .parse()?,
+
+            // Search Configuration
+            search_max_tokens: env::var("SEARCH_MAX_TOKENS")
+                .unwrap_or_else(|_| "50".to_string())
+                .parse()?,
+            search_max_token_length: env::var("SEARCH_MAX_TOKEN_LENGTH")
+                .unwrap_or_else(|_| "50".to_string())
+                .parse()?,
+            search_max_query_chars: env::var("SEARCH_MAX_QUERY_CHARS")
+                .unwrap_or_else(|_| "200".to_string())
+                .parse()?,
+            search_timeout_secs: env::var("SEARCH_TIMEOUT_SECS")
+                .unwrap_or_else(|_| "5".to_string())
+                .parse()?,
+            search_cache_ttl_secs: env::var("SEARCH_CACHE_TTL_SECS")
+                .unwrap_or_else(|_| "10".to_string())
+                .parse()?,
+            search_rpm_limit: env::var("SEARCH_RPM_LIMIT")
                 .unwrap_or_else(|_| "30".to_string())
                 .parse()?,
 

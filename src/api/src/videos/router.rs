@@ -1,0 +1,46 @@
+use axum::{
+    routing::{delete, get, post},
+    Router,
+};
+use shared::config::Config;
+
+use crate::state::AppState;
+
+use super::handlers;
+
+pub fn videos_router(_config: &Config) -> Router<AppState> {
+    Router::new()
+        .route("/feed", get(handlers::get_feed))
+        // Upload
+        .route("/videos/init", post(handlers::init_upload))
+        .route(
+            "/videos/init/anonymous",
+            post(handlers::init_anonymous_upload),
+        )
+        .route("/videos/:id/confirm", post(handlers::confirm_upload))
+        // Search
+        .route("/videos/search", get(handlers::search_videos))
+        // Download
+        .route("/videos/:id/download", get(handlers::download_video))
+        .route(
+            "/videos/:id/download/refresh",
+            post(handlers::refresh_download_url),
+        )
+        // Bulk Download
+        .route(
+            "/videos/download/bulk",
+            post(handlers::create_bulk_download),
+        )
+        .route(
+            "/videos/download/bulk/:id",
+            get(handlers::get_bulk_download_status),
+        )
+        // Actions
+        .route("/videos/:id/like", post(handlers::like_video))
+        .route(
+            "/videos/:id",
+            delete(handlers::delete_video).patch(handlers::update_video_metadata),
+        )
+        // Bulk Delete (New Feature)
+        .route("/videos/bulk-delete", post(handlers::bulk_delete_videos))
+}
