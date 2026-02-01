@@ -21,20 +21,13 @@ COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
 
 # ============================================
-# API BUILDER (Only builds API binary)
+# API & WORKER BUILDER (Builds BOTH binaries in one go)
 # ============================================
-FROM builder-base AS builder-api
+FROM builder-base AS builder
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN cargo build --release -p api -vv
-
-# ============================================
-# WORKER BUILDER (Only builds Worker binary)
-# ============================================
-FROM builder-base AS builder-worker
-COPY Cargo.toml Cargo.lock ./
-COPY src ./src
-RUN cargo build --release -p worker -vv
+# Build both binaries. Cargo will share compilation of 'shared' crate.
+RUN cargo build --release -p api -p worker -vv
 
 # ============================================
 # API RUNTIME (Final API image)
@@ -42,7 +35,7 @@ RUN cargo build --release -p worker -vv
 FROM debian:bookworm-slim AS api
 WORKDIR /app
 RUN apt-get update && apt-get install -y libssl3 ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY --from=builder-api /app/target/release/api /app/api
+COPY --from=builder /app/target/release/api /app/api
 COPY openapi.yaml /app/openapi.yaml
 COPY static /app/static
 CMD ["/app/api"]
@@ -53,5 +46,5 @@ CMD ["/app/api"]
 FROM debian:bookworm-slim AS worker
 WORKDIR /app
 RUN apt-get update && apt-get install -y libssl3 ca-certificates ffmpeg && rm -rf /var/lib/apt/lists/*
-COPY --from=builder-worker /app/target/release/worker /app/worker
+COPY --from=builder /app/target/release/worker /app/worker
 CMD ["/app/worker"]
