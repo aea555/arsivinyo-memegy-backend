@@ -1,7 +1,7 @@
 target/
 docs/
 **/*.rs.bk
-Cargo.lock
+#Cargo.lock
 .env
 .env.*
 .idea/

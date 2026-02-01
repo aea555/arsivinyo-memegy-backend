@@ -49,3 +49,5 @@ rust-toolchain
 docs/
 
 src/api/tests/
+
+.github

@@ -6,3 +6,10 @@ members = [
     "src/shared",
     "src/shared/migration",
 ]
+
+# Optimize for build speed on low-resource VPS
+[profile.release]
+lto = "thin"       # Faster linking than "fat", still good optimization
+codegen-units = 16 # Parallelize code generation (tradeoff: slightly slower code)
+strip = true       # Strip symbols to reduce binary size
+opt-level = 3      # Keep max optimization

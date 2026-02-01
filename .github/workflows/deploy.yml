@@ -1,0 +1,28 @@
+name: Deploy to VPS
+
+on:
+    push:
+        branches:
+            - dev
+
+jobs:
+    deploy:
+        runs-on: ubuntu-latest
+        steps:
+            - name: Execute Remote SSH Commands
+              uses: appleboy/ssh-action@v1.0.3
+              with:
+                  host: ${{ secrets.SSH_HOST }}
+                  username: ${{ secrets.SSH_USER }}
+                  key: ${{ secrets.SSH_KEY }}
+                  script: |
+                      # hata oluşursa durdur
+                      set -e 
+                      cd ~/arsivinyo-memegy-backend/
+                      docker compose -f docker-compose.production.yml --env-file .env.production down
+                      git fetch origin
+                      git checkout -f dev || git checkout -b dev origin/dev
+                      git reset --hard origin/dev
+                      docker compose -f docker-compose.production.yml --env-file .env.production up -d --build
+                      docker image prune -f
+                      sleep 10
