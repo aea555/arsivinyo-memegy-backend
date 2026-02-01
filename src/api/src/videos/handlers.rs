@@ -90,7 +90,7 @@ pub async fn get_feed(
         if let Ok(Some(cached)) = state.feed_cache.get_feed(sort, None, page).await {
             let base_url = format!(
                 "{}/{}",
-                state.config.minio_endpoint, state.config.minio_bucket_videos
+                state.config.minio_public_endpoint, state.config.minio_bucket_videos
             );
 
             let items: Vec<VideoFeedItem> = cached
@@ -147,7 +147,7 @@ pub async fn get_feed(
 
     let base_url = format!(
         "{}/{}",
-        state.config.minio_endpoint, state.config.minio_bucket_videos
+        state.config.minio_public_endpoint, state.config.minio_bucket_videos
     );
 
     let items: Vec<VideoFeedItem> = video_with_users
@@ -369,16 +369,30 @@ pub async fn confirm_upload(
         return Ok(StatusCode::ACCEPTED);
     }
 
-    // 3. Verify file exists in S3
-    let exists = state
+    // 3. Verify file exists and check actual size
+    let actual_size = state
         .storage
-        .file_exists(&state.config.minio_bucket_raw, &video.s3_key)
+        .get_file_size(&state.config.minio_bucket_raw, &video.s3_key)
         .await
-        .unwrap_or(false);
+        .map_err(|_| ApiErrorResponse::bad_request("File not uploaded or not accessible"))?;
 
-    if !exists {
+    // SECURITY: Enforce strict size check to prevent quota bypass
+    // If actual size is significantly larger than claimed size (allowing small buffer for differences), reject it.
+    // For strictness, we reject any size larger than claimed.
+    if actual_size > video.size_bytes as u64 {
         txn.rollback().await?;
-        return Err(ApiErrorResponse::bad_request("File not uploaded yet"));
+        return Err(ApiErrorResponse::bad_request(format!(
+            "File larger than declared. Declared: {} bytes, Actual: {} bytes",
+            video.size_bytes, actual_size
+        )));
+    }
+
+    // Double check global max limit (redundant but safe)
+    if actual_size > state.config.max_file_size_bytes as u64 {
+        txn.rollback().await?;
+        return Err(ApiErrorResponse::bad_request(
+            "File exceeds global size limit",
+        ));
     }
 
     // 4. Increment rate limit (only after verified upload)
@@ -388,9 +402,15 @@ pub async fn confirm_upload(
         .increment(&rate_key, state.config.rate_limit_window_secs)
         .await;
 
-    // 5. Update Status
+    // 5. Update Status and Actual Size
     let mut active_video: videos::ActiveModel = video.clone().into();
     active_video.status = Set("PROCESSING".to_string());
+
+    // Update DB with actual size if different (e.g. user declared 10MB but uploaded 9MB)
+    if actual_size != video.size_bytes as u64 {
+        active_video.size_bytes = Set(actual_size as i64);
+    }
+
     active_video.updated_at = Set(Utc::now().into());
     active_video.update(&txn).await?;
 
@@ -409,6 +429,21 @@ pub async fn confirm_upload(
 
     // Commit transaction
     txn.commit().await?;
+
+    // 7. Invalidate User's Video List Cache
+    // This ensures the new video immediately appears in their list
+    if let Ok(mut conn) = state.queue.get_conn().await {
+        let pattern = format!("user:{}:videos:*", user_id);
+        let keys: Vec<String> = conn.keys(&pattern).await.unwrap_or_default();
+        if !keys.is_empty() {
+            let _: Result<(), _> = conn.del(&keys).await;
+            tracing::info!(
+                "Invalidated {} video list cache keys for user {}",
+                keys.len(),
+                user_id
+            );
+        }
+    }
 
     Ok(StatusCode::ACCEPTED)
 }
@@ -515,6 +550,20 @@ pub async fn delete_video(
         }
     }
 
+    // 6. Invalidate User's Video List Cache (Always, as list includes drafts)
+    if let Ok(mut conn) = state.queue.get_conn().await {
+        let pattern = format!("user:{}:videos:*", user_id);
+        let keys: Vec<String> = conn.keys(&pattern).await.unwrap_or_default();
+        if !keys.is_empty() {
+            let _: Result<(), _> = conn.del(&keys).await;
+            tracing::info!(
+                "Invalidated {} video list cache keys for user {} (delete)",
+                keys.len(),
+                user_id
+            );
+        }
+    }
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -606,6 +655,15 @@ pub async fn update_video_metadata(
         if let Err(e) = invalidate_feed_cache(&state).await {
             tracing::warn!("Failed to invalidate feed cache after update: {:?}", e);
             // Don't fail the request - cache will expire naturally
+        }
+    }
+
+    // 6. Invalidate User's Video List Cache
+    if let Ok(mut conn) = state.queue.get_conn().await {
+        let pattern = format!("user:{}:videos:*", user_id);
+        let keys: Vec<String> = conn.keys(&pattern).await.unwrap_or_default();
+        if !keys.is_empty() {
+            let _: Result<(), _> = conn.del(&keys).await;
         }
     }
 

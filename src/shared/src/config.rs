@@ -33,6 +33,7 @@ pub struct Config {
     pub minio_secret_key: String,
     pub minio_bucket_videos: String,
     pub minio_bucket_raw: String,
+    pub minio_public_endpoint: String,
     pub presigned_url_expiry_secs: u64,
 
     // File Upload Limits
@@ -112,6 +113,9 @@ impl Config {
             minio_bucket_videos: env::var("MINIO_BUCKET_VIDEOS")
                 .expect("MINIO_BUCKET_VIDEOS must be set"),
             minio_bucket_raw: env::var("MINIO_BUCKET_RAW").expect("MINIO_BUCKET_RAW must be set"),
+            minio_public_endpoint: env::var("MINIO_PUBLIC_ENDPOINT").unwrap_or_else(|_| {
+                env::var("MINIO_ENDPOINT").expect("MINIO_ENDPOINT must be set")
+            }),
             presigned_url_expiry_secs: env::var("PRESIGNED_URL_EXPIRY_SECS")
                 .unwrap_or_else(|_| "3600".to_string()) // 1 hour
                 .parse()?,

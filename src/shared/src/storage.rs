@@ -28,6 +28,7 @@ pub trait StorageBackend: Send + Sync {
         expires_in: Duration,
     ) -> Result<String>;
     async fn file_exists(&self, bucket: &str, key: &str) -> Result<bool>;
+    async fn get_file_size(&self, bucket: &str, key: &str) -> Result<u64>;
     async fn download_file(&self, bucket: &str, key: &str, dest_path: &Path) -> Result<()>;
     async fn upload_file(
         &self,
@@ -41,6 +42,7 @@ pub trait StorageBackend: Send + Sync {
 #[derive(Clone)]
 pub struct S3Storage {
     client: Client,
+    public_client: Client,
 }
 
 impl S3Storage {
@@ -54,7 +56,7 @@ impl S3Storage {
         );
 
         let s3_config = aws_sdk_s3::Config::builder()
-            .credentials_provider(SharedCredentialsProvider::new(credentials))
+            .credentials_provider(SharedCredentialsProvider::new(credentials.clone()))
             .endpoint_url(&config.minio_endpoint)
             .region(Region::new("us-east-1")) // MinIO defaults
             .behavior_version(BehaviorVersion::latest())
@@ -62,7 +64,22 @@ impl S3Storage {
             .build();
 
         let client = Client::from_conf(s3_config);
-        Self { client }
+
+        // Separate client for Presigned URLs (Client sees this endpoint)
+        let s3_public_config = aws_sdk_s3::Config::builder()
+            .credentials_provider(SharedCredentialsProvider::new(credentials))
+            .endpoint_url(&config.minio_public_endpoint)
+            .region(Region::new("us-east-1"))
+            .behavior_version(BehaviorVersion::latest())
+            .force_path_style(true)
+            .build();
+
+        let public_client = Client::from_conf(s3_public_config);
+
+        Self {
+            client,
+            public_client,
+        }
     }
 }
 
@@ -87,7 +104,7 @@ impl StorageBackend for S3Storage {
         let presigning_config = PresigningConfig::expires_in(expires_in)?;
 
         let presigned_request = self
-            .client
+            .public_client
             .put_object()
             .bucket(bucket)
             .key(key)
@@ -106,7 +123,7 @@ impl StorageBackend for S3Storage {
         let presigning_config = PresigningConfig::expires_in(expires_in)?;
 
         let presigned_request = self
-            .client
+            .public_client
             .get_object()
             .bucket(bucket)
             .key(key)
@@ -135,6 +152,18 @@ impl StorageBackend for S3Storage {
                 }
             }
         }
+    }
+
+    async fn get_file_size(&self, bucket: &str, key: &str) -> Result<u64> {
+        let output = self
+            .client
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await?;
+
+        Ok(output.content_length.unwrap_or(0) as u64)
     }
 
     async fn download_file(&self, bucket: &str, key: &str, dest_path: &Path) -> Result<()> {

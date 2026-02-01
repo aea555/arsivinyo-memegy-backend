@@ -48,6 +48,9 @@ impl StorageBackend for MockStorage {
     async fn file_exists(&self, _bucket: &str, _key: &str) -> anyhow::Result<bool> {
         Ok(true)
     }
+    async fn get_file_size(&self, _bucket: &str, _key: &str) -> anyhow::Result<u64> {
+        Ok(1024) // Mock size matching test expectations
+    }
     async fn download_file(
         &self,
         _bucket: &str,
@@ -119,6 +122,7 @@ pub async fn spawn_app() -> TestApp {
         google_client_id: "test_client_id".to_string(),
         google_client_secret: "test_client_secret".to_string(),
         minio_endpoint: "http://mock".to_string(),
+        minio_public_endpoint: "http://mock".to_string(),
         minio_access_key: "minio".to_string(),
         minio_secret_key: "minio123".to_string(),
         minio_bucket_videos: "videos".to_string(),

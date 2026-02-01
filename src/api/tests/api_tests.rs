@@ -66,7 +66,7 @@ async fn video_upload_flow_works() {
     let token = app.login_as_dev("uploader", "uploader@example.com").await;
 
     // 2. Init Upload
-    let (video_id, upload_url) = app.init_upload(&token, "funny_cat.mp4", 1024 * 1024).await;
+    let (video_id, upload_url) = app.init_upload(&token, "funny_cat.mp4", 1024).await;
     assert!(!video_id.is_empty());
     assert!(!upload_url.is_empty());
 
@@ -261,7 +261,7 @@ async fn like_video_works() {
 
     // User A uploads
     let token_a = app.login_as_dev("user_a", "a@example.com").await;
-    let (video_id, _) = app.init_upload(&token_a, "vid.mp4", 100).await;
+    let (video_id, _) = app.init_upload(&token_a, "vid.mp4", 1024).await;
     app.confirm_upload(&token_a, &video_id).await;
 
     // Force update to PUBLISHED manually
@@ -390,7 +390,7 @@ async fn search_functionality_works() {
         s3_bucket: Set("raw".to_string()),
         s3_key: Set("key1".to_string()),
         status: Set("PUBLISHED".to_string()),
-        size_bytes: Set(100),
+        size_bytes: Set(1024),
         like_count: Set(0),
         is_anonymous: Set(false),
         deleted_at: Set(None),
@@ -408,7 +408,7 @@ async fn search_functionality_works() {
         s3_bucket: Set("raw".to_string()),
         s3_key: Set("key2".to_string()),
         status: Set("PUBLISHED".to_string()),
-        size_bytes: Set(100),
+        size_bytes: Set(1024),
         like_count: Set(0),
         is_anonymous: Set(false),
         deleted_at: Set(None),
@@ -452,7 +452,7 @@ async fn security_access_control_works() {
 
     // User A uploads
     let token_a = app.login_as_dev("user_a_sec", "a_sec@example.com").await;
-    let (video_id, _) = app.init_upload(&token_a, "private.mp4", 100).await;
+    let (video_id, _) = app.init_upload(&token_a, "private.mp4", 1024).await;
     app.confirm_upload(&token_a, &video_id).await;
 
     // User B tries to act
@@ -493,7 +493,7 @@ async fn download_flow_works() {
 
     let token = app.login_as_dev("dl_user", "dl@example.com").await;
 
-    let (video_id, _) = app.init_upload(&token, "dl.mp4", 100).await;
+    let (video_id, _) = app.init_upload(&token, "dl.mp4", 1024).await;
     app.confirm_upload(&token, &video_id).await;
 
     // Need to publish it
@@ -557,7 +557,7 @@ async fn bulk_operations_works() {
     let mut video_ids = Vec::new();
     for i in 0..3 {
         let (vid, _) = app
-            .init_upload(&token, &format!("bulk{}.mp4", i), 100)
+            .init_upload(&token, &format!("bulk{}.mp4", i), 1024)
             .await;
         app.confirm_upload(&token, &vid).await;
         // Force publish
