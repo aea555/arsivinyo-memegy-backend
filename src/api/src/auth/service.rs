@@ -176,7 +176,7 @@ impl AuthService {
         refresh_token_ttl_days: u16,
     ) -> Result<(String, String)> {
         // 1. Get claims from old token (even if expired)
-        let old_claims = Self::get_claims_from_token(old_access_token, jwt_secret)?;
+        let old_claims = Self::get_claims_ignoring_expiry(old_access_token, jwt_secret)?;
         let user_id = old_claims.sub;
 
         // 2. Find and validate the refresh token (with lock to prevent concurrent refresh)
@@ -261,9 +261,24 @@ impl AuthService {
         Ok(())
     }
 
+    /// Validate access token and extract claims (Enforces Expiry)
+    pub fn validate_token(token: &str, secret: &str) -> Result<Claims> {
+        use jsonwebtoken::{Algorithm, DecodingKey, Validation};
+        let validation = Validation::new(Algorithm::HS256);
+        // validate_exp is true by default
+
+        let token_data = jsonwebtoken::decode::<Claims>(
+            token,
+            &DecodingKey::from_secret(secret.as_bytes()),
+            &validation,
+        )?;
+
+        Ok(token_data.claims)
+    }
+
     /// Extract claims from token WITHOUT validating expiry.
     /// Used for token refresh when access token may be expired.
-    pub fn get_claims_from_token(token: &str, secret: &str) -> Result<Claims> {
+    pub fn get_claims_ignoring_expiry(token: &str, secret: &str) -> Result<Claims> {
         use jsonwebtoken::{Algorithm, DecodingKey, Validation};
         let mut validation = Validation::new(Algorithm::HS256);
         validation.validate_exp = false; // Ignore expiry

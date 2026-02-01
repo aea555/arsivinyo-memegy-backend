@@ -1423,8 +1423,12 @@ pub async fn bulk_delete_videos(
     Json(payload): Json<BulkDeleteRequest>,
 ) -> ApiResult<()> {
     let token = auth.token();
-    let claims = AuthService::get_claims_from_token(token, &state.config.jwt_secret)
+    let claims = AuthService::validate_token(token, &state.config.jwt_secret)
         .map_err(|_| ApiErrorResponse::unauthorized("Invalid token"))?;
+
+    if state.token_revocation.is_revoked(claims.jti).await {
+        return Err(ApiErrorResponse::unauthorized("Token revoked"));
+    }
     let user_id = claims.sub;
 
     if payload.video_ids.is_empty() {

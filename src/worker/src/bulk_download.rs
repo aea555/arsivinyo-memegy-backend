@@ -4,11 +4,12 @@ use shared::{
     config::Config,
     entities::{download_jobs, videos},
     queue::QueueService,
-    storage::StorageService,
+    storage::StorageBackend,
 };
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -17,7 +18,7 @@ use zip::write::FileOptions;
 pub struct BulkDownloadWorker {
     db: DatabaseConnection,
     queue: QueueService,
-    storage: StorageService,
+    storage: Arc<dyn StorageBackend + Send + Sync>,
     config: Config,
 }
 
@@ -25,7 +26,7 @@ impl BulkDownloadWorker {
     pub fn new(
         db: DatabaseConnection,
         queue: QueueService,
-        storage: StorageService,
+        storage: Arc<dyn StorageBackend + Send + Sync>,
         config: Config,
     ) -> Self {
         Self {

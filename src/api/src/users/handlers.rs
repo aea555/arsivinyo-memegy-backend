@@ -33,8 +33,12 @@ pub async fn get_me(
     TypedHeader(auth): TypedHeader<Authorization<Bearer>>,
 ) -> ApiResult<Json<UserDto>> {
     let token = auth.token();
-    let claims = AuthService::get_claims_from_token(token, &state.config.jwt_secret)
+    let claims = AuthService::validate_token(token, &state.config.jwt_secret)
         .map_err(|_| ApiErrorResponse::unauthorized("Invalid token"))?;
+
+    if state.token_revocation.is_revoked(claims.jti).await {
+        return Err(ApiErrorResponse::unauthorized("Token revoked"));
+    }
 
     let user_id = claims.sub;
     let cache_key = format!("user:{}:profile", user_id);
@@ -79,8 +83,12 @@ pub async fn delete_account(
     TypedHeader(auth): TypedHeader<Authorization<Bearer>>,
 ) -> ApiResult<()> {
     let token = auth.token();
-    let claims = AuthService::get_claims_from_token(token, &state.config.jwt_secret)
+    let claims = AuthService::validate_token(token, &state.config.jwt_secret)
         .map_err(|_| ApiErrorResponse::unauthorized("Invalid token"))?;
+
+    if state.token_revocation.is_revoked(claims.jti).await {
+        return Err(ApiErrorResponse::unauthorized("Token revoked"));
+    }
 
     let user_id = claims.sub;
 
@@ -97,6 +105,15 @@ pub async fn delete_account(
         .map_err(ApiErrorResponse::db_error)?;
 
     // 2. Revoke all tokens
+    // Revoke current access token
+    let now_secs = chrono::Utc::now().timestamp() as usize;
+    if claims.exp > now_secs {
+        state
+            .token_revocation
+            .revoke_token(claims.jti, claims.exp - now_secs)
+            .await
+            .ok();
+    }
     AuthService::logout_all(&state.db, user_id).await?;
 
     // 3. Invalidate Cache
@@ -115,8 +132,12 @@ pub async fn get_my_videos(
     Query(pagination): Query<PaginationQuery>,
 ) -> ApiResult<Json<Vec<UserVideoDto>>> {
     let token = auth.token();
-    let claims = AuthService::get_claims_from_token(token, &state.config.jwt_secret)
+    let claims = AuthService::validate_token(token, &state.config.jwt_secret)
         .map_err(|_| ApiErrorResponse::unauthorized("Invalid token"))?;
+
+    if state.token_revocation.is_revoked(claims.jti).await {
+        return Err(ApiErrorResponse::unauthorized("Token revoked"));
+    }
 
     let user_id = claims.sub;
     let page = pagination.page.unwrap_or(1).max(1);

@@ -4,18 +4,23 @@ use sea_orm::*;
 use shared::{
     config::Config,
     entities::{users, videos},
-    storage::StorageService,
+    storage::StorageBackend,
 };
+use std::sync::Arc;
 use tokio::time::sleep;
 
 pub struct AccountCleanupWorker {
     db: DatabaseConnection,
-    storage: StorageService,
+    storage: Arc<dyn StorageBackend + Send + Sync>,
     _config: Config,
 }
 
 impl AccountCleanupWorker {
-    pub fn new(db: DatabaseConnection, storage: StorageService, config: Config) -> Self {
+    pub fn new(
+        db: DatabaseConnection,
+        storage: Arc<dyn StorageBackend + Send + Sync>,
+        config: Config,
+    ) -> Self {
         Self {
             db,
             storage,

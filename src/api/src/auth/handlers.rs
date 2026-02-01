@@ -159,9 +159,21 @@ pub async fn logout(
     TypedHeader(auth): TypedHeader<Authorization<Bearer>>,
 ) -> ApiResult<()> {
     let token = auth.token();
-    let claims = AuthService::get_claims_from_token(token, &state.config.jwt_secret)
+    // Validate token (must be valid to logout, though lenient impls might allow invalid)
+    let claims = AuthService::validate_token(token, &state.config.jwt_secret)
         .map_err(|_| ApiErrorResponse::unauthorized("Invalid token"))?;
 
+    // 1. Revoke Access Token
+    let now_secs = chrono::Utc::now().timestamp() as usize;
+    if claims.exp > now_secs {
+        state
+            .token_revocation
+            .revoke_token(claims.jti, claims.exp - now_secs)
+            .await
+            .ok(); // ignore errors
+    }
+
+    // 2. Revoke Refresh Tokens
     AuthService::logout_all(&state.db, claims.sub).await?;
 
     Ok(())
@@ -173,9 +185,12 @@ pub async fn dev_login(
     State(state): State<AppState>,
     Json(payload): Json<DevLoginRequest>,
 ) -> ApiResult<Json<AuthResponse>> {
-    // Only allow in development mode
+    // Only allow in development mode or test environment
     let log_level = std::env::var("RUST_LOG").unwrap_or_default();
-    if !log_level.contains("debug") && !log_level.contains("trace") {
+    if !log_level.contains("debug")
+        && !log_level.contains("trace")
+        && state.config.environment != "test"
+    {
         return Err(ApiErrorResponse::not_found("Endpoint not available"));
     }
 

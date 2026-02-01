@@ -12,12 +12,38 @@ use tokio::io::AsyncWriteExt;
 
 use crate::config::Config;
 
+#[async_trait::async_trait]
+pub trait StorageBackend: Send + Sync {
+    async fn delete_file(&self, bucket: &str, key: &str) -> Result<()>;
+    async fn generate_presigned_put(
+        &self,
+        bucket: &str,
+        key: &str,
+        expires_in: Duration,
+    ) -> Result<String>;
+    async fn generate_presigned_get(
+        &self,
+        bucket: &str,
+        key: &str,
+        expires_in: Duration,
+    ) -> Result<String>;
+    async fn file_exists(&self, bucket: &str, key: &str) -> Result<bool>;
+    async fn download_file(&self, bucket: &str, key: &str, dest_path: &Path) -> Result<()>;
+    async fn upload_file(
+        &self,
+        bucket: &str,
+        key: &str,
+        src_path: &Path,
+        content_type: &str,
+    ) -> Result<()>;
+}
+
 #[derive(Clone)]
-pub struct StorageService {
+pub struct S3Storage {
     client: Client,
 }
 
-impl StorageService {
+impl S3Storage {
     pub async fn new(config: &Config) -> Self {
         let credentials = Credentials::new(
             &config.minio_access_key,
@@ -38,8 +64,11 @@ impl StorageService {
         let client = Client::from_conf(s3_config);
         Self { client }
     }
+}
 
-    pub async fn delete_file(&self, bucket: &str, key: &str) -> Result<()> {
+#[async_trait::async_trait]
+impl StorageBackend for S3Storage {
+    async fn delete_file(&self, bucket: &str, key: &str) -> Result<()> {
         self.client
             .delete_object()
             .bucket(bucket)
@@ -49,7 +78,7 @@ impl StorageService {
         Ok(())
     }
 
-    pub async fn generate_presigned_put(
+    async fn generate_presigned_put(
         &self,
         bucket: &str,
         key: &str,
@@ -68,7 +97,7 @@ impl StorageService {
         Ok(presigned_request.uri().to_string())
     }
 
-    pub async fn generate_presigned_get(
+    async fn generate_presigned_get(
         &self,
         bucket: &str,
         key: &str,
@@ -87,7 +116,7 @@ impl StorageService {
         Ok(presigned_request.uri().to_string())
     }
 
-    pub async fn file_exists(&self, bucket: &str, key: &str) -> Result<bool> {
+    async fn file_exists(&self, bucket: &str, key: &str) -> Result<bool> {
         match self
             .client
             .head_object()
@@ -108,7 +137,7 @@ impl StorageService {
         }
     }
 
-    pub async fn download_file(&self, bucket: &str, key: &str, dest_path: &Path) -> Result<()> {
+    async fn download_file(&self, bucket: &str, key: &str, dest_path: &Path) -> Result<()> {
         let mut object = self
             .client
             .get_object()
@@ -124,7 +153,7 @@ impl StorageService {
         Ok(())
     }
 
-    pub async fn upload_file(
+    async fn upload_file(
         &self,
         bucket: &str,
         key: &str,

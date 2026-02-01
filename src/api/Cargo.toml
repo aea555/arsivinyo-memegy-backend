@@ -3,6 +3,10 @@ name = "api"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "api"
+path = "src/lib.rs"
+
 [dependencies]
 shared = { path = "../shared" }
 migration = { path = "../shared/migration" }
@@ -32,3 +36,11 @@ uuid = "1.20.0"
 chrono = "0.4.43"
 
 time = "0.3.46"
+async-trait = "0.1.89"
+
+[dev-dependencies]
+reqwest = "0.13.1"
+serde_json = "1.0"
+testcontainers = "0.26.3"
+testcontainers-modules = { version = "0.14.0", features = ["postgres", "redis"] }
+tokio = { version = "1.40", features = ["rt-multi-thread"] }

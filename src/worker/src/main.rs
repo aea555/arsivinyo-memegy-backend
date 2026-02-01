@@ -5,10 +5,11 @@ use shared::{
     config::Config,
     entities::videos,
     queue::{QueueService, VideoProcessJob},
-    storage::StorageService,
+    storage::{S3Storage, StorageBackend},
 };
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
 use tempfile::TempDir;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -37,7 +38,7 @@ async fn main() -> Result<()> {
     migration::Migrator::up(&db, None).await?;
     tracing::info!("Database migrations completed");
 
-    let storage = StorageService::new(&config).await;
+    let storage: Arc<dyn StorageBackend + Send + Sync> = Arc::new(S3Storage::new(&config).await);
     let queue = QueueService::new(&config)?;
 
     // 5. Start bulk download worker in background
@@ -84,7 +85,7 @@ async fn main() -> Result<()> {
                 let mut last_error = None;
 
                 while attempt <= config.worker_retry_max_attempts {
-                    match process_video(&db, &storage, &queue, &config, &job).await {
+                    match process_video(&db, storage.clone(), &queue, &config, &job).await {
                         Ok(()) => {
                             tracing::info!(
                                 "Video {} processed successfully on attempt {}",
@@ -146,7 +147,7 @@ async fn main() -> Result<()> {
 
 async fn process_video(
     db: &sea_orm::DatabaseConnection,
-    storage: &StorageService,
+    storage: Arc<dyn StorageBackend + Send + Sync>,
     queue: &QueueService,
     config: &Config,
     job: &VideoProcessJob,
