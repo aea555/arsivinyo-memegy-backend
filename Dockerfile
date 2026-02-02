@@ -16,18 +16,23 @@ RUN cargo chef prepare --recipe-path recipe.json
 # BUILDER BASE (Shared - installs build deps & cooks dependencies)
 # ============================================
 FROM chef AS builder-base
-RUN apt-get update && apt-get install -y pkg-config libssl-dev protobuf-compiler && rm -rf /var/lib/apt/lists/*
+# Install build dependencies (including mold) early
+RUN apt-get update && apt-get install -y pkg-config libssl-dev protobuf-compiler clang mold && rm -rf /var/lib/apt/lists/*
 COPY --from=planner /app/recipe.json recipe.json
+# Set RUSTFLAGS here so dependencies are cooked with mold found
+ENV RUSTFLAGS="-C link-arg=-fuse-ld=mold"
 RUN cargo chef cook --release --recipe-path recipe.json
 
 # ============================================
-# API & WORKER BUILDER (Builds BOTH binaries in one go)
+# API & WORKER BUILDER
 # ============================================
+# Build application
 FROM builder-base AS builder
+# RUSTFLAGS and tools are inherited from builder-base
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 # Build both binaries. Cargo will share compilation of 'shared' crate.
-RUN cargo build --release -p api -p worker -vv
+RUN cargo build --release -p api -p worker
 
 # ============================================
 # API RUNTIME (Final API image)
