@@ -1,11 +1,11 @@
 use crate::auth::revocation::TokenRevocationService;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use chrono::{Duration, Utc};
 use sea_orm::*;
 use serde::Deserialize;
 use shared::entities::{refresh_tokens, users};
 use shared::security::{
-    create_access_token, generate_refresh_token, hash_token, verify_token_hash, Claims,
+    Claims, create_access_token, generate_refresh_token, hash_token, verify_token_hash,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -182,13 +182,14 @@ impl AuthService {
         // 2. Find and validate the refresh token (with lock to prevent concurrent refresh)
         let txn = db.begin().await?;
 
+        // Fetch all tokens for user to find the matching one
         let user_tokens = refresh_tokens::Entity::find()
             .filter(refresh_tokens::Column::UserId.eq(user_id))
             .all(&txn)
             .await?;
 
         // 3. Match the hash and find valid token
-        let mut valid_token_model = None;
+        let mut matching_token_model = None;
         for token_model in user_tokens {
             if verify_token_hash(refresh_token_raw, &token_model.token_hash) {
                 // Check expiry
@@ -199,15 +200,49 @@ impl AuthService {
                         .await;
                     continue;
                 }
-                valid_token_model = Some(token_model);
+                matching_token_model = Some(token_model);
                 break;
             }
         }
 
-        let old_refresh =
-            valid_token_model.ok_or_else(|| anyhow!("Invalid or expired refresh token"))?;
+        let old_refresh = match matching_token_model {
+            Some(token) => token,
+            None => return Err(anyhow!("Invalid or expired refresh token")),
+        };
 
-        // 4. REVOKE old access token (add to Redis blacklist)
+        // 4. Check for Reuse / Rotation Logic
+        if let Some(replaced_at) = old_refresh.replaced_at {
+            // Token has already been used/rotated. Check Grace Period.
+            let now = Utc::now();
+            let duration_since_replacement = now.signed_duration_since(replaced_at);
+
+            if duration_since_replacement.num_seconds() < 30 {
+                // GRACE PERIOD ACTIVE: Allow reuse by forking the chain.
+                // We issue a new pair but do NOT update the old token (it's already replaced).
+                tracing::info!(
+                    "Refresh token reuse within grace period ({}s). Forking chain for user {}",
+                    duration_since_replacement.num_seconds(),
+                    user_id
+                );
+            } else {
+                // SECURITY ALERT: Token reused after grace period -> Potential Theft
+                tracing::warn!(
+                    "Refresh token reuse DETECTED for user {}! Revoking all sessions.",
+                    user_id
+                );
+
+                // Revoke all refresh tokens
+                refresh_tokens::Entity::delete_many()
+                    .filter(refresh_tokens::Column::UserId.eq(user_id))
+                    .exec(&txn)
+                    .await?;
+
+                txn.commit().await?; // Commit the deletion
+                return Err(anyhow!("Refresh token reuse detected. Session revoked."));
+            }
+        }
+
+        // 5. REVOKE old access token (add to Redis blacklist) if not already done?
         let now_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as usize)
@@ -215,35 +250,34 @@ impl AuthService {
 
         let remaining_ttl = old_claims.exp.saturating_sub(now_secs);
         if remaining_ttl > 0 {
-            // Only revoke if token hasn't already expired
             if let Err(e) = revocation.revoke_token(old_claims.jti, remaining_ttl).await {
                 tracing::warn!("Failed to revoke old token {}: {:?}", old_claims.jti, e);
-                // Continue anyway - the old token will expire naturally
             }
-            tracing::debug!(
-                "Revoked old access token {} with {}s remaining TTL",
-                old_claims.jti,
-                remaining_ttl
-            );
         }
-
-        // 5. DELETE old refresh token (rotation - prevents reuse)
-        refresh_tokens::Entity::delete_by_id(old_refresh.id)
-            .exec(&txn)
-            .await?;
 
         // 6. Issue NEW access and refresh tokens
         let new_access_token = create_access_token(user_id, jwt_secret, access_token_ttl_secs)?;
         let new_refresh_token = generate_refresh_token();
         let new_refresh_hash = hash_token(&new_refresh_token)?;
+        let new_token_id = Uuid::new_v4();
 
-        // 7. Store new refresh token
+        // 7. Update Old Token (Mark as replaced) IF it wasn't already replaced
+        if old_refresh.replaced_by.is_none() {
+            let mut active_old: refresh_tokens::ActiveModel = old_refresh.into();
+            active_old.replaced_by = Set(Some(new_token_id));
+            active_old.replaced_at = Set(Some(Utc::now().into()));
+            active_old.update(&txn).await?;
+        }
+
+        // 8. Store new refresh token
         let expires_at = Utc::now() + Duration::days(refresh_token_ttl_days as i64);
         let new_rt_model = refresh_tokens::ActiveModel {
-            id: Set(Uuid::new_v4()),
+            id: Set(new_token_id),
             user_id: Set(user_id),
             token_hash: Set(new_refresh_hash),
             expires_at: Set(expires_at.into()),
+            replaced_by: Set(None),
+            replaced_at: Set(None),
             ..Default::default()
         };
         new_rt_model.insert(&txn).await?;

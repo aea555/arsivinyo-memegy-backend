@@ -25,5 +25,5 @@ jobs:
                       git checkout -f dev || git checkout -b dev origin/dev
                       git reset --hard origin/dev
                       docker compose -f docker-compose.production.yml --env-file .env.production up -d --build
-                      docker image prune -f
+                      # docker image prune -f
                       sleep 10

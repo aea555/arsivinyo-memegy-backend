@@ -94,7 +94,7 @@ pub async fn get_feed(
                 state.config.minio_public_endpoint, state.config.minio_bucket_videos
             );
 
-            let mut items: Vec<VideoFeedItem> = cached
+            let items: Vec<VideoFeedItem> = cached
                 .into_iter()
                 .map(|c| VideoFeedItem {
                     id: c.id,
