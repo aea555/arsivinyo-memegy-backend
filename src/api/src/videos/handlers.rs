@@ -1,11 +1,11 @@
 use axum::{
+    Json,
     extract::{Path, Query, State},
     http::StatusCode,
-    Json,
 };
 use axum_extra::{
-    headers::{authorization::Bearer, Authorization},
     TypedHeader,
+    headers::{Authorization, authorization::Bearer},
 };
 use chrono::Utc;
 use sea_orm::*;
@@ -41,6 +41,7 @@ pub struct VideoFeedItem {
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uploader: Option<UploaderInfo>, // None if video is anonymous
+    pub is_liked: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -93,7 +94,7 @@ pub async fn get_feed(
                 state.config.minio_public_endpoint, state.config.minio_bucket_videos
             );
 
-            let items: Vec<VideoFeedItem> = cached
+            let mut items: Vec<VideoFeedItem> = cached
                 .into_iter()
                 .map(|c| VideoFeedItem {
                     id: c.id,
@@ -101,7 +102,6 @@ pub async fn get_feed(
                     url: format!("{}/{}", base_url, c.url.split('/').last().unwrap_or(&c.url)),
                     like_count: c.like_count,
                     created_at: c.created_at,
-                    // Phase 5: Map uploader from cache (respecting anonymity)
                     uploader: if c.is_anonymous {
                         None
                     } else {
@@ -110,6 +110,32 @@ pub async fn get_feed(
                             username: u.username,
                         })
                     },
+                    is_liked: false, // Will be populated shortly
+                })
+                .collect();
+
+            // Batch check for likes
+            let video_ids: Vec<Uuid> = items.iter().map(|i| i.id).collect();
+            let liked_video_ids: Vec<Uuid> = likes::Entity::find()
+                .select_only()
+                .column(likes::Column::VideoId)
+                .filter(
+                    Condition::all()
+                        .add(likes::Column::UserId.eq(user_id))
+                        .add(likes::Column::VideoId.is_in(video_ids)),
+                )
+                .into_tuple()
+                .all(&state.db)
+                .await
+                .map_err(|e| ApiErrorResponse::internal_error(e.to_string()))?;
+
+            let liked_set: std::collections::HashSet<Uuid> = liked_video_ids.into_iter().collect();
+
+            let items = items
+                .into_iter()
+                .map(|mut item| {
+                    item.is_liked = liked_set.contains(&item.id);
+                    item
                 })
                 .collect();
 
@@ -167,12 +193,11 @@ pub async fn get_feed(
                     username: user.username.clone(),
                 })
             },
+            is_liked: false,
         })
         .collect();
 
-    // Update cache is skipped - will be implemented in Phase 5 with user info support
-
-    // Phase 5: Populate cache with full metadata
+    // Populate cache with full metadata
     if sort != "random" && !video_with_users.is_empty() {
         let cached_items: Vec<_> = video_with_users
             .iter()
@@ -1447,6 +1472,7 @@ pub async fn search_videos(
             like_count: row.try_get("", "like_count")?,
             created_at: row.try_get("", "created_at")?,
             uploader,
+            is_liked: false,
         });
     }
 
