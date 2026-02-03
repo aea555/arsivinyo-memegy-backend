@@ -1,15 +1,15 @@
 use axum::{
+    Json,
     extract::{Query, State},
     response::{IntoResponse, Redirect},
-    Json,
 };
 use axum_extra::{
-    extract::cookie::{Cookie, CookieJar, SameSite},
-    headers::{authorization::Bearer, Authorization},
     TypedHeader,
+    extract::cookie::{Cookie, CookieJar, SameSite},
+    headers::{Authorization, authorization::Bearer},
 };
 use oauth2::{
-    basic::BasicClient, AuthUrl, ClientId, ClientSecret, CsrfToken, RedirectUrl, Scope, TokenUrl,
+    AuthUrl, ClientId, ClientSecret, CsrfToken, RedirectUrl, Scope, TokenUrl, basic::BasicClient,
 };
 
 use super::{dtos::*, service::AuthService};
@@ -51,7 +51,7 @@ pub async fn google_login(
     cookie.set_path("/");
     cookie.set_http_only(true);
     cookie.set_same_site(SameSite::Lax); // Allow redirect from Google
-                                         // Set expiry (e.g., 10 minutes)
+    // Set expiry (e.g., 10 minutes)
     cookie.set_max_age(time::Duration::minutes(10));
 
     (jar.add(cookie), Redirect::to(auth_url.as_str()))
@@ -61,7 +61,7 @@ pub async fn google_callback(
     State(state): State<AppState>,
     jar: CookieJar,
     Query(query): Query<GoogleCallbackQuery>,
-) -> ApiResult<(CookieJar, Json<AuthResponse>)> {
+) -> ApiResult<(CookieJar, Redirect)> {
     // 1. Verify CSRF Token
     let stored_state = jar.get("oauth_state").map(|c| c.value().to_string());
 
@@ -104,7 +104,7 @@ pub async fn google_callback(
         ApiErrorResponse::unauthorized("Failed to verify Google authentication")
     })?;
 
-    let (access_token, refresh_token, user) = AuthService::login_or_register(
+    let (access_token, refresh_token, _user) = AuthService::login_or_register(
         &state.db,
         google_user,
         &state.config.jwt_secret,
@@ -117,19 +117,13 @@ pub async fn google_callback(
         ApiErrorResponse::internal_error("Failed to complete authentication")
     })?;
 
-    Ok((
-        jar,
-        Json(AuthResponse {
-            access_token,
-            refresh_token,
-            user: UserDto {
-                id: user.id,
-                username: user.username,
-                email: user.email,
-                avatar_url: user.avatar_url,
-            },
-        }),
-    ))
+    // Redirect to frontend with tokens
+    let redirect_url = format!(
+        "{}/auth/callback?access_token={}&refresh_token={}",
+        state.config.frontend_app_url, access_token, refresh_token
+    );
+
+    Ok((jar, Redirect::to(&redirect_url)))
 }
 
 pub async fn refresh_token(

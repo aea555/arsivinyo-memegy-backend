@@ -8,6 +8,7 @@ pub struct Config {
     pub server_host: String,
     pub server_port: u16,
     pub oauth_redirect_base_url: String,
+    pub frontend_app_url: String,
     pub cors_allowed_origins: String,
 
     // Environment
@@ -76,6 +77,10 @@ impl Config {
                 .expect("SERVER_PORT must be a number"),
             oauth_redirect_base_url: env::var("OAUTH_REDIRECT_BASE_URL")
                 .unwrap_or_else(|_| "http://localhost:80".to_string())
+                .trim_end_matches('/')
+                .to_string(),
+            frontend_app_url: env::var("FRONTEND_APP_URL")
+                .unwrap_or_else(|_| "http://localhost:3000".to_string())
                 .trim_end_matches('/')
                 .to_string(),
             cors_allowed_origins: env::var("CORS_ALLOWED_ORIGINS").unwrap_or_default(),

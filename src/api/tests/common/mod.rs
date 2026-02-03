@@ -7,7 +7,7 @@ use sea_orm_migration::MigratorTrait;
 use shared::{config::Config, queue::QueueService, storage::StorageBackend};
 use std::sync::Arc;
 use std::time::Duration;
-use testcontainers::{runners::AsyncRunner, ContainerAsync};
+use testcontainers::{ContainerAsync, runners::AsyncRunner};
 use testcontainers_modules::{postgres::Postgres, redis::Redis};
 use tokio::net::TcpListener;
 
@@ -111,6 +111,7 @@ pub async fn spawn_app() -> TestApp {
         server_host: "127.0.0.1".to_string(),
         server_port: 0,
         oauth_redirect_base_url: "http://localhost".to_string(),
+        frontend_app_url: "http://localhost".to_string(),
         cors_allowed_origins: "".to_string(),
         environment: "test".to_string(),
         require_cloudflare_headers: false,
