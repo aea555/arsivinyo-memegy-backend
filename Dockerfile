@@ -37,13 +37,18 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # ============================================
 # Build application
 FROM builder-base AS builder
+# Limit concurrency to avoid OOM on small CI runners
+ENV CARGO_BUILD_JOBS=2
 # RUSTFLAGS and tools are inherited from builder-base
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 # Build both binaries with cache mounts.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
-    cargo build --release -p api -p worker
+    cargo build --release -p api -p worker && \
+    mkdir -p /app/bin && \
+    cp target/release/api /app/bin/api && \
+    cp target/release/worker /app/bin/worker
 
 # ============================================
 # API RUNTIME (Final API image)
@@ -54,7 +59,7 @@ RUN rm -f /etc/apt/apt.conf.d/docker-clean; echo 'Binary::apt::APT::Keep-Downloa
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update && apt-get install -y libssl3 ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /app/target/release/api /app/api
+COPY --from=builder /app/bin/api /app/api
 COPY openapi.yaml /app/openapi.yaml
 COPY static /app/static
 CMD ["/app/api"]
@@ -68,5 +73,5 @@ RUN rm -f /etc/apt/apt.conf.d/docker-clean; echo 'Binary::apt::APT::Keep-Downloa
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update && apt-get install -y libssl3 ca-certificates ffmpeg && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /app/target/release/worker /app/worker
+COPY --from=builder /app/bin/worker /app/worker
 CMD ["/app/worker"]
