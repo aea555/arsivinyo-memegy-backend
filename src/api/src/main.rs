@@ -1,6 +1,7 @@
 use api::{
-    auth::revocation::TokenRevocationService, cache::feed_cache::FeedCacheService, create_router,
-    services::rate_limiter::RateLimiter, state::AppState,
+    auth::revocation::TokenRevocationService, cache::feed_cache::FeedCacheService,
+    cache::otc_cache::OtcCacheService, create_router, metrics, services::rate_limiter::RateLimiter,
+    state::AppState,
 };
 use sea_orm::Database;
 use sea_orm_migration::prelude::*;
@@ -17,6 +18,9 @@ async fn main() -> anyhow::Result<()> {
         ))
         .with(tracing_subscriber::fmt::layer())
         .init();
+
+    // Register metrics
+    metrics::register_metrics();
 
     // 2. Config
     let config = Config::from_env()?;
@@ -35,9 +39,16 @@ async fn main() -> anyhow::Result<()> {
     let queue = QueueService::new(&config)?;
     let token_revocation = TokenRevocationService::new(queue.clone());
     let feed_cache = FeedCacheService::new(queue.clone());
+    let otc_cache = OtcCacheService::new(queue.clone());
     let rate_limiter = RateLimiter::new(queue.clone());
 
-    // 6. State
+    // 6. OTC Rate Limiter
+    let otc_rate_limiter = api::middleware::rate_limit::RateLimiter::new(
+        config.otc_rate_limit_max_attempts,
+        config.otc_rate_limit_window_seconds,
+    );
+
+    // 7. State
     let state = AppState {
         db,
         config: Arc::new(config.clone()),
@@ -45,10 +56,22 @@ async fn main() -> anyhow::Result<()> {
         queue,
         token_revocation,
         feed_cache,
+        otc_cache,
         rate_limiter,
+        otc_rate_limiter,
     };
 
-    // 7. Routes (via library)
+    // 8. Spawn rate limiter cleanup task
+    let cleanup_limiter = state.otc_rate_limiter.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300)); // 5 minutes
+        loop {
+            interval.tick().await;
+            cleanup_limiter.cleanup().await;
+        }
+    });
+
+    // 9. Routes (via library)
     let app = create_router(state.clone());
 
     // 8. Server

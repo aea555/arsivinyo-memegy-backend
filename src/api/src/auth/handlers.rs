@@ -1,55 +1,154 @@
 use axum::{
     Json,
     extract::{Query, State},
-    response::{IntoResponse, Redirect},
+    response::IntoResponse,
 };
-use axum_extra::{
-    TypedHeader,
-    extract::cookie::{Cookie, CookieJar, SameSite},
-    headers::{Authorization, authorization::Bearer},
-};
-use oauth2::{
-    AuthUrl, ClientId, ClientSecret, CsrfToken, RedirectUrl, Scope, TokenUrl, basic::BasicClient,
-};
+use axum_extra::extract::cookie::Cookie;
 
-use super::{dtos::*, service::AuthService};
 use crate::{
+    audit::logger::{AuditEvent, log_audit_event},
+    auth::extractors::AuthUser,
     error::{ApiErrorResponse, ApiResult},
+    metrics::*,
     state::AppState,
 };
+use axum::response::Redirect;
+use axum_extra::extract::cookie::{CookieJar, SameSite};
+use chrono::{Duration, Utc};
+use oauth2::{
+    AuthType, AuthUrl, ClientId, ClientSecret, CsrfToken, RedirectUrl, Scope, TokenUrl,
+    basic::BasicClient,
+};
+use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+use shared::entities::{refresh_tokens, users};
+use shared::security::{create_access_token, generate_refresh_token, hash_token};
+use uuid::Uuid;
 
-// Helper to build OAuth Client
+use super::constants::*;
+use super::dtos::*;
+use super::service::AuthService;
+
+#[derive(Debug)]
+struct OAuthState {
+    source: String,
+    code_challenge: Option<String>,
+}
+
+fn parse_oauth_state(state: &str) -> Result<OAuthState, &'static str> {
+    let parts: Vec<&str> = state.split(':').collect();
+
+    // Format: csrf:source[:code_challenge]
+    // We validate the full state string before parsing, so we only extract what we need
+    if parts.len() < 2 {
+        return Err("Invalid state format");
+    }
+
+    Ok(OAuthState {
+        source: parts[1].to_string(),
+        code_challenge: parts.get(2).map(|s| s.to_string()),
+    })
+}
+
 fn oauth_client(state: &AppState) -> BasicClient {
+    let google_client_id = ClientId::new(state.config.google_client_id.clone());
+    let google_client_secret = ClientSecret::new(state.config.google_client_secret.clone());
+    let auth_url = AuthUrl::new("https://accounts.google.com/o/oauth2/v2/auth".to_string())
+        .expect("Invalid authorization endpoint URL");
+    let token_url = TokenUrl::new("https://oauth2.googleapis.com/token".to_string())
+        .expect("Invalid token endpoint URL");
+
+    let redirect_url = format!(
+        "{}/auth/google/callback",
+        state.config.oauth_redirect_base_url
+    );
+
     BasicClient::new(
-        ClientId::new(state.config.google_client_id.clone()),
-        Some(ClientSecret::new(state.config.google_client_secret.clone())),
-        AuthUrl::new("https://accounts.google.com/o/oauth2/v2/auth".to_string()).unwrap(),
-        Some(TokenUrl::new("https://oauth2.googleapis.com/token".to_string()).unwrap()),
+        google_client_id,
+        Some(google_client_secret),
+        auth_url,
+        Some(token_url),
     )
-    .set_redirect_uri(
-        RedirectUrl::new(format!(
-            "{}/auth/google/callback",
-            state.config.oauth_redirect_base_url
-        ))
-        .expect("Invalid redirect URL"),
-    )
+    .set_auth_type(AuthType::RequestBody)
+    .set_redirect_uri(RedirectUrl::new(redirect_url).expect("Invalid redirect URL"))
 }
 
 pub async fn google_login(
     State(state): State<AppState>,
     jar: CookieJar,
     Query(query): Query<GoogleLoginQuery>,
-) -> (CookieJar, impl IntoResponse) {
-    let client = oauth_client(&state);
-    // Encode source into state: "csrf_token:source"
-    let source = query.source.unwrap_or_else(|| "web".to_string());
+) -> Result<(CookieJar, impl IntoResponse), ApiErrorResponse> {
+    OAUTH_REQUESTS_TOTAL.inc();
 
-    // Create CSRF token with embedded source
-    let csrf_token = CsrfToken::new_random();
-    let combined_state_str = format!("{}:{}", csrf_token.secret(), source);
+    let client = oauth_client(&state);
+    let source = query.source.as_deref().unwrap_or(SOURCE_WEB);
+
+    // PKCE Validation
+    let code_challenge = if let Some(challenge) = query.code_challenge {
+        // Validate method is S256
+        match query.code_challenge_method.as_deref() {
+            Some(method) if method == PKCE_METHOD_S256 => {
+                // RFC 7636: base64url(SHA256) = 43 characters
+                if challenge.is_empty() || challenge.len() != 43 {
+                    return Err(ApiErrorResponse::bad_request("Invalid code_challenge"));
+                }
+
+                // Validate base64url characters only (A-Z, a-z, 0-9, -, _)
+                if !challenge
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                {
+                    return Err(ApiErrorResponse::bad_request(
+                        "Invalid code_challenge format",
+                    ));
+                }
+
+                // Ensure challenge is base64url (no padding, no +/)
+                if challenge.contains('+') || challenge.contains('/') || challenge.contains('=') {
+                    return Err(ApiErrorResponse::bad_request(
+                        "code_challenge must be base64url encoded",
+                    ));
+                }
+
+                Some(challenge)
+            }
+            Some(method) if method == PKCE_METHOD_PLAIN => {
+                return Err(ApiErrorResponse::bad_request(
+                    "PKCE plain method not allowed, use S256",
+                ));
+            }
+            _ => {
+                return Err(ApiErrorResponse::bad_request(
+                    "code_challenge_method must be S256",
+                ));
+            }
+        }
+    } else {
+        // Require PKCE for mobile
+        if source == SOURCE_MOBILE {
+            return Err(ApiErrorResponse::bad_request(
+                "PKCE required for mobile flows: code_challenge and code_challenge_method=S256",
+            ));
+        }
+        None
+    };
+
+    // Audit log: OAuth login initiated
+    log_audit_event(AuditEvent::OAuthLoginInitiated {
+        source: source.to_string(),
+        has_pkce: code_challenge.is_some(),
+        timestamp: Utc::now(),
+    });
+
+    // Build state parameter: "csrf:source[:challenge]"
+    let csrf = CsrfToken::new_random();
+    let combined_state_str = if let Some(challenge) = code_challenge {
+        format!("{}:{}:{}", csrf.secret(), source, challenge)
+    } else {
+        format!("{}:{}", csrf.secret(), source)
+    };
 
     let (auth_url, _) = client
-        .authorize_url(|| CsrfToken::new(combined_state_str.clone())) // Use closure that returns our custom token
+        .authorize_url(|| CsrfToken::new(combined_state_str.clone()))
         .add_scope(Scope::new("email".to_string()))
         .add_scope(Scope::new("profile".to_string()))
         .url();
@@ -60,7 +159,7 @@ pub async fn google_login(
     cookie.set_same_site(SameSite::Lax);
     cookie.set_max_age(time::Duration::minutes(10));
 
-    (jar.add(cookie), Redirect::to(auth_url.as_str()))
+    Ok((jar.add(cookie), Redirect::to(auth_url.as_str())))
 }
 
 pub async fn google_callback(
@@ -68,27 +167,68 @@ pub async fn google_callback(
     jar: CookieJar,
     Query(query): Query<GoogleCallbackQuery>,
 ) -> ApiResult<impl IntoResponse> {
-    // 1. Verify CSRF Token
-    let stored_state = jar.get("oauth_state").map(|c| c.value().to_string());
+    OAUTH_CALLBACKS_TOTAL.inc();
+
+    // 1. Validate CSRF
+    let stored_state_str = jar
+        .get("oauth_state")
+        .ok_or_else(|| ApiErrorResponse::bad_request("Missing state cookie"))?
+        .value()
+        .to_string();
+
     let jar = jar.remove(Cookie::from("oauth_state"));
 
-    match stored_state {
-        Some(ref stored) if stored == &query.state => {
-            // State matches
-        }
-        _ => {
-            tracing::error!("CSRF state mismatch or missing");
-            return Err(ApiErrorResponse::bad_request(
-                "Invalid authentication state",
-            ));
-        }
+    if stored_state_str != query.state {
+        tracing::error!("CSRF mismatch");
+        log_audit_event(AuditEvent::OAuthCallbackFailure {
+            error: "CSRF mismatch".to_string(),
+            source: None,
+            timestamp: Utc::now(),
+        });
+        return Err(ApiErrorResponse::bad_request("Invalid state"));
     }
 
-    // Decode source from state
-    let parts: Vec<&str> = query.state.split(':').collect();
-    let source = if parts.len() >= 2 { parts[1] } else { "web" };
+    // 2. Parse state
+    let oauth_state = parse_oauth_state(&stored_state_str).map_err(|e| {
+        tracing::error!("State parse error: {}", e);
+        log_audit_event(AuditEvent::OAuthCallbackFailure {
+            error: format!("State parse error: {}", e),
+            source: None,
+            timestamp: Utc::now(),
+        });
+        ApiErrorResponse::bad_request("Malformed state")
+    })?;
 
-    // Use the same redirect URI as in the authorization request
+    // 3. PKCE Validation
+    if let Some(ref expected_challenge) = oauth_state.code_challenge {
+        PKCE_VALIDATIONS_TOTAL.inc();
+
+        let verifier = query.code_verifier.ok_or_else(|| {
+            tracing::error!("Missing code_verifier for PKCE flow");
+            log_audit_event(AuditEvent::PkceValidationFailed {
+                source: oauth_state.source.clone(),
+                timestamp: Utc::now(),
+            });
+            PKCE_FAILURES_TOTAL.inc();
+            ApiErrorResponse::bad_request("Invalid OAuth state")
+        })?;
+
+        use shared::security::verify_pkce_challenge;
+
+        if !verify_pkce_challenge(&verifier, &expected_challenge) {
+            tracing::error!("PKCE validation failed for user flow. Challenge mismatch.");
+            log_audit_event(AuditEvent::PkceValidationFailed {
+                source: oauth_state.source.clone(),
+                timestamp: Utc::now(),
+            });
+            PKCE_FAILURES_TOTAL.inc();
+            return Err(ApiErrorResponse::unauthorized("Authentication failed"));
+        }
+
+        tracing::info!("PKCE validation successful");
+    }
+
+    // 4. Use the same redirect URI as in the authorization request
     let redirect_uri = format!(
         "{}/auth/google/callback",
         state.config.oauth_redirect_base_url
@@ -106,7 +246,7 @@ pub async fn google_callback(
         ApiErrorResponse::unauthorized("Failed to verify Google authentication")
     })?;
 
-    let (access_token, refresh_token, _user) = AuthService::login_or_register(
+    let (access_token, refresh_token, user) = AuthService::login_or_register(
         &state.db,
         google_user,
         &state.config.jwt_secret,
@@ -119,14 +259,47 @@ pub async fn google_callback(
         ApiErrorResponse::internal_error("Failed to complete authentication")
     })?;
 
+    // Capture pkce_validated flag before oauth_state is consumed
+    let pkce_validated = oauth_state.code_challenge.is_some();
+
+    // Audit log: OAuth callback success
+    log_audit_event(AuditEvent::OAuthCallbackSuccess {
+        user_id: user.id,
+        source: oauth_state.source.clone(),
+        pkce_validated,
+        timestamp: Utc::now(),
+    });
+
+    // Generate OTC and store tokens
+    use crate::cache::otc_cache::OtcTokenData;
+    use shared::security::generate_otc;
+
+    let otc = generate_otc();
+    let token_data = OtcTokenData {
+        access_token,
+        refresh_token,
+        user_id: user.id,
+        username: user.username.clone(),
+        email: user.email.clone(),
+        avatar_url: user.avatar_url.clone(),
+    };
+
+    state
+        .otc_cache
+        .store_otc(&otc, &token_data)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to store OTC: {:?}", e);
+            ApiErrorResponse::internal_error("Failed to complete authentication")
+        })?;
+
     // Handle Redirect based on Source
-    match source {
-        "mobile" => {
-            // Deep Link Redirect
-            // e.g. memegy://auth/callback?access_token=...
+    match oauth_state.source.as_str() {
+        s if s == SOURCE_MOBILE => {
+            // Deep Link Redirect with OTC
             let redirect_url = format!(
-                "{}auth/callback?access_token={}&refresh_token={}",
-                state.config.mobile_app_scheme, access_token, refresh_token
+                "{}auth/callback?code={}",
+                state.config.mobile_app_scheme, otc
             );
             Ok((
                 jar,
@@ -138,8 +311,8 @@ pub async fn google_callback(
             )
                 .into_response())
         }
-        "popup" => {
-            // HTML PostMessage
+        s if s == SOURCE_POPUP => {
+            // HTML PostMessage with specific origin
             let html = format!(
                 r#"
                 <!DOCTYPE html>
@@ -149,23 +322,22 @@ pub async fn google_callback(
                 <script>
                     window.opener.postMessage({{
                         type: 'GOOGLE_AUTH_SUCCESS',
-                        accessToken: '{}',
-                        refreshToken: '{}'
-                    }}, '*');
+                        code: '{}'
+                    }}, '{}');
                     window.close();
                 </script>
                 </body>
                 </html>
                 "#,
-                access_token, refresh_token
+                otc, state.config.frontend_app_url
             );
             Ok((jar, axum::response::Html(html)).into_response())
         }
         _ => {
-            // Default Web Redirect
+            // Default Web Redirect with OTC
             let redirect_url = format!(
-                "{}/auth/callback?access_token={}&refresh_token={}",
-                state.config.frontend_app_url, access_token, refresh_token
+                "{}/auth/callback?code={}",
+                state.config.frontend_app_url, otc
             );
             Ok((jar, Redirect::to(&redirect_url)).into_response())
         }
@@ -185,8 +357,7 @@ pub async fn refresh_token(
         state.config.access_token_ttl_secs,
         state.config.refresh_token_ttl_days,
     )
-    .await
-    .map_err(|_| ApiErrorResponse::unauthorized("Invalid or expired tokens"))?;
+    .await?;
 
     Ok(Json(RefreshResponse {
         access_token: new_access_token,
@@ -194,28 +365,8 @@ pub async fn refresh_token(
     }))
 }
 
-pub async fn logout(
-    State(state): State<AppState>,
-    TypedHeader(auth): TypedHeader<Authorization<Bearer>>,
-) -> ApiResult<()> {
-    let token = auth.token();
-    // Validate token (must be valid to logout, though lenient impls might allow invalid)
-    let claims = AuthService::validate_token(token, &state.config.jwt_secret)
-        .map_err(|_| ApiErrorResponse::unauthorized("Invalid token"))?;
-
-    // 1. Revoke Access Token
-    let now_secs = chrono::Utc::now().timestamp() as usize;
-    if claims.exp > now_secs {
-        state
-            .token_revocation
-            .revoke_token(claims.jti, claims.exp - now_secs)
-            .await
-            .ok(); // ignore errors
-    }
-
-    // 2. Revoke Refresh Tokens
-    AuthService::logout_all(&state.db, claims.sub).await?;
-
+pub async fn logout(State(state): State<AppState>, AuthUser(user_id): AuthUser) -> ApiResult<()> {
+    AuthService::logout_all(&state.db, user_id).await?;
     Ok(())
 }
 
@@ -227,25 +378,18 @@ pub async fn dev_login(
 ) -> ApiResult<Json<AuthResponse>> {
     // Only allow in development mode or test environment
     let log_level = std::env::var("RUST_LOG").unwrap_or_default();
-    if !log_level.contains("debug")
-        && !log_level.contains("trace")
-        && state.config.environment != "test"
-    {
-        return Err(ApiErrorResponse::not_found("Endpoint not available"));
+    if !log_level.contains("debug") && std::env::var("APP_ENV").unwrap_or_default() != "test" {
+        return Err(ApiErrorResponse::forbidden(
+            "Dev login is only available in debug mode",
+        ));
     }
 
-    use chrono::{Duration, Utc};
-    use sea_orm::*;
-    use shared::entities::refresh_tokens;
-    use shared::entities::users;
-    use shared::security::{create_access_token, generate_refresh_token, hash_token};
-    use uuid::Uuid;
+    // Generate a fake Google ID for dev user
+    let google_id = format!("dev_{}", uuid::Uuid::new_v4());
 
-    // Create or find dev user
-    let google_id = format!("dev_{}", payload.email);
-
+    // Find or create user
     let user = users::Entity::find()
-        .filter(users::Column::GoogleId.eq(&google_id))
+        .filter(users::Column::Email.eq(&payload.email))
         .one(&state.db)
         .await?;
 
@@ -268,11 +412,12 @@ pub async fn dev_login(
         &state.config.jwt_secret,
         state.config.access_token_ttl_secs,
     )?;
+
     let refresh_token = generate_refresh_token();
     let refresh_token_hash = hash_token(&refresh_token)?;
 
-    let expires_at = Utc::now() + Duration::days(14);
-
+    // Store refresh token in database
+    let expires_at = Utc::now() + Duration::days(state.config.refresh_token_ttl_days as i64);
     let rt_model = refresh_tokens::ActiveModel {
         id: Set(Uuid::new_v4()),
         user_id: Set(user.id),
@@ -280,10 +425,9 @@ pub async fn dev_login(
         expires_at: Set(expires_at.into()),
         ..Default::default()
     };
-
     rt_model.insert(&state.db).await?;
 
-    Ok(Json(AuthResponse {
+    let response = AuthResponse {
         access_token,
         refresh_token,
         user: UserDto {
@@ -292,5 +436,80 @@ pub async fn dev_login(
             email: user.email,
             avatar_url: user.avatar_url,
         },
-    }))
+    };
+
+    Ok(Json(response))
+}
+
+/// Exchange one-time code for access/refresh tokens
+pub async fn exchange_otc(
+    State(state): State<AppState>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    Json(payload): Json<ExchangeOtcRequest>,
+) -> ApiResult<Json<ExchangeOtcResponse>> {
+    let client_ip = addr.ip().to_string();
+    let timer = OTC_EXCHANGE_DURATION.start_timer();
+
+    // Rate limiting
+    state
+        .otc_rate_limiter
+        .check_rate_limit(&client_ip)
+        .await
+        .map_err(|_| {
+            tracing::warn!("Rate limit exceeded for IP: {}", client_ip);
+            log_audit_event(AuditEvent::RateLimitExceeded {
+                client_ip: client_ip.clone(),
+                endpoint: "/auth/exchange-otc".to_string(),
+                timestamp: Utc::now(),
+            });
+            RATE_LIMIT_EXCEEDED_TOTAL.inc();
+            ApiErrorResponse::too_many_requests("Too many attempts, please try again later")
+        })?;
+
+    // Consume OTC (get and delete atomically)
+    let token_data = state
+        .otc_cache
+        .consume_otc(&payload.code)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to retrieve OTC: {:?}", e);
+            log_audit_event(AuditEvent::OtcExchangeFailure {
+                client_ip: client_ip.clone(),
+                error: "Failed to retrieve OTC".to_string(),
+                timestamp: Utc::now(),
+            });
+            ApiErrorResponse::internal_error("Failed to exchange code")
+        })?
+        .ok_or_else(|| {
+            tracing::warn!("Invalid or expired OTC: {}", payload.code);
+            log_audit_event(AuditEvent::OtcExchangeFailure {
+                client_ip: client_ip.clone(),
+                error: "Invalid or expired OTC".to_string(),
+                timestamp: Utc::now(),
+            });
+            ApiErrorResponse::bad_request("Invalid or expired code")
+        })?;
+
+    // Audit log: OTC exchange success
+    log_audit_event(AuditEvent::OtcExchangeSuccess {
+        user_id: token_data.user_id,
+        client_ip,
+        timestamp: Utc::now(),
+    });
+
+    OTC_EXCHANGES_TOTAL.inc();
+    timer.observe_duration();
+
+    let response = ExchangeOtcResponse {
+        access_token: token_data.access_token,
+        refresh_token: token_data.refresh_token,
+        user: UserDto {
+            id: token_data.user_id,
+            username: token_data.username,
+            email: token_data.email,
+            avatar_url: token_data.avatar_url,
+        },
+    };
+
+    Ok(Json(response))
 }

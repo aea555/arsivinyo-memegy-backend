@@ -1,6 +1,8 @@
+pub mod audit;
 pub mod auth;
 pub mod cache;
 pub mod error;
+pub mod metrics;
 pub mod middleware;
 pub mod services;
 pub mod state;
@@ -82,7 +84,10 @@ pub fn create_router(state: AppState) -> Router {
             .allow_credentials(true)
     };
 
-    Router::new()
+    metrics::register_metrics();
+
+    // Core routes
+    let mut router = Router::new()
         .route("/health", get(|| async { "OK" }))
         .route("/docs", get(serve_docs))
         .route("/openapi.yaml", get(serve_openapi))
@@ -94,6 +99,21 @@ pub fn create_router(state: AppState) -> Router {
         .route("/auth/refresh", post(auth::handlers::refresh_token))
         .route("/auth/logout", post(auth::handlers::logout))
         .route("/auth/dev/login", post(auth::handlers::dev_login))
+        .route("/auth/exchange-otc", post(auth::handlers::exchange_otc));
+
+    // Conditionally expose /metrics only in development/test environments
+    // Production metrics should be scraped via internal monitoring infrastructure
+    if state.config.environment == "development" || state.config.environment == "test" {
+        tracing::info!(
+            "Metrics endpoint enabled at /metrics (environment: {})",
+            state.config.environment
+        );
+        router = router.route("/metrics", get(|| async { metrics::metrics_handler() }));
+    } else {
+        tracing::info!("Metrics endpoint disabled in production mode");
+    }
+
+    router
         .merge(videos::router::videos_router(&state.config))
         .nest("/users", users::router::users_router(&state.config))
         .layer(cors)

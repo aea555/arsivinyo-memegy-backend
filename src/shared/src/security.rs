@@ -1,9 +1,9 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use argon2::{
-    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng},
 };
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -72,4 +72,89 @@ pub fn generate_refresh_token() -> String {
     let mut rng = rand::rng(); // Use thread_rng
     let random_bytes: [u8; 32] = rng.random();
     hex::encode(random_bytes)
+}
+
+/// Generate a cryptographically secure one-time code for OAuth token exchange
+pub fn generate_otc() -> String {
+    use rand::Rng;
+    let mut rng = rand::rng();
+    let random_bytes: [u8; 32] = rng.random();
+    hex::encode(random_bytes)
+}
+
+/// Validates PKCE code_verifier format per RFC 7636
+/// Must be 43-128 chars of [A-Z a-z 0-9 - . _ ~]
+pub fn validate_code_verifier(verifier: &str) -> bool {
+    let len = verifier.len();
+    if len < 43 || len > 128 {
+        return false;
+    }
+
+    verifier
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '~'))
+}
+
+/// Computes SHA256 code_challenge from code_verifier
+/// Returns base64url-encoded (no padding) challenge per RFC 7636
+pub fn compute_code_challenge(verifier: &str) -> String {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(verifier.as_bytes());
+    let hash = hasher.finalize();
+    URL_SAFE_NO_PAD.encode(hash)
+}
+
+/// Validates that code_verifier produces the expected code_challenge
+/// Used for PKCE validation in OAuth callback
+pub fn verify_pkce_challenge(verifier: &str, expected_challenge: &str) -> bool {
+    if !validate_code_verifier(verifier) {
+        return false;
+    }
+
+    let computed = compute_code_challenge(verifier);
+    computed == expected_challenge
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_code_verifier_validation() {
+        // Valid
+        assert!(validate_code_verifier(&"a".repeat(43)));
+        assert!(validate_code_verifier(&"a".repeat(128)));
+        assert!(validate_code_verifier(&"aZ0-._~".repeat(7)));
+
+        // Invalid length
+        assert!(!validate_code_verifier(&"a".repeat(42)));
+        assert!(!validate_code_verifier(&"a".repeat(129)));
+
+        // Invalid chars
+        assert!(!validate_code_verifier(&format!("{}+", "a".repeat(43))));
+        assert!(!validate_code_verifier(&format!("{}/", "a".repeat(43))));
+    }
+
+    #[test]
+    fn test_pkce_challenge_computation() {
+        // RFC 7636 Appendix B test vector
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let expected = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+
+        let computed = compute_code_challenge(verifier);
+        assert_eq!(computed, expected);
+    }
+
+    #[test]
+    fn test_verify_pkce_challenge() {
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+
+        assert!(verify_pkce_challenge(verifier, challenge));
+        assert!(!verify_pkce_challenge(verifier, "wrong_challenge"));
+        assert!(!verify_pkce_challenge("short", challenge));
+    }
 }

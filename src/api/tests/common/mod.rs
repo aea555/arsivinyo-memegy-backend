@@ -1,6 +1,7 @@
 use api::{
-    auth::revocation::TokenRevocationService, cache::feed_cache::FeedCacheService, create_router,
-    services::rate_limiter::RateLimiter, state::AppState,
+    auth::revocation::TokenRevocationService, cache::feed_cache::FeedCacheService,
+    cache::otc_cache::OtcCacheService, create_router, services::rate_limiter::RateLimiter,
+    state::AppState,
 };
 use sea_orm::Database;
 use sea_orm_migration::MigratorTrait;
@@ -131,6 +132,8 @@ pub async fn spawn_app() -> TestApp {
         presigned_url_expiry_secs: 3600,
         max_file_size_bytes: 1024 * 1024 * 10,
         limit_upload_bytes_hourly: 1024 * 1024 * 100,
+        otc_rate_limit_max_attempts: 5,
+        otc_rate_limit_window_seconds: 60,
         feed_page_size: 20,
         feed_cache_ttl_secs: 60,
         limit_feed_rpm: 100,
@@ -153,7 +156,9 @@ pub async fn spawn_app() -> TestApp {
     let storage = Arc::new(MockStorage);
     let token_revocation = TokenRevocationService::new(queue.clone());
     let feed_cache = FeedCacheService::new(queue.clone());
+    let otc_cache = OtcCacheService::new(queue.clone());
     let rate_limiter = RateLimiter::new(queue.clone());
+    let otc_rate_limiter = api::middleware::rate_limit::RateLimiter::new(5, 60);
 
     let state = AppState {
         db: db.clone(),
@@ -162,7 +167,9 @@ pub async fn spawn_app() -> TestApp {
         queue,
         token_revocation,
         feed_cache,
+        otc_cache,
         rate_limiter,
+        otc_rate_limiter,
     };
 
     // 5. App Router
@@ -175,9 +182,14 @@ pub async fn spawn_app() -> TestApp {
     let port = listener.local_addr().unwrap().port();
     let address = format!("http://127.0.0.1:{}", port);
 
-    // 7. Spawn server in background
+    // 7. Spawn server in background with ConnectInfo for client IP
     tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
 
     TestApp {

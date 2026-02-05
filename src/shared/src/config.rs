@@ -51,6 +51,10 @@ pub struct Config {
     pub rate_limit_window_secs: usize,
     pub ip_rate_limit_rpm: u64,
 
+    // OTC Rate Limiting
+    pub otc_rate_limit_max_attempts: u32,
+    pub otc_rate_limit_window_seconds: u64,
+
     // Search Configuration
     pub search_max_tokens: usize,
     pub search_max_token_length: usize,
@@ -153,6 +157,14 @@ impl Config {
                 .parse()?,
             ip_rate_limit_rpm: env::var("IP_RATE_LIMIT_RPM")
                 .unwrap_or_else(|_| "30".to_string())
+                .parse()?,
+
+            // OTC Rate Limiting
+            otc_rate_limit_max_attempts: env::var("OTC_RATE_LIMIT_MAX_ATTEMPTS")
+                .unwrap_or_else(|_| "5".to_string())
+                .parse()?,
+            otc_rate_limit_window_seconds: env::var("OTC_RATE_LIMIT_WINDOW_SECONDS")
+                .unwrap_or_else(|_| "60".to_string())
                 .parse()?,
 
             // Search Configuration
