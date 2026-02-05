@@ -44,33 +44,13 @@ lazy_static! {
 }
 
 pub fn register_metrics() {
-    REGISTRY
-        .register(Box::new(OAUTH_REQUESTS_TOTAL.clone()))
-        .expect("collector can be registered");
-
-    REGISTRY
-        .register(Box::new(OAUTH_CALLBACKS_TOTAL.clone()))
-        .expect("collector can be registered");
-
-    REGISTRY
-        .register(Box::new(PKCE_VALIDATIONS_TOTAL.clone()))
-        .expect("collector can be registered");
-
-    REGISTRY
-        .register(Box::new(PKCE_FAILURES_TOTAL.clone()))
-        .expect("collector can be registered");
-
-    REGISTRY
-        .register(Box::new(OTC_EXCHANGES_TOTAL.clone()))
-        .expect("collector can be registered");
-
-    REGISTRY
-        .register(Box::new(OTC_EXCHANGE_DURATION.clone()))
-        .expect("collector can be registered");
-
-    REGISTRY
-        .register(Box::new(RATE_LIMIT_EXCEEDED_TOTAL.clone()))
-        .expect("collector can be registered");
+    let _ = REGISTRY.register(Box::new(OAUTH_REQUESTS_TOTAL.clone()));
+    let _ = REGISTRY.register(Box::new(OAUTH_CALLBACKS_TOTAL.clone()));
+    let _ = REGISTRY.register(Box::new(PKCE_VALIDATIONS_TOTAL.clone()));
+    let _ = REGISTRY.register(Box::new(PKCE_FAILURES_TOTAL.clone()));
+    let _ = REGISTRY.register(Box::new(OTC_EXCHANGES_TOTAL.clone()));
+    let _ = REGISTRY.register(Box::new(OTC_EXCHANGE_DURATION.clone()));
+    let _ = REGISTRY.register(Box::new(RATE_LIMIT_EXCEEDED_TOTAL.clone()));
 }
 
 pub fn metrics_handler() -> String {
