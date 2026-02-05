@@ -8,10 +8,10 @@ pub mod users;
 pub mod videos;
 
 use axum::{
+    Router,
     http::StatusCode,
     response::{Html, IntoResponse},
     routing::{get, post},
-    Router,
 };
 use state::AppState;
 use tower_http::cors::{Any, CorsLayer};
@@ -38,12 +38,21 @@ async fn serve_openapi() -> impl IntoResponse {
 pub fn create_router(state: AppState) -> Router {
     // CORS Logic
     let cors = if state.config.cors_allowed_origins.is_empty() {
-        // Development mode: allow all origins
-        tracing::warn!("CORS: Allowing all origins (development mode)");
-        CorsLayer::new()
-            .allow_origin(Any)
-            .allow_methods(Any)
-            .allow_headers(Any)
+        if state.config.environment == "development" {
+            // Development mode: allow all origins
+            tracing::warn!("CORS: Allowing all origins (development mode)");
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any)
+        } else {
+            // Production mode (or any non-dev): reject all if not explicitly configured
+            tracing::error!(
+                "CORS: No allowed origins configured in {} mode. Rejecting all cross-origin requests.",
+                state.config.environment
+            );
+            CorsLayer::new()
+        }
     } else {
         // Production mode: restrict to specific origins
         let origins: Vec<_> = state

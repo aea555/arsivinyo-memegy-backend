@@ -2,6 +2,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 #[derive(Deserialize)]
+pub struct GoogleLoginQuery {
+    pub source: Option<String>, // "web", "popup", "mobile"
+}
+
+#[derive(Deserialize)]
 pub struct GoogleCallbackQuery {
     pub code: String,
     pub state: String,

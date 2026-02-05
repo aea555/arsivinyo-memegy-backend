@@ -38,20 +38,26 @@ fn oauth_client(state: &AppState) -> BasicClient {
 pub async fn google_login(
     State(state): State<AppState>,
     jar: CookieJar,
+    Query(query): Query<GoogleLoginQuery>,
 ) -> (CookieJar, impl IntoResponse) {
     let client = oauth_client(&state);
-    let (auth_url, csrf_token) = client
-        .authorize_url(CsrfToken::new_random)
+    // Encode source into state: "csrf_token:source"
+    let source = query.source.unwrap_or_else(|| "web".to_string());
+
+    // Create CSRF token with embedded source
+    let csrf_token = CsrfToken::new_random();
+    let combined_state_str = format!("{}:{}", csrf_token.secret(), source);
+
+    let (auth_url, _) = client
+        .authorize_url(|| CsrfToken::new(combined_state_str.clone())) // Use closure that returns our custom token
         .add_scope(Scope::new("email".to_string()))
         .add_scope(Scope::new("profile".to_string()))
         .url();
 
-    // Create CSRF cookie
-    let mut cookie = Cookie::new("oauth_state", csrf_token.secret().to_string());
+    let mut cookie = Cookie::new("oauth_state", combined_state_str);
     cookie.set_path("/");
     cookie.set_http_only(true);
-    cookie.set_same_site(SameSite::Lax); // Allow redirect from Google
-    // Set expiry (e.g., 10 minutes)
+    cookie.set_same_site(SameSite::Lax);
     cookie.set_max_age(time::Duration::minutes(10));
 
     (jar.add(cookie), Redirect::to(auth_url.as_str()))
@@ -61,30 +67,26 @@ pub async fn google_callback(
     State(state): State<AppState>,
     jar: CookieJar,
     Query(query): Query<GoogleCallbackQuery>,
-) -> ApiResult<(CookieJar, Redirect)> {
+) -> ApiResult<impl IntoResponse> {
     // 1. Verify CSRF Token
     let stored_state = jar.get("oauth_state").map(|c| c.value().to_string());
-
-    // Clear the cookie regardless of outcome
     let jar = jar.remove(Cookie::from("oauth_state"));
 
     match stored_state {
         Some(ref stored) if stored == &query.state => {
-            // State matches, proceed
+            // State matches
         }
-        Some(_) => {
-            tracing::error!("CSRF state mismatch");
+        _ => {
+            tracing::error!("CSRF state mismatch or missing");
             return Err(ApiErrorResponse::bad_request(
                 "Invalid authentication state",
             ));
         }
-        None => {
-            tracing::error!("Missing CSRF state cookie");
-            return Err(ApiErrorResponse::bad_request(
-                "Authentication session expired",
-            ));
-        }
     }
+
+    // Decode source from state
+    let parts: Vec<&str> = query.state.split(':').collect();
+    let source = if parts.len() >= 2 { parts[1] } else { "web" };
 
     // Use the same redirect URI as in the authorization request
     let redirect_uri = format!(
@@ -117,13 +119,57 @@ pub async fn google_callback(
         ApiErrorResponse::internal_error("Failed to complete authentication")
     })?;
 
-    // Redirect to frontend with tokens
-    let redirect_url = format!(
-        "{}/auth/callback?access_token={}&refresh_token={}",
-        state.config.frontend_app_url, access_token, refresh_token
-    );
-
-    Ok((jar, Redirect::to(&redirect_url)))
+    // Handle Redirect based on Source
+    match source {
+        "mobile" => {
+            // Deep Link Redirect
+            // e.g. memegy://auth/callback?access_token=...
+            let redirect_url = format!(
+                "{}auth/callback?access_token={}&refresh_token={}",
+                state.config.mobile_app_scheme, access_token, refresh_token
+            );
+            Ok((
+                jar,
+                axum::response::Response::builder()
+                    .status(302)
+                    .header("Location", redirect_url)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+                .into_response())
+        }
+        "popup" => {
+            // HTML PostMessage
+            let html = format!(
+                r#"
+                <!DOCTYPE html>
+                <html>
+                <head><title>Authenticating...</title></head>
+                <body>
+                <script>
+                    window.opener.postMessage({{
+                        type: 'GOOGLE_AUTH_SUCCESS',
+                        accessToken: '{}',
+                        refreshToken: '{}'
+                    }}, '*');
+                    window.close();
+                </script>
+                </body>
+                </html>
+                "#,
+                access_token, refresh_token
+            );
+            Ok((jar, axum::response::Html(html)).into_response())
+        }
+        _ => {
+            // Default Web Redirect
+            let redirect_url = format!(
+                "{}/auth/callback?access_token={}&refresh_token={}",
+                state.config.frontend_app_url, access_token, refresh_token
+            );
+            Ok((jar, Redirect::to(&redirect_url)).into_response())
+        }
+    }
 }
 
 pub async fn refresh_token(

@@ -27,6 +27,7 @@ pub struct Config {
     // OAuth Provider
     pub google_client_id: String,
     pub google_client_secret: String,
+    pub mobile_app_scheme: String,
 
     // Object Storage
     pub minio_endpoint: String,
@@ -109,6 +110,8 @@ impl Config {
             google_client_id: env::var("GOOGLE_CLIENT_ID").expect("GOOGLE_CLIENT_ID must be set"),
             google_client_secret: env::var("GOOGLE_CLIENT_SECRET")
                 .expect("GOOGLE_CLIENT_SECRET must be set"),
+            mobile_app_scheme: env::var("MOBILE_APP_SCHEME")
+                .unwrap_or_else(|_| "memegy://".to_string()),
 
             // Object Storage
             minio_endpoint: env::var("MINIO_ENDPOINT").expect("MINIO_ENDPOINT must be set"),

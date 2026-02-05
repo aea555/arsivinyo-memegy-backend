@@ -145,6 +145,7 @@ pub async fn spawn_app() -> TestApp {
         draft_video_cleanup_hours: 24,
         worker_retry_max_attempts: 3,
         worker_retry_backoff_base_secs: 2,
+        mobile_app_scheme: "memegy://".to_string(),
     };
 
     // 4. Queues & Services
