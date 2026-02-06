@@ -282,13 +282,16 @@ async fn like_video_works() {
     let token_b = app.login_as_dev("user_b", "b@example.com").await;
 
     let response: Response = client
-        .post(&format!("{}/videos/{}/like", app.address, video_id))
+        .put(&format!("{}/videos/{}/like", app.address, video_id))
         .header("Authorization", format!("Bearer {}", token_b))
         .send()
         .await
         .expect("Failed to like video");
 
-    assert_eq!(response.status().as_u16(), 201); // CREATED
+    assert_eq!(response.status().as_u16(), 200); // OK
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["is_liked"], true);
+    assert_eq!(body["like_count"], 1);
 
     // Verify count
     let video = videos::Entity::find_by_id(video_uuid)
@@ -298,23 +301,101 @@ async fn like_video_works() {
         .unwrap();
     assert_eq!(video.like_count, 1);
 
-    // Duplicate Like
+    // Unlike
     let response: Response = client
-        .post(&format!("{}/videos/{}/like", app.address, video_id))
+        .delete(&format!("{}/videos/{}/like", app.address, video_id))
         .header("Authorization", format!("Bearer {}", token_b))
         .send()
         .await
-        .expect("Failed to like video again");
+        .expect("Failed to unlike video");
 
-    assert_eq!(response.status().as_u16(), 200); // OK (Idempotent)
+    assert_eq!(response.status().as_u16(), 200); // OK
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["is_liked"], false);
+    assert_eq!(body["like_count"], 0);
 
-    // Verify count remains 1
+    // Verify count decremented
     let video = videos::Entity::find_by_id(video_uuid)
         .one(&app.db)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(video.like_count, 1);
+    assert_eq!(video.like_count, 0);
+}
+
+#[tokio::test]
+async fn like_video_idempotent_put_delete_works() {
+    let app = spawn_app().await;
+    let client = Client::new();
+
+    // User A uploads
+    let token_a = app.login_as_dev("user_a2", "a2@example.com").await;
+    let (video_id, _) = app.init_upload(&token_a, "vid2.mp4", 1024).await;
+    app.confirm_upload(&token_a, &video_id).await;
+
+    // Force update to PUBLISHED manually
+    use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+    use shared::entities::videos;
+
+    let video_uuid = uuid::Uuid::parse_str(&video_id).unwrap();
+    let video = videos::Entity::find_by_id(video_uuid)
+        .one(&app.db)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut active: videos::ActiveModel = video.into();
+    active.status = Set("PUBLISHED".to_string());
+    active.update(&app.db).await.unwrap();
+
+    let token_b = app.login_as_dev("user_b2", "b2@example.com").await;
+
+    // First PUT likes the video.
+    let response: Response = client
+        .put(&format!("{}/videos/{}/like", app.address, video_id))
+        .header("Authorization", format!("Bearer {}", token_b))
+        .send()
+        .await
+        .expect("Failed to like video with PUT");
+    assert_eq!(response.status().as_u16(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["is_liked"], true);
+    assert_eq!(body["like_count"], 1);
+
+    // Second PUT stays liked and does not increment again.
+    let response: Response = client
+        .put(&format!("{}/videos/{}/like", app.address, video_id))
+        .header("Authorization", format!("Bearer {}", token_b))
+        .send()
+        .await
+        .expect("Failed to re-like video with PUT");
+    assert_eq!(response.status().as_u16(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["is_liked"], true);
+    assert_eq!(body["like_count"], 1);
+
+    // First DELETE unlikes the video.
+    let response: Response = client
+        .delete(&format!("{}/videos/{}/like", app.address, video_id))
+        .header("Authorization", format!("Bearer {}", token_b))
+        .send()
+        .await
+        .expect("Failed to unlike video with DELETE");
+    assert_eq!(response.status().as_u16(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["is_liked"], false);
+    assert_eq!(body["like_count"], 0);
+
+    // Second DELETE stays unliked and does not decrement below zero.
+    let response: Response = client
+        .delete(&format!("{}/videos/{}/like", app.address, video_id))
+        .header("Authorization", format!("Bearer {}", token_b))
+        .send()
+        .await
+        .expect("Failed to re-unlike video with DELETE");
+    assert_eq!(response.status().as_u16(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["is_liked"], false);
+    assert_eq!(body["like_count"], 0);
 }
 
 #[tokio::test]

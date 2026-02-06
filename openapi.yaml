@@ -728,6 +728,8 @@ paths:
           $ref: "#/components/responses/UnauthorizedError"
         "404":
           $ref: "#/components/responses/NotFoundError"
+        "429":
+          $ref: "#/components/responses/TooManyRequestsError"
         "500":
           $ref: "#/components/responses/InternalServerError"
 
@@ -777,17 +779,14 @@ paths:
           $ref: "#/components/responses/InternalServerError"
 
   /videos/{id}/like:
-    post:
+    put:
       tags:
         - Videos
-      summary: Like/Unlike a video
+      summary: Like a video (idempotent)
       description: |
-        Toggles the like status for a video.
-        - If not liked: adds a like
-        - If already liked: removes the like
-
-        The `like_count` is updated atomically.
-      operationId: likeVideo
+        Ensures the authenticated user likes the video.
+        Repeated requests keep the same state and do not over-increment `like_count`.
+      operationId: setLikeVideo
       security:
         - BearerAuth: []
       parameters:
@@ -801,14 +800,75 @@ paths:
             example: 550e8400-e29b-41d4-a716-446655440000
       responses:
         "200":
-          description: Like status toggled
+          description: Video is liked
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  is_liked:
+                    type: boolean
+                    example: true
+                  like_count:
+                    type: integer
+                    format: int64
+                    example: 42
+                required:
+                  - is_liked
+                  - like_count
         "401":
           $ref: "#/components/responses/UnauthorizedError"
         "404":
           $ref: "#/components/responses/NotFoundError"
+        "429":
+          $ref: "#/components/responses/TooManyRequestsError"
         "500":
           $ref: "#/components/responses/InternalServerError"
-
+    delete:
+      tags:
+        - Videos
+      summary: Unlike a video (idempotent)
+      description: |
+        Ensures the authenticated user does not like the video.
+        Repeated requests keep the same state and do not over-decrement `like_count`.
+      operationId: unsetLikeVideo
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Video ID
+          schema:
+            type: string
+            format: uuid
+            example: 550e8400-e29b-41d4-a716-446655440000
+      responses:
+        "200":
+          description: Video is unliked
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  is_liked:
+                    type: boolean
+                    example: false
+                  like_count:
+                    type: integer
+                    format: int64
+                    example: 41
+                required:
+                  - is_liked
+                  - like_count
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "429":
+          $ref: "#/components/responses/TooManyRequestsError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
   /videos/{id}:
     delete:
       tags:

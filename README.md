@@ -72,7 +72,8 @@ The documentation includes:
 - `POST /videos/init`: Request upload URL. Body: `{ "filename": "meme.mp4", "size_bytes": 123456 }`.
 - `POST /videos/{id}/confirm`: Confirm upload completion.
 - `GET /feed`: Get video feed. Params: `?sort=random|latest|popular&page=0`.
-- `POST /videos/{id}/like`: Like a video.
+- `PUT /videos/{id}/like`: Idempotently like a video. Returns current `{ is_liked, like_count }`.
+- `DELETE /videos/{id}/like`: Idempotently unlike a video. Returns current `{ is_liked, like_count }`.
 
 ## Testing
 

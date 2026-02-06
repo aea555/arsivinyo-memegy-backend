@@ -1,6 +1,12 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[derive(Serialize)]
+pub struct LikeVideoResponse {
+    pub is_liked: bool,
+    pub like_count: i64,
+}
+
 #[derive(Deserialize)]
 pub struct InitUploadRequest {
     pub filename: String,

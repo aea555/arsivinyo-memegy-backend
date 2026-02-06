@@ -113,6 +113,11 @@ impl RateLimiter {
         format!("ratelimit:feed:rpm:{}", user_id)
     }
 
+    /// Generate key for per-user like/unlike rate limiting
+    pub fn like_actions_rpm_key(user_id: &uuid::Uuid) -> String {
+        format!("ratelimit:likes:rpm:{}", user_id)
+    }
+
     /// Generate key for per-IP rate limiting
     pub fn ip_rpm_key(ip: &str) -> String {
         format!("ratelimit:ip:rpm:{}", ip)

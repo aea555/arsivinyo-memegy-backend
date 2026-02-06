@@ -50,6 +50,8 @@ pub struct Config {
     // Rate Limiting
     pub rate_limit_window_secs: usize,
     pub ip_rate_limit_rpm: u64,
+    pub like_actions_rpm_limit: u64,
+    pub like_actions_window_secs: usize,
 
     // OTC Rate Limiting
     pub otc_rate_limit_max_attempts: u32,
@@ -157,6 +159,12 @@ impl Config {
                 .parse()?,
             ip_rate_limit_rpm: env::var("IP_RATE_LIMIT_RPM")
                 .unwrap_or_else(|_| "30".to_string())
+                .parse()?,
+            like_actions_rpm_limit: env::var("LIKE_ACTIONS_RPM_LIMIT")
+                .unwrap_or_else(|_| "60".to_string())
+                .parse()?,
+            like_actions_window_secs: env::var("LIKE_ACTIONS_WINDOW_SECS")
+                .unwrap_or_else(|_| "60".to_string())
                 .parse()?,
 
             // OTC Rate Limiting

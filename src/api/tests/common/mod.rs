@@ -139,6 +139,8 @@ pub async fn spawn_app() -> TestApp {
         limit_feed_rpm: 100,
         rate_limit_window_secs: 3600,
         ip_rate_limit_rpm: 100,
+        like_actions_rpm_limit: 60,
+        like_actions_window_secs: 60,
         search_max_tokens: 50,
         search_max_token_length: 50,
         search_max_query_chars: 200,

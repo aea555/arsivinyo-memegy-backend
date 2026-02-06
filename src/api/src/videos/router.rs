@@ -1,5 +1,5 @@
 use axum::{
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Router,
 };
 use shared::config::Config;
@@ -36,7 +36,10 @@ pub fn videos_router(_config: &Config) -> Router<AppState> {
             get(handlers::get_bulk_download_status),
         )
         // Actions
-        .route("/videos/:id/like", post(handlers::like_video))
+        .route(
+            "/videos/:id/like",
+            put(handlers::set_like_video).delete(handlers::unset_like_video),
+        )
         .route(
             "/videos/:id",
             delete(handlers::delete_video).patch(handlers::update_video_metadata),

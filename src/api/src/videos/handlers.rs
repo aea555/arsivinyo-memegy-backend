@@ -176,7 +176,7 @@ pub async fn get_feed(
         state.config.minio_public_endpoint, state.config.minio_bucket_videos
     );
 
-    let items: Vec<VideoFeedItem> = video_with_users
+    let mut items: Vec<VideoFeedItem> = video_with_users
         .iter()
         .map(|(v, u)| VideoFeedItem {
             id: v.id,
@@ -196,6 +196,27 @@ pub async fn get_feed(
             is_liked: false,
         })
         .collect();
+
+    if !items.is_empty() {
+        let video_ids: Vec<Uuid> = items.iter().map(|i| i.id).collect();
+        let liked_video_ids: Vec<Uuid> = likes::Entity::find()
+            .select_only()
+            .column(likes::Column::VideoId)
+            .filter(
+                Condition::all()
+                    .add(likes::Column::UserId.eq(user_id))
+                    .add(likes::Column::VideoId.is_in(video_ids)),
+            )
+            .into_tuple()
+            .all(&state.db)
+            .await
+            .map_err(|e| ApiErrorResponse::internal_error(e.to_string()))?;
+
+        let liked_set: std::collections::HashSet<Uuid> = liked_video_ids.into_iter().collect();
+        for item in &mut items {
+            item.is_liked = liked_set.contains(&item.id);
+        }
+    }
 
     // Populate cache with full metadata
     if sort != "random" && !video_with_users.is_empty() {
@@ -473,46 +494,157 @@ pub async fn confirm_upload(
     Ok(StatusCode::ACCEPTED)
 }
 
-pub async fn like_video(
+async fn invalidate_like_related_caches(state: &AppState, owner_user_id: Uuid, actor_user_id: Uuid) {
+    let _ = state.feed_cache.invalidate_all().await;
+    if let Ok(mut conn) = state.queue.get_conn().await {
+        let mut keys: Vec<String> = Vec::new();
+
+        let owner_videos_pattern = format!("user:{}:videos:*", owner_user_id);
+        let actor_search_pattern = format!("search:cache:{}:*", actor_user_id);
+
+        keys.extend(
+            conn.keys::<_, Vec<String>>(&owner_videos_pattern)
+                .await
+                .unwrap_or_default(),
+        );
+        keys.extend(
+            conn.keys::<_, Vec<String>>(&actor_search_pattern)
+                .await
+                .unwrap_or_default(),
+        );
+
+        if !keys.is_empty() {
+            let _: Result<(), _> = conn.del(keys).await;
+        }
+    }
+}
+
+async fn get_published_video_or_404(
+    db: &DatabaseConnection,
+    video_id: Uuid,
+) -> ApiResult<videos::Model> {
+    videos::Entity::find_by_id(video_id)
+        .filter(videos::Column::Status.eq("PUBLISHED"))
+        .one(db)
+        .await?
+        .ok_or_else(|| ApiErrorResponse::not_found("Video not found or not published"))
+}
+
+async fn get_video_like_count(txn: &DatabaseTransaction, video_id: Uuid) -> ApiResult<i64> {
+    let video = videos::Entity::find_by_id(video_id)
+        .one(txn)
+        .await?
+        .ok_or_else(|| ApiErrorResponse::not_found("Video not found or not published"))?;
+    Ok(video.like_count)
+}
+
+async fn enforce_like_rate_limit(state: &AppState, user_id: Uuid) -> ApiResult<()> {
+    let rate_key = crate::services::rate_limiter::RateLimiter::like_actions_rpm_key(&user_id);
+    match state
+        .rate_limiter
+        .check_and_increment(
+            &rate_key,
+            state.config.like_actions_rpm_limit,
+            state.config.like_actions_window_secs,
+        )
+        .await
+    {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(count)) => Err(ApiErrorResponse::too_many_requests(format!(
+            "Like rate limit exceeded: {} actions per {} seconds (current: {})",
+            state.config.like_actions_rpm_limit, state.config.like_actions_window_secs, count
+        ))),
+        Err(_) => Ok(()), // Fail open if Redis is unavailable
+    }
+}
+
+async fn insert_like_if_missing(
+    txn: &DatabaseTransaction,
+    user_id: Uuid,
+    video_id: Uuid,
+) -> ApiResult<bool> {
+    let result = txn
+        .execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            r#"
+            INSERT INTO likes (user_id, video_id)
+            VALUES ($1, $2)
+            ON CONFLICT (user_id, video_id) DO NOTHING
+            "#,
+            vec![user_id.into(), video_id.into()],
+        ))
+        .await?;
+
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn set_like_video(
     State(state): State<AppState>,
     AuthUser(user_id): AuthUser,
     Path(video_id): Path<Uuid>,
-) -> ApiResult<StatusCode> {
-    // Check if video exists and is published
-    let _video = videos::Entity::find_by_id(video_id)
-        .filter(videos::Column::Status.eq("PUBLISHED"))
-        .one(&state.db)
-        .await?
-        .ok_or_else(|| ApiErrorResponse::not_found("Video not found or not published"))?;
+) -> ApiResult<Json<LikeVideoResponse>> {
+    enforce_like_rate_limit(&state, user_id).await?;
+    let video = get_published_video_or_404(&state.db, video_id).await?;
 
-    // Try to insert like
-    let like = likes::ActiveModel {
-        user_id: Set(user_id),
-        video_id: Set(video_id),
-        created_at: Set(Utc::now().into()),
-    };
-
-    match like.insert(&state.db).await {
-        Ok(_) => {
-            // Increment like count
-            videos::Entity::update_many()
-                .col_expr(
-                    videos::Column::LikeCount,
-                    sea_orm::sea_query::Expr::col(videos::Column::LikeCount).add(1),
-                )
-                .filter(videos::Column::Id.eq(video_id))
-                .exec(&state.db)
-                .await?;
-
-            Ok(StatusCode::CREATED)
-        }
-        Err(DbErr::RecordNotInserted) | Err(DbErr::Query(sea_orm::RuntimeErr::SqlxError(_))) => {
-            // Already liked (duplicate key violation)
-            // Note: SqlxError is generic, but practically unique constraints trigger this in SeaORM 1.1 sometimes
-            Ok(StatusCode::OK)
-        }
-        Err(e) => Err(e.into()),
+    let txn = state.db.begin().await?;
+    if insert_like_if_missing(&txn, user_id, video_id).await? {
+        videos::Entity::update_many()
+            .col_expr(
+                videos::Column::LikeCount,
+                sea_orm::sea_query::Expr::col(videos::Column::LikeCount).add(1),
+            )
+            .filter(videos::Column::Id.eq(video_id))
+            .exec(&txn)
+            .await?;
     }
+    let like_count = get_video_like_count(&txn, video_id).await?;
+
+    txn.commit().await?;
+
+    invalidate_like_related_caches(&state, video.user_id, user_id).await;
+
+    Ok(Json(LikeVideoResponse {
+        is_liked: true,
+        like_count,
+    }))
+}
+
+pub async fn unset_like_video(
+    State(state): State<AppState>,
+    AuthUser(user_id): AuthUser,
+    Path(video_id): Path<Uuid>,
+) -> ApiResult<Json<LikeVideoResponse>> {
+    enforce_like_rate_limit(&state, user_id).await?;
+    let video = get_published_video_or_404(&state.db, video_id).await?;
+
+    let txn = state.db.begin().await?;
+    let delete_result = likes::Entity::delete_by_id((user_id, video_id))
+        .exec(&txn)
+        .await?;
+
+    if delete_result.rows_affected > 0 {
+        videos::Entity::update_many()
+            .col_expr(
+                videos::Column::LikeCount,
+                sea_orm::sea_query::Expr::cust(
+                    "CASE WHEN like_count > 0 THEN like_count - 1 ELSE 0 END",
+                ),
+            )
+            .filter(videos::Column::Id.eq(video_id))
+            .exec(&txn)
+            .await?;
+    }
+
+    let like_count = get_video_like_count(&txn, video_id).await?;
+
+    txn.commit().await?;
+
+    invalidate_like_related_caches(&state, video.user_id, user_id).await;
+
+    Ok(Json(LikeVideoResponse {
+        is_liked: false,
+        like_count,
+    }))
 }
 
 /// Delete video (soft delete with audit trail)
@@ -1474,6 +1606,27 @@ pub async fn search_videos(
             uploader,
             is_liked: false,
         });
+    }
+
+    if !feed.is_empty() {
+        let video_ids: Vec<Uuid> = feed.iter().map(|i| i.id).collect();
+        let liked_video_ids: Vec<Uuid> = likes::Entity::find()
+            .select_only()
+            .column(likes::Column::VideoId)
+            .filter(
+                Condition::all()
+                    .add(likes::Column::UserId.eq(user_id))
+                    .add(likes::Column::VideoId.is_in(video_ids)),
+            )
+            .into_tuple()
+            .all(&state.db)
+            .await
+            .map_err(|e| ApiErrorResponse::internal_error(e.to_string()))?;
+
+        let liked_set: std::collections::HashSet<Uuid> = liked_video_ids.into_iter().collect();
+        for item in &mut feed {
+            item.is_liked = liked_set.contains(&item.id);
+        }
     }
 
     // 8. CACHE RESULTS (user-scoped)
