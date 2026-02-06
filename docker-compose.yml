@@ -27,6 +27,8 @@ services:
     image: valkey/valkey:9.0.1-alpine
     container_name: memegy_cache
     restart: unless-stopped
+    environment:
+      VALKEY_PASSWORD: ${VALKEY_PASSWORD}
     command: >
       /bin/sh -ec '
       test -n "$$VALKEY_PASSWORD";
@@ -37,7 +39,7 @@ services:
     volumes:
       - valkey_data:/data
     healthcheck:
-      test: ["CMD", "valkey-cli", "-a", "${VALKEY_PASSWORD}", "ping"]
+      test: ["CMD-SHELL", "valkey-cli -a \"$${VALKEY_PASSWORD}\" ping | grep -q PONG"]
       interval: 5s
       timeout: 5s
       retries: 5
