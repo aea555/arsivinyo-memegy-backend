@@ -441,6 +441,86 @@ async fn user_profile_management_works() {
 }
 
 #[tokio::test]
+async fn my_videos_returns_playable_url_for_published_only() {
+    let app = spawn_app().await;
+    let client = Client::new();
+    let email = "myvideos@example.com";
+    let token = app.login_as_dev("myvideos_user", email).await;
+
+    use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+    use shared::entities::{users, videos};
+
+    let user = users::Entity::find()
+        .filter(users::Column::Email.eq(email))
+        .one(&app.db)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let published_id = uuid::Uuid::new_v4();
+    let processing_id = uuid::Uuid::new_v4();
+
+    let published = videos::ActiveModel {
+        id: Set(published_id),
+        user_id: Set(user.id),
+        title: Set(Some("Published video".to_string())),
+        description: Set(None),
+        s3_bucket: Set("videos".to_string()),
+        s3_key: Set("published.mp4".to_string()),
+        status: Set("PUBLISHED".to_string()),
+        size_bytes: Set(1024),
+        like_count: Set(3),
+        is_anonymous: Set(false),
+        deleted_at: Set(None),
+        created_at: Set(chrono::Utc::now().into()),
+        updated_at: Set(chrono::Utc::now().into()),
+    };
+    published.insert(&app.db).await.unwrap();
+
+    let processing = videos::ActiveModel {
+        id: Set(processing_id),
+        user_id: Set(user.id),
+        title: Set(Some("Processing video".to_string())),
+        description: Set(None),
+        s3_bucket: Set("raw".to_string()),
+        s3_key: Set("processing.mp4".to_string()),
+        status: Set("PROCESSING".to_string()),
+        size_bytes: Set(1024),
+        like_count: Set(0),
+        is_anonymous: Set(false),
+        deleted_at: Set(None),
+        created_at: Set(chrono::Utc::now().into()),
+        updated_at: Set(chrono::Utc::now().into()),
+    };
+    processing.insert(&app.db).await.unwrap();
+
+    let response: Response = client
+        .get(&format!("{}/users/me/videos", app.address))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .expect("Failed to get my videos");
+
+    assert!(response.status().is_success());
+    let body: Vec<serde_json::Value> = response.json().await.unwrap();
+
+    let published_item = body
+        .iter()
+        .find(|item| item["id"] == published_id.to_string())
+        .expect("Published video should exist");
+    assert_eq!(
+        published_item["url"].as_str(),
+        Some("http://mock/videos/published.mp4")
+    );
+
+    let processing_item = body
+        .iter()
+        .find(|item| item["id"] == processing_id.to_string())
+        .expect("Processing video should exist");
+    assert!(processing_item["url"].is_null());
+}
+
+#[tokio::test]
 async fn search_functionality_works() {
     let app = spawn_app().await;
     let client = Client::new();

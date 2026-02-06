@@ -235,6 +235,42 @@ components:
         - like_count
         - created_at
 
+    UserVideoItem:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        title:
+          type: string
+          nullable: true
+        description:
+          type: string
+          nullable: true
+        status:
+          type: string
+          description: Video status (`DRAFT`, `PROCESSING`, `PUBLISHED`, `FAILED`)
+        created_at:
+          type: string
+          format: date-time
+        is_anonymous:
+          type: boolean
+        like_count:
+          type: integer
+          format: int64
+        url:
+          type: string
+          format: uri
+          nullable: true
+          description: Public playable URL if status is `PUBLISHED`, otherwise null
+      required:
+        - id
+        - status
+        - created_at
+        - is_anonymous
+        - like_count
+        - url
+
     RefreshDownloadResponse:
       type: object
       properties:
@@ -1377,13 +1413,16 @@ paths:
           required: false
           schema:
             type: integer
-            default: 0
-        - name: limit
+            default: 1
+            minimum: 1
+        - name: per_page
           in: query
           required: false
           schema:
             type: integer
             default: 20
+            minimum: 1
+            maximum: 100
       responses:
         "200":
           description: List of user videos
@@ -1392,7 +1431,7 @@ paths:
               schema:
                 type: array
                 items:
-                  $ref: "#/components/schemas/VideoFeedItem"
+                  $ref: "#/components/schemas/UserVideoItem"
         "401":
           $ref: "#/components/responses/UnauthorizedError"
         "500":

@@ -168,7 +168,31 @@ pub async fn get_my_videos(
         .await
         .map_err(ApiErrorResponse::db_error)?;
 
-    let dtos: Vec<UserVideoDto> = items.into_iter().map(|v: videos::Model| v.into()).collect();
+    let base_url = format!(
+        "{}/{}",
+        state.config.minio_public_endpoint, state.config.minio_bucket_videos
+    );
+    let dtos: Vec<UserVideoDto> = items
+        .into_iter()
+        .map(|v: videos::Model| {
+            let url = if v.status == "PUBLISHED" {
+                Some(format!("{}/{}", base_url, v.s3_key))
+            } else {
+                None
+            };
+
+            UserVideoDto {
+                id: v.id,
+                title: v.title,
+                description: v.description,
+                status: v.status,
+                created_at: v.created_at,
+                is_anonymous: v.is_anonymous,
+                like_count: v.like_count,
+                url,
+            }
+        })
+        .collect();
 
     // Cache result (short TTL, e.g., 5 mins, invalidated on upload/delete)
     if let Ok(mut conn) = state.queue.get_conn().await {

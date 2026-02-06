@@ -80,7 +80,12 @@ pub async fn get_feed(
         }
     }
 
-    let sort = query.sort.as_deref().unwrap_or("random");
+    let requested_sort = query.sort.as_deref().unwrap_or("random").to_ascii_lowercase();
+    let sort = match requested_sort.as_str() {
+        "latest" | "newest" => "latest",
+        "popular" => "popular",
+        _ => "random",
+    };
     // Standardize on 1-based pagination for API
     let page = query.page.unwrap_or(1);
     let page = if page > 0 { page - 1 } else { 0 };
@@ -153,10 +158,15 @@ pub async fn get_feed(
 
     match sort {
         "latest" => {
-            select = select.order_by_desc(videos::Column::CreatedAt);
+            select = select
+                .order_by_desc(videos::Column::CreatedAt)
+                .order_by_desc(videos::Column::Id);
         }
         "popular" => {
-            select = select.order_by_desc(videos::Column::LikeCount);
+            select = select
+                .order_by_desc(videos::Column::LikeCount)
+                .order_by_desc(videos::Column::CreatedAt)
+                .order_by_desc(videos::Column::Id);
         }
         _ => {
             select = select.order_by(
@@ -316,6 +326,9 @@ pub async fn init_upload(
             ApiErrorResponse::internal_error(format!("Failed to generate upload URL: {}", e))
         })?;
 
+    // Ensure /users/me/videos reflects new DRAFT immediately.
+    invalidate_user_video_cache(&state, user_id).await;
+
     Ok(Json(InitUploadResponse {
         video_id,
         upload_url,
@@ -387,6 +400,9 @@ pub async fn init_anonymous_upload(
         .map_err(|e| {
             ApiErrorResponse::internal_error(format!("Failed to generate upload URL: {}", e))
         })?;
+
+    // Ensure /users/me/videos reflects new DRAFT immediately.
+    invalidate_user_video_cache(&state, user_id).await;
 
     Ok(Json(InitUploadResponse {
         video_id,
@@ -478,20 +494,19 @@ pub async fn confirm_upload(
 
     // 7. Invalidate User's Video List Cache
     // This ensures the new video immediately appears in their list
+    invalidate_user_video_cache(&state, user_id).await;
+
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn invalidate_user_video_cache(state: &AppState, user_id: Uuid) {
     if let Ok(mut conn) = state.queue.get_conn().await {
         let pattern = format!("user:{}:videos:*", user_id);
         let keys: Vec<String> = conn.keys(&pattern).await.unwrap_or_default();
         if !keys.is_empty() {
             let _: Result<(), _> = conn.del(&keys).await;
-            tracing::info!(
-                "Invalidated {} video list cache keys for user {}",
-                keys.len(),
-                user_id
-            );
         }
     }
-
-    Ok(StatusCode::ACCEPTED)
 }
 
 async fn invalidate_like_related_caches(state: &AppState, owner_user_id: Uuid, actor_user_id: Uuid) {

@@ -12,6 +12,7 @@ use std::process::Command;
 use std::sync::Arc;
 use tempfile::TempDir;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use uuid::Uuid;
 
 mod bulk_download;
 use bulk_download::BulkDownloadWorker;
@@ -125,6 +126,7 @@ async fn main() -> Result<()> {
                         let mut active: videos::ActiveModel = v.into();
                         active.status = Set("FAILED".to_string());
                         let _ = active.update(&db).await;
+                        invalidate_user_video_cache(&queue, job.user_id).await;
                         tracing::error!(
                             "Marked video {} as FAILED after exhausting retries: {:?}",
                             job.video_id,
@@ -222,21 +224,42 @@ async fn process_video(
     active.s3_key = Set(video_key.clone());
     active.update(db).await?;
 
-    // 8. Invalidate feed cache
-    use redis::AsyncCommands;
-    if let Ok(mut conn) = queue.get_conn().await {
-        // Use SCAN in production, KEYS is ok for moderate load
-        if let Ok(keys) = conn.keys::<_, Vec<String>>("feed:*").await {
-            if !keys.is_empty() {
-                let _: Result<(), _> = conn.del(keys).await;
-                tracing::debug!("Invalidated feed cache after publishing video");
-            }
-        }
-    }
+    // 8. Invalidate caches affected by publish transition.
+    invalidate_feed_cache(queue).await;
+    invalidate_user_video_cache(queue, job.user_id).await;
 
     tracing::info!("Video {} published successfully", job.video_id);
 
     Ok(())
+}
+
+async fn invalidate_feed_cache(queue: &QueueService) {
+    use redis::AsyncCommands;
+    if let Ok(mut conn) = queue.get_conn().await {
+        if let Ok(keys) = conn.keys::<_, Vec<String>>("feed:*").await {
+            if !keys.is_empty() {
+                let _: Result<(), _> = conn.del(&keys).await;
+                tracing::debug!("Invalidated feed cache after publishing video");
+            }
+        }
+    }
+}
+
+async fn invalidate_user_video_cache(queue: &QueueService, user_id: Uuid) {
+    use redis::AsyncCommands;
+    if let Ok(mut conn) = queue.get_conn().await {
+        let pattern = format!("user:{}:videos:*", user_id);
+        if let Ok(keys) = conn.keys::<_, Vec<String>>(&pattern).await {
+            if !keys.is_empty() {
+                let _: Result<(), _> = conn.del(&keys).await;
+                tracing::debug!(
+                    "Invalidated {} /users/me/videos cache key(s) for user {}",
+                    keys.len(),
+                    user_id
+                );
+            }
+        }
+    }
 }
 
 fn compress_video(input: &Path, output: &Path) -> Result<()> {
