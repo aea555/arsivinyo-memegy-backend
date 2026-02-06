@@ -253,6 +253,9 @@ components:
         created_at:
           type: string
           format: date-time
+        updated_at:
+          type: string
+          format: date-time
         is_anonymous:
           type: boolean
         like_count:
@@ -267,9 +270,47 @@ components:
         - id
         - status
         - created_at
+        - updated_at
         - is_anonymous
         - like_count
         - url
+
+    RealtimeVideoSignal:
+      type: object
+      description: Realtime websocket payload for video status updates.
+      properties:
+        type:
+          type: string
+          enum:
+            - video.status.snapshot
+            - video.status.processing
+            - video.status.published
+            - video.status.failed
+        event_id:
+          type: string
+          format: uuid
+        event_at:
+          type: string
+          format: date-time
+        version:
+          type: integer
+          example: 1
+        previous_status:
+          type: string
+          nullable: true
+        video:
+          $ref: "#/components/schemas/UserVideoItem"
+          nullable: true
+        videos:
+          type: array
+          items:
+            $ref: "#/components/schemas/UserVideoItem"
+          nullable: true
+      required:
+        - type
+        - event_id
+        - event_at
+        - version
 
     RefreshDownloadResponse:
       type: object
@@ -1436,6 +1477,38 @@ paths:
           $ref: "#/components/responses/UnauthorizedError"
         "500":
           $ref: "#/components/responses/InternalServerError"
+
+  /users/me/videos/ws:
+    get:
+      tags:
+        - Users
+      summary: Realtime my-videos status stream
+      description: |
+        Upgrades to WebSocket and streams per-user video status signals.
+        Flow:
+        1. Connect with `Authorization: Bearer <token>`
+        2. Receive one `video.status.snapshot` payload first
+        3. Receive live `video.status.processing|published|failed` messages
+      operationId: getMyVideosRealtime
+      security:
+        - BearerAuth: []
+      responses:
+        "101":
+          description: Switching Protocols (WebSocket connected)
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          description: Origin not allowed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          description: Rate limited or connection limit reached
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
   /videos/bulk-delete:
     post:

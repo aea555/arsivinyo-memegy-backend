@@ -69,6 +69,15 @@ pub struct Config {
     pub draft_video_cleanup_hours: u16,
     pub worker_retry_max_attempts: u8,
     pub worker_retry_backoff_base_secs: u64,
+
+    // Realtime WebSocket
+    pub video_ws_enabled: bool,
+    pub video_ws_max_conn_per_user: usize,
+    pub video_ws_max_conn_global: usize,
+    pub video_ws_connect_rpm_per_ip: u64,
+    pub video_ws_connect_rpm_per_user: u64,
+    pub video_ws_send_buffer: usize,
+    pub video_ws_heartbeat_secs: u64,
 }
 
 impl Config {
@@ -204,6 +213,30 @@ impl Config {
                 .parse()?,
             worker_retry_backoff_base_secs: env::var("WORKER_RETRY_BACKOFF_BASE_SECS")
                 .unwrap_or_else(|_| "2".to_string())
+                .parse()?,
+
+            // Realtime WebSocket
+            video_ws_enabled: env::var("VIDEO_WS_ENABLED")
+                .unwrap_or_else(|_| "true".to_string())
+                .parse()
+                .unwrap_or(true),
+            video_ws_max_conn_per_user: env::var("VIDEO_WS_MAX_CONN_PER_USER")
+                .unwrap_or_else(|_| "3".to_string())
+                .parse()?,
+            video_ws_max_conn_global: env::var("VIDEO_WS_MAX_CONN_GLOBAL")
+                .unwrap_or_else(|_| "5000".to_string())
+                .parse()?,
+            video_ws_connect_rpm_per_ip: env::var("VIDEO_WS_CONNECT_RPM_PER_IP")
+                .unwrap_or_else(|_| "30".to_string())
+                .parse()?,
+            video_ws_connect_rpm_per_user: env::var("VIDEO_WS_CONNECT_RPM_PER_USER")
+                .unwrap_or_else(|_| "60".to_string())
+                .parse()?,
+            video_ws_send_buffer: env::var("VIDEO_WS_SEND_BUFFER")
+                .unwrap_or_else(|_| "64".to_string())
+                .parse()?,
+            video_ws_heartbeat_secs: env::var("VIDEO_WS_HEARTBEAT_SECS")
+                .unwrap_or_else(|_| "20".to_string())
                 .parse()?,
         })
     }

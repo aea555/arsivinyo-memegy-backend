@@ -18,7 +18,10 @@ use crate::auth::service::AuthService;
 use crate::{
     auth::extractors::AuthUser,
     error::{ApiErrorResponse, ApiResult},
+    metrics::WS_EVENTS_PUBLISHED_TOTAL,
+    realtime::messages::{EVENT_PROCESSING, RealtimeSignalMessage},
     state::AppState,
+    users::handlers::video_model_to_user_dto,
 };
 use redis::AsyncCommands;
 use shared::{
@@ -80,7 +83,11 @@ pub async fn get_feed(
         }
     }
 
-    let requested_sort = query.sort.as_deref().unwrap_or("random").to_ascii_lowercase();
+    let requested_sort = query
+        .sort
+        .as_deref()
+        .unwrap_or("random")
+        .to_ascii_lowercase();
     let sort = match requested_sort.as_str() {
         "latest" | "newest" => "latest",
         "popular" => "popular",
@@ -152,8 +159,12 @@ pub async fn get_feed(
     use shared::entities::users;
 
     let mut select = videos::Entity::find()
-        .filter(videos::Column::Status.eq("PUBLISHED"))
         .filter(videos::Column::DeletedAt.is_null()) // Filter soft-deleted videos
+        .filter(
+            Condition::any()
+                .add(videos::Column::Status.eq("PUBLISHED"))
+                .add(videos::Column::S3Bucket.eq(state.config.minio_bucket_videos.clone())),
+        )
         .find_also_related(users::Entity); // Left join users table
 
     match sort {
@@ -465,6 +476,7 @@ pub async fn confirm_upload(
         .await;
 
     // 5. Update Status and Actual Size
+    let previous_status = video.status.clone();
     let mut active_video: videos::ActiveModel = video.clone().into();
     active_video.status = Set("PROCESSING".to_string());
 
@@ -474,7 +486,7 @@ pub async fn confirm_upload(
     }
 
     active_video.updated_at = Set(Utc::now().into());
-    active_video.update(&txn).await?;
+    let processing_video = active_video.update(&txn).await?;
 
     // 6. Queue Job
     let job = VideoProcessJob {
@@ -496,6 +508,19 @@ pub async fn confirm_upload(
     // This ensures the new video immediately appears in their list
     invalidate_user_video_cache(&state, user_id).await;
 
+    // 8. Publish realtime processing signal (non-fatal).
+    if let Err(e) = publish_video_status_signal(
+        &state,
+        user_id,
+        EVENT_PROCESSING,
+        Some(previous_status),
+        processing_video,
+    )
+    .await
+    {
+        tracing::warn!("Failed to publish processing realtime signal: {:?}", e);
+    }
+
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -509,7 +534,29 @@ async fn invalidate_user_video_cache(state: &AppState, user_id: Uuid) {
     }
 }
 
-async fn invalidate_like_related_caches(state: &AppState, owner_user_id: Uuid, actor_user_id: Uuid) {
+async fn publish_video_status_signal(
+    state: &AppState,
+    user_id: Uuid,
+    event_type: &str,
+    previous_status: Option<String>,
+    video: videos::Model,
+) -> anyhow::Result<()> {
+    let dto = video_model_to_user_dto(video, &state.config);
+    let signal = RealtimeSignalMessage::status(event_type, previous_status, dto);
+    let payload = serde_json::to_string(&signal)?;
+    state
+        .queue
+        .publish_video_status_event(user_id, &payload)
+        .await?;
+    WS_EVENTS_PUBLISHED_TOTAL.inc();
+    Ok(())
+}
+
+async fn invalidate_like_related_caches(
+    state: &AppState,
+    owner_user_id: Uuid,
+    actor_user_id: Uuid,
+) {
     let _ = state.feed_cache.invalidate_all().await;
     if let Ok(mut conn) = state.queue.get_conn().await {
         let mut keys: Vec<String> = Vec::new();
@@ -1488,7 +1535,7 @@ pub async fn search_videos(
     let limit = params.limit.min(100);
     let offset = params.offset;
     let cache_key = format!(
-        "search:cache:{}:{}:{}:{}:{}",
+        "search:cache:{}:v2:{}:{}:{}:{}",
         user_id, // CRITICAL: User-scoped cache
         query.to_lowercase(),
         params.sort,
@@ -1527,7 +1574,7 @@ pub async fn search_videos(
             FROM videos
             WHERE search_vector @@ plainto_tsquery('english', $1)
             AND deleted_at IS NULL
-            AND status = 'PUBLISHED'
+            AND (status = 'PUBLISHED' OR s3_bucket = $4)
             ORDER BY created_at DESC
             LIMIT $2 OFFSET $3
             "#
@@ -1538,7 +1585,7 @@ pub async fn search_videos(
             FROM videos
             WHERE search_vector @@ plainto_tsquery('english', $1)
             AND deleted_at IS NULL
-            AND status = 'PUBLISHED'
+            AND (status = 'PUBLISHED' OR s3_bucket = $4)
             ORDER BY like_count DESC, created_at DESC
             LIMIT $2 OFFSET $3
             "#
@@ -1550,7 +1597,7 @@ pub async fn search_videos(
             FROM videos
             WHERE search_vector @@ plainto_tsquery('english', $1)
             AND deleted_at IS NULL
-            AND status = 'PUBLISHED'
+            AND (status = 'PUBLISHED' OR s3_bucket = $4)
             ORDER BY rank DESC, like_count DESC
             LIMIT $2 OFFSET $3
             "#
@@ -1565,6 +1612,7 @@ pub async fn search_videos(
             query.clone().into(),
             (limit as i64).into(),
             (offset as i64).into(),
+            state.config.minio_bucket_videos.clone().into(),
         ],
     ));
 
@@ -1584,6 +1632,7 @@ pub async fn search_videos(
 
     // 7. CONVERT TO RESPONSE
     let mut feed = vec![];
+    let base_url = format!("{}", state.config.minio_public_endpoint);
     for row in results {
         let video_id: Uuid = row.try_get("", "id").map_err(|e| {
             tracing::error!("Failed to parse video ID: {:?}", e);
@@ -1592,6 +1641,14 @@ pub async fn search_videos(
 
         let uploader_id: Uuid = row.try_get("", "user_id")?;
         let is_anonymous: bool = row.try_get("", "is_anonymous")?;
+        let status: String = row.try_get("", "status")?;
+        let s3_bucket: String = row.try_get("", "s3_bucket")?;
+        let s3_key: String = row.try_get("", "s3_key")?;
+        let url_bucket = if status == "PUBLISHED" {
+            state.config.minio_bucket_videos.clone()
+        } else {
+            s3_bucket
+        };
 
         // Fetch uploader username if not anonymous
         let uploader = if is_anonymous {
@@ -1611,11 +1668,7 @@ pub async fn search_videos(
         feed.push(VideoFeedItem {
             id: video_id,
             title: row.try_get("", "title")?,
-            url: format!(
-                "http://{}/videos-public/{}",
-                state.config.minio_endpoint,
-                row.try_get::<String>("", "s3_key")?
-            ),
+            url: format!("{}/{}/{}", base_url, url_bucket, s3_key),
             like_count: row.try_get("", "like_count")?,
             created_at: row.try_get("", "created_at")?,
             uploader,

@@ -12,7 +12,7 @@ shared = { path = "../shared" }
 migration = { path = "../shared/migration" }
 
 # Web Framework
-axum = { version = "0.7", features = ["macros", "multipart"] }
+axum = { version = "0.7", features = ["macros", "multipart", "ws"] }
 tokio = { version = "1.40", features = ["full"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "limit"] }
@@ -39,6 +39,7 @@ lazy_static = "1.4"
 
 time = "0.3.46"
 async-trait = "0.1.89"
+futures-util = "0.3"
 
 [dev-dependencies]
 reqwest = { version = "0.13.1", features = ["json", "multipart", "form", "query"] }

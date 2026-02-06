@@ -122,4 +122,14 @@ impl RateLimiter {
     pub fn ip_rpm_key(ip: &str) -> String {
         format!("ratelimit:ip:rpm:{}", ip)
     }
+
+    /// Generate key for websocket connection attempts per IP
+    pub fn ws_connect_ip_key(ip: &str) -> String {
+        format!("ratelimit:ws:connect:ip:{}", ip)
+    }
+
+    /// Generate key for websocket connection attempts per user
+    pub fn ws_connect_user_key(user_id: &uuid::Uuid) -> String {
+        format!("ratelimit:ws:connect:user:{}", user_id)
+    }
 }

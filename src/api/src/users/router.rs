@@ -1,4 +1,4 @@
-use axum::{routing::get, Router};
+use axum::{Router, routing::get};
 use shared::config::Config;
 
 use crate::state::AppState;
@@ -12,4 +12,5 @@ pub fn users_router(_config: &Config) -> Router<AppState> {
             get(handlers::get_me).delete(handlers::delete_account),
         )
         .route("/me/videos", get(handlers::get_my_videos))
+        .route("/me/videos/ws", get(handlers::my_videos_ws))
 }

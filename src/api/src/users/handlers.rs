@@ -1,19 +1,30 @@
 use axum::{
-    extract::{Query, State},
     Json,
+    extract::{
+        ConnectInfo, Query, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    },
+    http::{HeaderMap, header},
+    response::IntoResponse,
 };
 use axum_extra::{
-    headers::{authorization::Bearer, Authorization},
     TypedHeader,
+    headers::{Authorization, authorization::Bearer},
 };
+use futures_util::{SinkExt, StreamExt};
 use redis::AsyncCommands;
 use sea_orm::*;
 use serde::Deserialize;
 use shared::entities::{users, videos};
+use tokio::time::{Duration, Instant};
+use uuid::Uuid;
 
 use crate::{
     auth::{dtos::UserDto, service::AuthService},
     error::{ApiErrorResponse, ApiResult},
+    metrics::WS_CONNECTION_REJECTED_TOTAL,
+    realtime::{hub::HubRegisterError, messages::RealtimeSignalMessage},
+    services::rate_limiter::RateLimiter,
     state::AppState,
 };
 
@@ -23,6 +34,43 @@ use super::dtos::UserVideoDto;
 pub struct PaginationQuery {
     pub page: Option<u64>,
     pub per_page: Option<u64>,
+}
+
+pub(crate) fn video_model_to_user_dto(
+    v: videos::Model,
+    config: &shared::config::Config,
+) -> UserVideoDto {
+    // Legacy compatibility:
+    // 1) For PUBLISHED rows, keep using configured public bucket.
+    //    Some historical rows may have stale s3_bucket values.
+    // 2) For non-PUBLISHED rows, only expose URL when row already points to public bucket.
+    let has_public_object = v.status == "PUBLISHED" || v.s3_bucket == config.minio_bucket_videos;
+    let url_bucket = if v.status == "PUBLISHED" {
+        config.minio_bucket_videos.clone()
+    } else {
+        v.s3_bucket.clone()
+    };
+
+    let url = if has_public_object {
+        Some(format!(
+            "{}/{}/{}",
+            config.minio_public_endpoint, url_bucket, v.s3_key
+        ))
+    } else {
+        None
+    };
+
+    UserVideoDto {
+        id: v.id,
+        title: v.title,
+        description: v.description,
+        status: v.status,
+        created_at: v.created_at,
+        updated_at: v.updated_at,
+        is_anonymous: v.is_anonymous,
+        like_count: v.like_count,
+        url,
+    }
 }
 
 /// GET /users/me
@@ -144,7 +192,8 @@ pub async fn get_my_videos(
     let per_page = pagination.per_page.unwrap_or(20).clamp(1, 100);
 
     // Cache key specific to user and pagination
-    let cache_key = format!("user:{}:videos:{}:{}", user_id, page, per_page);
+    // Versioned key to prevent stale schema/URL semantics from older cache entries.
+    let cache_key = format!("user:{}:videos:v3:{}:{}", user_id, page, per_page);
 
     // Try cache
     if let Ok(mut conn) = state.queue.get_conn().await {
@@ -168,30 +217,9 @@ pub async fn get_my_videos(
         .await
         .map_err(ApiErrorResponse::db_error)?;
 
-    let base_url = format!(
-        "{}/{}",
-        state.config.minio_public_endpoint, state.config.minio_bucket_videos
-    );
     let dtos: Vec<UserVideoDto> = items
         .into_iter()
-        .map(|v: videos::Model| {
-            let url = if v.status == "PUBLISHED" {
-                Some(format!("{}/{}", base_url, v.s3_key))
-            } else {
-                None
-            };
-
-            UserVideoDto {
-                id: v.id,
-                title: v.title,
-                description: v.description,
-                status: v.status,
-                created_at: v.created_at,
-                is_anonymous: v.is_anonymous,
-                like_count: v.like_count,
-                url,
-            }
-        })
+        .map(|v| video_model_to_user_dto(v, &state.config))
         .collect();
 
     // Cache result (short TTL, e.g., 5 mins, invalidated on upload/delete)
@@ -202,4 +230,247 @@ pub async fn get_my_videos(
     }
 
     Ok(Json(dtos))
+}
+
+/// GET /users/me/videos/ws
+/// Realtime per-user status stream for upload lifecycle events.
+pub async fn my_videos_ws(
+    State(state): State<AppState>,
+    ws: WebSocketUpgrade,
+    headers: HeaderMap,
+    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
+) -> ApiResult<impl IntoResponse> {
+    if !state.config.video_ws_enabled {
+        return Err(ApiErrorResponse::not_found("Realtime endpoint disabled"));
+    }
+
+    validate_ws_origin(&state, &headers)?;
+
+    let token = extract_bearer_token(&headers)
+        .ok_or_else(|| ApiErrorResponse::unauthorized("Missing or invalid bearer token"))?;
+    let claims = AuthService::validate_token(token, &state.config.jwt_secret)
+        .map_err(|_| ApiErrorResponse::unauthorized("Invalid token"))?;
+
+    if state.token_revocation.is_revoked(claims.jti).await {
+        return Err(ApiErrorResponse::unauthorized("Token revoked"));
+    }
+
+    let user_id = claims.sub;
+    let client_ip = connect_info
+        .map(|c| c.0.ip().to_string())
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let ip_key = RateLimiter::ws_connect_ip_key(&client_ip);
+    match state
+        .rate_limiter
+        .check_and_increment(&ip_key, state.config.video_ws_connect_rpm_per_ip, 60)
+        .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(_)) => {
+            WS_CONNECTION_REJECTED_TOTAL.inc();
+            return Err(ApiErrorResponse::too_many_requests(
+                "Too many websocket connection attempts from this IP",
+            ));
+        }
+        Err(_) => {}
+    }
+
+    let user_key = RateLimiter::ws_connect_user_key(&user_id);
+    match state
+        .rate_limiter
+        .check_and_increment(&user_key, state.config.video_ws_connect_rpm_per_user, 60)
+        .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(_)) => {
+            WS_CONNECTION_REJECTED_TOTAL.inc();
+            return Err(ApiErrorResponse::too_many_requests(
+                "Too many websocket connection attempts for this user",
+            ));
+        }
+        Err(_) => {}
+    }
+
+    let (conn_id, rx) = match state.realtime_hub.register_connection(user_id).await {
+        Ok(value) => value,
+        Err(HubRegisterError::GlobalLimitExceeded) => {
+            return Err(ApiErrorResponse::too_many_requests(
+                "Realtime connection capacity reached",
+            ));
+        }
+        Err(HubRegisterError::PerUserLimitExceeded) => {
+            return Err(ApiErrorResponse::too_many_requests(
+                "Too many concurrent realtime connections for this user",
+            ));
+        }
+    };
+
+    let jti = claims.jti;
+    let exp = claims.exp;
+    let state_for_upgrade = state.clone();
+    Ok(ws.on_upgrade(move |socket| async move {
+        handle_ws_connection(state_for_upgrade, socket, user_id, conn_id, rx, jti, exp).await;
+    }))
+}
+
+fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let raw = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    raw.strip_prefix("Bearer ")
+}
+
+fn validate_ws_origin(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
+    let origin = match headers.get(header::ORIGIN) {
+        Some(value) => value
+            .to_str()
+            .map_err(|_| ApiErrorResponse::forbidden("Invalid Origin header"))?,
+        None => return Ok(()), // Mobile clients often don't send Origin.
+    };
+
+    if state.config.environment == "development" {
+        return Ok(());
+    }
+
+    if state.config.cors_allowed_origins.is_empty() {
+        return Err(ApiErrorResponse::forbidden("Origin is not allowed"));
+    }
+
+    let allowed = state
+        .config
+        .cors_allowed_origins
+        .split(',')
+        .map(|s| s.trim())
+        .any(|s| !s.is_empty() && s == origin);
+
+    if !allowed {
+        return Err(ApiErrorResponse::forbidden("Origin is not allowed"));
+    }
+
+    Ok(())
+}
+
+async fn load_user_videos_snapshot(
+    state: &AppState,
+    user_id: Uuid,
+) -> ApiResult<Vec<UserVideoDto>> {
+    let items = videos::Entity::find()
+        .filter(videos::Column::UserId.eq(user_id))
+        .filter(videos::Column::DeletedAt.is_null())
+        .order_by_desc(videos::Column::CreatedAt)
+        .all(&state.db)
+        .await
+        .map_err(ApiErrorResponse::db_error)?;
+
+    Ok(items
+        .into_iter()
+        .map(|v| video_model_to_user_dto(v, &state.config))
+        .collect())
+}
+
+async fn handle_ws_connection(
+    state: AppState,
+    socket: WebSocket,
+    user_id: Uuid,
+    conn_id: Uuid,
+    mut rx: tokio::sync::mpsc::Receiver<String>,
+    jti: Uuid,
+    exp: usize,
+) {
+    let (mut ws_sender, mut ws_receiver) = socket.split();
+
+    // Send initial snapshot.
+    match load_user_videos_snapshot(&state, user_id).await {
+        Ok(videos) => {
+            let snapshot = RealtimeSignalMessage::snapshot(videos);
+            match serde_json::to_string(&snapshot) {
+                Ok(text) => {
+                    if ws_sender.send(Message::Text(text.into())).await.is_err() {
+                        state.realtime_hub.remove_connection(user_id, conn_id).await;
+                        return;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to serialize snapshot message: {:?}", e);
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Failed to build realtime snapshot for user {}: {:?}",
+                user_id,
+                e
+            );
+        }
+    }
+
+    let pending = state
+        .realtime_hub
+        .mark_bootstrapped_and_take_pending(user_id, conn_id)
+        .await;
+    for msg in pending {
+        if ws_sender.send(Message::Text(msg.into())).await.is_err() {
+            state.realtime_hub.remove_connection(user_id, conn_id).await;
+            return;
+        }
+    }
+
+    let heartbeat_secs = state.config.video_ws_heartbeat_secs.max(5);
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(heartbeat_secs));
+    let mut last_pong = Instant::now();
+    let timeout = Duration::from_secs(heartbeat_secs * 3);
+
+    loop {
+        tokio::select! {
+            maybe_msg = rx.recv() => {
+                match maybe_msg {
+                    Some(msg) => {
+                        if ws_sender.send(Message::Text(msg.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+            inbound = ws_receiver.next() => {
+                match inbound {
+                    Some(Ok(Message::Pong(_))) => {
+                        last_pong = Instant::now();
+                    }
+                    Some(Ok(Message::Ping(payload))) => {
+                        last_pong = Instant::now();
+                        if ws_sender.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) => break,
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) => break,
+                    None => break,
+                }
+            }
+            _ = heartbeat.tick() => {
+                let now_secs = chrono::Utc::now().timestamp() as usize;
+                if now_secs >= exp {
+                    break;
+                }
+                if state.token_revocation.is_revoked(jti).await {
+                    break;
+                }
+                if Instant::now().duration_since(last_pong) > timeout {
+                    break;
+                }
+                if ws_sender.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    state.realtime_hub.remove_connection(user_id, conn_id).await;
 }

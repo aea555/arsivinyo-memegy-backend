@@ -1,6 +1,10 @@
 use api::{
-    auth::revocation::TokenRevocationService, cache::feed_cache::FeedCacheService,
-    cache::otc_cache::OtcCacheService, create_router, metrics, services::rate_limiter::RateLimiter,
+    auth::revocation::TokenRevocationService,
+    cache::feed_cache::FeedCacheService,
+    cache::otc_cache::OtcCacheService,
+    create_router, metrics,
+    realtime::{hub::RealtimeHub, subscriber::spawn_realtime_subscriber},
+    services::rate_limiter::RateLimiter,
     state::AppState,
 };
 use sea_orm::Database;
@@ -47,6 +51,11 @@ async fn main() -> anyhow::Result<()> {
         config.otc_rate_limit_max_attempts,
         config.otc_rate_limit_window_seconds,
     );
+    let realtime_hub = RealtimeHub::new(
+        config.video_ws_max_conn_per_user,
+        config.video_ws_max_conn_global,
+        config.video_ws_send_buffer,
+    );
 
     // 7. State
     let state = AppState {
@@ -59,6 +68,7 @@ async fn main() -> anyhow::Result<()> {
         otc_cache,
         rate_limiter,
         otc_rate_limiter,
+        realtime_hub,
     };
 
     // 8. Spawn rate limiter cleanup task
@@ -71,15 +81,22 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // 9. Routes (via library)
+    // 9. Spawn realtime pubsub listener
+    spawn_realtime_subscriber(state.clone());
+
+    // 10. Routes (via library)
     let app = create_router(state.clone());
 
-    // 8. Server
+    // 11. Server
     let addr = SocketAddr::from(([0, 0, 0, 0], state.config.server_port));
     tracing::info!("Server listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }

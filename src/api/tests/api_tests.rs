@@ -591,6 +591,7 @@ async fn search_functionality_works() {
     let items: Vec<serde_json::Value> = response.json().await.unwrap();
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["title"], "Rust Programming Tutorial");
+    assert_eq!(items[0]["url"], "http://mock/videos/key1");
 
     // 2. Search for "Pasta"
     let response: Response = client
@@ -604,6 +605,7 @@ async fn search_functionality_works() {
     let items: Vec<serde_json::Value> = response.json().await.unwrap();
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["title"], "Cooking Pasta");
+    assert_eq!(items[0]["url"], "http://mock/videos/key2");
 }
 
 #[tokio::test]

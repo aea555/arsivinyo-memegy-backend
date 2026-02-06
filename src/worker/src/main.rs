@@ -102,7 +102,11 @@ async fn main() -> Result<()> {
                                     * (2_u64.pow(attempt as u32 - 1));
                                 tracing::warn!(
                                     "Failed to process video {} (attempt {}/{}): {:?}. Retrying in {}s",
-                                    job.video_id, attempt, config.worker_retry_max_attempts, last_error, backoff_secs
+                                    job.video_id,
+                                    attempt,
+                                    config.worker_retry_max_attempts,
+                                    last_error,
+                                    backoff_secs
                                 );
                                 tokio::time::sleep(std::time::Duration::from_secs(backoff_secs))
                                     .await;
@@ -123,9 +127,23 @@ async fn main() -> Result<()> {
                 // If all retries failed update status to FAILED
                 if let Some(err) = last_error {
                     if let Ok(Some(v)) = videos::Entity::find_by_id(job.video_id).one(&db).await {
+                        let previous_status = v.status.clone();
                         let mut active: videos::ActiveModel = v.into();
                         active.status = Set("FAILED".to_string());
-                        let _ = active.update(&db).await;
+                        if let Ok(updated_video) = active.update(&db).await {
+                            if let Err(e) = publish_video_status_signal(
+                                &queue,
+                                &config,
+                                job.user_id,
+                                "video.status.failed",
+                                Some(previous_status),
+                                &updated_video,
+                            )
+                            .await
+                            {
+                                tracing::warn!("Failed to publish failed realtime signal: {:?}", e);
+                            }
+                        }
                         invalidate_user_video_cache(&queue, job.user_id).await;
                         tracing::error!(
                             "Marked video {} as FAILED after exhausting retries: {:?}",
@@ -222,11 +240,24 @@ async fn process_video(
     active.status = Set("PUBLISHED".to_string());
     active.s3_bucket = Set(config.minio_bucket_videos.clone());
     active.s3_key = Set(video_key.clone());
-    active.update(db).await?;
+    let published_video = active.update(db).await?;
 
     // 8. Invalidate caches affected by publish transition.
     invalidate_feed_cache(queue).await;
     invalidate_user_video_cache(queue, job.user_id).await;
+
+    if let Err(e) = publish_video_status_signal(
+        queue,
+        config,
+        job.user_id,
+        "video.status.published",
+        Some("PROCESSING".to_string()),
+        &published_video,
+    )
+    .await
+    {
+        tracing::warn!("Failed to publish published realtime signal: {:?}", e);
+    }
 
     tracing::info!("Video {} published successfully", job.video_id);
 
@@ -260,6 +291,56 @@ async fn invalidate_user_video_cache(queue: &QueueService, user_id: Uuid) {
             }
         }
     }
+}
+
+async fn publish_video_status_signal(
+    queue: &QueueService,
+    config: &Config,
+    user_id: Uuid,
+    event_type: &str,
+    previous_status: Option<String>,
+    video: &videos::Model,
+) -> Result<()> {
+    let has_public_object =
+        video.status == "PUBLISHED" || video.s3_bucket == config.minio_bucket_videos;
+    let url_bucket = if video.status == "PUBLISHED" {
+        config.minio_bucket_videos.clone()
+    } else {
+        video.s3_bucket.clone()
+    };
+    let url = if has_public_object {
+        Some(format!(
+            "{}/{}/{}",
+            config.minio_public_endpoint, url_bucket, video.s3_key
+        ))
+    } else {
+        None
+    };
+
+    let payload = serde_json::json!({
+        "type": event_type,
+        "event_id": Uuid::new_v4(),
+        "event_at": chrono::Utc::now().fixed_offset(),
+        "version": 1,
+        "previous_status": previous_status,
+        "video": {
+            "id": video.id,
+            "title": video.title.clone(),
+            "description": video.description.clone(),
+            "status": video.status.clone(),
+            "created_at": video.created_at,
+            "updated_at": video.updated_at,
+            "is_anonymous": video.is_anonymous,
+            "like_count": video.like_count,
+            "url": url,
+        }
+    });
+
+    queue
+        .publish_video_status_event(user_id, &payload.to_string())
+        .await?;
+
+    Ok(())
 }
 
 fn compress_video(input: &Path, output: &Path) -> Result<()> {

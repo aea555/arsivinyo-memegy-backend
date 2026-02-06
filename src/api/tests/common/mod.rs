@@ -1,7 +1,7 @@
 use api::{
     auth::revocation::TokenRevocationService, cache::feed_cache::FeedCacheService,
-    cache::otc_cache::OtcCacheService, create_router, services::rate_limiter::RateLimiter,
-    state::AppState,
+    cache::otc_cache::OtcCacheService, create_router, realtime::hub::RealtimeHub,
+    services::rate_limiter::RateLimiter, state::AppState,
 };
 use sea_orm::Database;
 use sea_orm_migration::MigratorTrait;
@@ -151,6 +151,13 @@ pub async fn spawn_app() -> TestApp {
         worker_retry_max_attempts: 3,
         worker_retry_backoff_base_secs: 2,
         mobile_app_scheme: "memegy://".to_string(),
+        video_ws_enabled: true,
+        video_ws_max_conn_per_user: 3,
+        video_ws_max_conn_global: 5000,
+        video_ws_connect_rpm_per_ip: 30,
+        video_ws_connect_rpm_per_user: 60,
+        video_ws_send_buffer: 64,
+        video_ws_heartbeat_secs: 20,
     };
 
     // 4. Queues & Services
@@ -172,6 +179,11 @@ pub async fn spawn_app() -> TestApp {
         otc_cache,
         rate_limiter,
         otc_rate_limiter,
+        realtime_hub: RealtimeHub::new(
+            config.video_ws_max_conn_per_user,
+            config.video_ws_max_conn_global,
+            config.video_ws_send_buffer,
+        ),
     };
 
     // 5. App Router

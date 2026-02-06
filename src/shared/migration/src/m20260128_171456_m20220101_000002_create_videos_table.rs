@@ -11,20 +11,30 @@ impl MigrationTrait for Migration {
                 Table::create()
                     .table(Videos::Table)
                     .if_not_exists()
-                    .col(
-                        ColumnDef::new(Videos::Id)
-                            .uuid()
-                            .not_null()
-                            .primary_key(),
-                    )
+                    .col(ColumnDef::new(Videos::Id).uuid().not_null().primary_key())
                     .col(ColumnDef::new(Videos::UserId).uuid().not_null())
                     .col(ColumnDef::new(Videos::Title).string().null())
                     .col(ColumnDef::new(Videos::Description).string().null())
                     .col(ColumnDef::new(Videos::S3Bucket).string().not_null())
                     .col(ColumnDef::new(Videos::S3Key).string().not_null())
-                    .col(ColumnDef::new(Videos::Status).string().not_null().default("DRAFT")) // Simple string for enum
-                    .col(ColumnDef::new(Videos::SizeBytes).big_integer().not_null().default(0))
-                    .col(ColumnDef::new(Videos::LikeCount).big_integer().not_null().default(0))
+                    .col(
+                        ColumnDef::new(Videos::Status)
+                            .string()
+                            .not_null()
+                            .default("DRAFT"),
+                    ) // Simple string for enum
+                    .col(
+                        ColumnDef::new(Videos::SizeBytes)
+                            .big_integer()
+                            .not_null()
+                            .default(0),
+                    )
+                    .col(
+                        ColumnDef::new(Videos::LikeCount)
+                            .big_integer()
+                            .not_null()
+                            .default(0),
+                    )
                     .col(
                         ColumnDef::new(Videos::CreatedAt)
                             .timestamp_with_time_zone()

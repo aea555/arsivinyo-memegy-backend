@@ -1,10 +1,10 @@
 use anyhow::Result;
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_s3::{
+    Client,
     config::{Credentials, SharedCredentialsProvider},
     presigning::PresigningConfig,
     primitives::ByteStream,
-    Client,
 };
 use std::path::Path;
 use std::time::Duration;

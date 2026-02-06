@@ -4,6 +4,7 @@ pub mod cache;
 pub mod error;
 pub mod metrics;
 pub mod middleware;
+pub mod realtime;
 pub mod services;
 pub mod state;
 pub mod users;

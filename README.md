@@ -74,6 +74,22 @@ The documentation includes:
 - `GET /feed`: Get video feed. Params: `?sort=random|latest|popular&page=0`.
 - `PUT /videos/{id}/like`: Idempotently like a video. Returns current `{ is_liked, like_count }`.
 - `DELETE /videos/{id}/like`: Idempotently unlike a video. Returns current `{ is_liked, like_count }`.
+- `GET /users/me/videos/ws`: WebSocket realtime stream for upload status changes.
+
+### Realtime Video Status (WebSocket)
+- Connect with `Authorization: Bearer <access_token>` to `GET /users/me/videos/ws`.
+- Server sends one snapshot first:
+ Yes, now recreate the plan  - `type = "video.status.snapshot"`
+  - Contains `videos: UserVideoDto[]`
+- Then server sends live status events:
+  - `video.status.processing`
+  - `video.status.published`
+  - `video.status.failed`
+- Each event contains full `video` payload (same shape as `/users/me/videos` item), plus:
+  - `event_id`, `event_at`, `previous_status`, `version`
+- Delivery model:
+  - At-most-once live delivery (Redis Pub/Sub)
+  - Reconnect strategy: reconnect and rely on snapshot to recover missed offline events
 
 ## Testing
 

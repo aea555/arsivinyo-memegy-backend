@@ -1,6 +1,6 @@
 use lazy_static::lazy_static;
 use prometheus::{
-    Counter, Encoder, Histogram, HistogramOpts, IntCounter, Opts, Registry, TextEncoder,
+    Counter, Encoder, Histogram, HistogramOpts, IntCounter, IntGauge, Opts, Registry, TextEncoder,
 };
 
 lazy_static! {
@@ -41,6 +41,27 @@ lazy_static! {
     pub static ref RATE_LIMIT_EXCEEDED_TOTAL: IntCounter = IntCounter::with_opts(
         Opts::new("rate_limit_exceeded_total", "Rate limit exceeded count")
     ).expect("metric can be created");
+
+    // Realtime websocket metrics
+    pub static ref WS_ACTIVE_CONNECTIONS: IntGauge = IntGauge::with_opts(
+        Opts::new("ws_active_connections", "Current active websocket connections")
+    ).expect("metric can be created");
+
+    pub static ref WS_CONNECTION_REJECTED_TOTAL: IntCounter = IntCounter::with_opts(
+        Opts::new("ws_connection_rejected_total", "Rejected websocket connection attempts")
+    ).expect("metric can be created");
+
+    pub static ref WS_EVENTS_PUBLISHED_TOTAL: IntCounter = IntCounter::with_opts(
+        Opts::new("ws_events_published_total", "Video status events published to redis")
+    ).expect("metric can be created");
+
+    pub static ref WS_EVENTS_FANOUT_TOTAL: IntCounter = IntCounter::with_opts(
+        Opts::new("ws_events_fanout_total", "Video status events pushed to websocket clients")
+    ).expect("metric can be created");
+
+    pub static ref WS_CONNECTION_DROPPED_TOTAL: IntCounter = IntCounter::with_opts(
+        Opts::new("ws_connection_dropped_total", "Websocket connections dropped due to overflow or send failure")
+    ).expect("metric can be created");
 }
 
 pub fn register_metrics() {
@@ -51,6 +72,11 @@ pub fn register_metrics() {
     let _ = REGISTRY.register(Box::new(OTC_EXCHANGES_TOTAL.clone()));
     let _ = REGISTRY.register(Box::new(OTC_EXCHANGE_DURATION.clone()));
     let _ = REGISTRY.register(Box::new(RATE_LIMIT_EXCEEDED_TOTAL.clone()));
+    let _ = REGISTRY.register(Box::new(WS_ACTIVE_CONNECTIONS.clone()));
+    let _ = REGISTRY.register(Box::new(WS_CONNECTION_REJECTED_TOTAL.clone()));
+    let _ = REGISTRY.register(Box::new(WS_EVENTS_PUBLISHED_TOTAL.clone()));
+    let _ = REGISTRY.register(Box::new(WS_EVENTS_FANOUT_TOTAL.clone()));
+    let _ = REGISTRY.register(Box::new(WS_CONNECTION_DROPPED_TOTAL.clone()));
 }
 
 pub fn metrics_handler() -> String {
