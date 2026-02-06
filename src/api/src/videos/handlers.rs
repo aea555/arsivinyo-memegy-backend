@@ -163,6 +163,9 @@ pub async fn get_feed(
         .filter(
             Condition::any()
                 .add(videos::Column::Status.eq("PUBLISHED"))
+                .add(videos::Column::Status.eq("published"))
+                .add(videos::Column::Status.eq("COMPLETED"))
+                .add(videos::Column::Status.eq("completed"))
                 .add(videos::Column::S3Bucket.eq(state.config.minio_bucket_videos.clone())),
         )
         .find_also_related(users::Entity); // Left join users table
@@ -1574,7 +1577,7 @@ pub async fn search_videos(
             FROM videos
             WHERE search_vector @@ plainto_tsquery('english', $1)
             AND deleted_at IS NULL
-            AND (status = 'PUBLISHED' OR s3_bucket = $4)
+            AND (UPPER(status) = 'PUBLISHED' OR UPPER(status) = 'COMPLETED' OR s3_bucket = $4)
             ORDER BY created_at DESC
             LIMIT $2 OFFSET $3
             "#
@@ -1585,7 +1588,7 @@ pub async fn search_videos(
             FROM videos
             WHERE search_vector @@ plainto_tsquery('english', $1)
             AND deleted_at IS NULL
-            AND (status = 'PUBLISHED' OR s3_bucket = $4)
+            AND (UPPER(status) = 'PUBLISHED' OR UPPER(status) = 'COMPLETED' OR s3_bucket = $4)
             ORDER BY like_count DESC, created_at DESC
             LIMIT $2 OFFSET $3
             "#
@@ -1597,7 +1600,7 @@ pub async fn search_videos(
             FROM videos
             WHERE search_vector @@ plainto_tsquery('english', $1)
             AND deleted_at IS NULL
-            AND (status = 'PUBLISHED' OR s3_bucket = $4)
+            AND (UPPER(status) = 'PUBLISHED' OR UPPER(status) = 'COMPLETED' OR s3_bucket = $4)
             ORDER BY rank DESC, like_count DESC
             LIMIT $2 OFFSET $3
             "#
@@ -1644,7 +1647,9 @@ pub async fn search_videos(
         let status: String = row.try_get("", "status")?;
         let s3_bucket: String = row.try_get("", "s3_bucket")?;
         let s3_key: String = row.try_get("", "s3_key")?;
-        let url_bucket = if status == "PUBLISHED" {
+        let is_published_like =
+            status.eq_ignore_ascii_case("PUBLISHED") || status.eq_ignore_ascii_case("COMPLETED");
+        let url_bucket = if is_published_like {
             state.config.minio_bucket_videos.clone()
         } else {
             s3_bucket

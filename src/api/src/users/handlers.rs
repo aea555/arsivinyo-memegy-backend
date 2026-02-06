@@ -40,12 +40,14 @@ pub(crate) fn video_model_to_user_dto(
     v: videos::Model,
     config: &shared::config::Config,
 ) -> UserVideoDto {
+    let is_published_like =
+        v.status.eq_ignore_ascii_case("PUBLISHED") || v.status.eq_ignore_ascii_case("COMPLETED");
     // Legacy compatibility:
     // 1) For PUBLISHED rows, keep using configured public bucket.
     //    Some historical rows may have stale s3_bucket values.
     // 2) For non-PUBLISHED rows, only expose URL when row already points to public bucket.
-    let has_public_object = v.status == "PUBLISHED" || v.s3_bucket == config.minio_bucket_videos;
-    let url_bucket = if v.status == "PUBLISHED" {
+    let has_public_object = is_published_like || v.s3_bucket == config.minio_bucket_videos;
+    let url_bucket = if is_published_like {
         config.minio_bucket_videos.clone()
     } else {
         v.s3_bucket.clone()
@@ -326,12 +328,27 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
 }
 
 fn validate_ws_origin(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
+    // Native clients (RN / mobile) may include non-browser origins.
+    // Enforce strict origin checks only for browser-like user agents.
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let is_browser_like = user_agent.contains("Mozilla/");
+    if !is_browser_like {
+        return Ok(());
+    }
+
     let origin = match headers.get(header::ORIGIN) {
         Some(value) => value
             .to_str()
             .map_err(|_| ApiErrorResponse::forbidden("Invalid Origin header"))?,
         None => return Ok(()), // Mobile clients often don't send Origin.
     };
+
+    if origin == "null" {
+        return Ok(());
+    }
 
     if state.config.environment == "development" {
         return Ok(());
