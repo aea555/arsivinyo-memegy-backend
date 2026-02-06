@@ -14,7 +14,7 @@ async fn test_mobile_with_valid_pkce_accepted() {
         .unwrap();
 
     // Generate valid PKCE parameters
-    let verifier = generate_otc(); // 32-char base64url string
+    let verifier = generate_otc(); // 64-char hex string
     let challenge = compute_code_challenge(&verifier);
 
     // Call login endpoint with mobile source and PKCE
@@ -24,6 +24,7 @@ async fn test_mobile_with_valid_pkce_accepted() {
             ("source", "mobile"),
             ("code_challenge", &challenge),
             ("code_challenge_method", "S256"),
+            ("code_verifier", &verifier),
         ])
         .send()
         .await
@@ -64,6 +65,7 @@ async fn test_invalid_challenge_length_rejected() {
 
     // Challenge too short (should be 43 chars for S256)
     let invalid_challenge = "tooshort";
+    let verifier = generate_otc();
 
     let response = client
         .get(&format!("{}/auth/google/login", app.address))
@@ -71,6 +73,7 @@ async fn test_invalid_challenge_length_rejected() {
             ("source", "mobile"),
             ("code_challenge", invalid_challenge),
             ("code_challenge_method", "S256"),
+            ("code_verifier", &verifier),
         ])
         .send()
         .await
@@ -100,6 +103,7 @@ async fn test_plain_method_rejected() {
             ("source", "mobile"),
             ("code_challenge", &verifier), // Using verifier directly as challenge
             ("code_challenge_method", "plain"),
+            ("code_verifier", &verifier),
         ])
         .send()
         .await
@@ -124,6 +128,7 @@ async fn test_invalid_challenge_format_rejected() {
     // Contains invalid characters (+ and /)
     let invalid_challenge = "ABC+DEF/GHI=JKLMNO" // Padding also invalid
         .repeat(3); // Make it long enough
+    let verifier = generate_otc();
 
     let response = client
         .get(&format!("{}/auth/google/login", app.address))
@@ -131,6 +136,7 @@ async fn test_invalid_challenge_format_rejected() {
             ("source", "mobile"),
             ("code_challenge", &invalid_challenge[..43]), // Truncate to 43
             ("code_challenge_method", "S256"),
+            ("code_verifier", &verifier),
         ])
         .send()
         .await

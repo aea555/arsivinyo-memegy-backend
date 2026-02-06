@@ -27,6 +27,7 @@ impl AuthService {
         client_id: &str,
         client_secret: &str,
         redirect_uri: &str,
+        code_verifier: Option<&str>,
     ) -> Result<GoogleUserResult> {
         // Trim credentials to avoid common copy-paste errors
         let client_id = client_id.trim();
@@ -43,13 +44,17 @@ impl AuthService {
         let client = reqwest::Client::new();
 
         // Exchange code for token
-        let params = [
+        let mut params = vec![
             ("client_id", client_id),
             ("client_secret", client_secret),
             ("code", &code),
             ("grant_type", "authorization_code"),
             ("redirect_uri", redirect_uri),
         ];
+
+        if let Some(verifier) = code_verifier {
+            params.push(("code_verifier", verifier));
+        }
 
         tracing::debug!("Sending Token Request to https://oauth2.googleapis.com/token");
 

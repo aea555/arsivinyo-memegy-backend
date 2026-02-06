@@ -16,12 +16,15 @@ use axum::response::Redirect;
 use axum_extra::extract::cookie::{CookieJar, SameSite};
 use chrono::{Duration, Utc};
 use oauth2::{
-    AuthType, AuthUrl, ClientId, ClientSecret, CsrfToken, RedirectUrl, Scope, TokenUrl,
-    basic::BasicClient,
+    AuthType, AuthUrl, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge, PkceCodeVerifier,
+    RedirectUrl, Scope, TokenUrl, basic::BasicClient,
 };
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use shared::entities::{refresh_tokens, users};
-use shared::security::{create_access_token, generate_refresh_token, hash_token};
+use shared::security::{
+    compute_code_challenge, create_access_token, generate_refresh_token, hash_token,
+    validate_code_verifier,
+};
 use uuid::Uuid;
 
 use super::constants::*;
@@ -83,34 +86,12 @@ pub async fn google_login(
     let source = query.source.as_deref().unwrap_or(SOURCE_WEB);
 
     // PKCE Validation
-    let code_challenge = if let Some(challenge) = query.code_challenge {
-        // Validate method is S256
+    let mut code_challenge: Option<String> = None;
+    let mut code_verifier: Option<String> = None;
+
+    if query.code_challenge.is_some() || query.code_verifier.is_some() || source == SOURCE_MOBILE {
         match query.code_challenge_method.as_deref() {
-            Some(method) if method == PKCE_METHOD_S256 => {
-                // RFC 7636: base64url(SHA256) = 43 characters
-                if challenge.is_empty() || challenge.len() != 43 {
-                    return Err(ApiErrorResponse::bad_request("Invalid code_challenge"));
-                }
-
-                // Validate base64url characters only (A-Z, a-z, 0-9, -, _)
-                if !challenge
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-                {
-                    return Err(ApiErrorResponse::bad_request(
-                        "Invalid code_challenge format",
-                    ));
-                }
-
-                // Ensure challenge is base64url (no padding, no +/)
-                if challenge.contains('+') || challenge.contains('/') || challenge.contains('=') {
-                    return Err(ApiErrorResponse::bad_request(
-                        "code_challenge must be base64url encoded",
-                    ));
-                }
-
-                Some(challenge)
-            }
+            Some(method) if method == PKCE_METHOD_S256 => {}
             Some(method) if method == PKCE_METHOD_PLAIN => {
                 return Err(ApiErrorResponse::bad_request(
                     "PKCE plain method not allowed, use S256",
@@ -122,20 +103,62 @@ pub async fn google_login(
                 ));
             }
         }
+    }
+
+    if let Some(verifier) = query.code_verifier.clone() {
+        if !validate_code_verifier(&verifier) {
+            return Err(ApiErrorResponse::bad_request("Invalid code_verifier"));
+        }
+
+        let computed_challenge = compute_code_challenge(&verifier);
+        code_challenge = Some(computed_challenge.clone());
+        code_verifier = Some(verifier);
+
+        if let Some(challenge) = query.code_challenge.clone() {
+            // RFC 7636: base64url(SHA256) = 43 characters
+            if challenge.is_empty() || challenge.len() != 43 {
+                return Err(ApiErrorResponse::bad_request("Invalid code_challenge"));
+            }
+
+            // Validate base64url characters only (A-Z, a-z, 0-9, -, _)
+            if !challenge
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                return Err(ApiErrorResponse::bad_request(
+                    "Invalid code_challenge format",
+                ));
+            }
+
+            // Ensure challenge is base64url (no padding, no +/)
+            if challenge.contains('+') || challenge.contains('/') || challenge.contains('=') {
+                return Err(ApiErrorResponse::bad_request(
+                    "code_challenge must be base64url encoded",
+                ));
+            }
+
+            if challenge != computed_challenge {
+                return Err(ApiErrorResponse::bad_request(
+                    "code_challenge does not match code_verifier",
+                ));
+            }
     } else {
-        // Require PKCE for mobile
-        if source == SOURCE_MOBILE {
+        if query.code_challenge.is_some() {
             return Err(ApiErrorResponse::bad_request(
-                "PKCE required for mobile flows: code_challenge and code_challenge_method=S256",
+                "code_verifier required when code_challenge is provided",
             ));
         }
-        None
-    };
+        if source == SOURCE_MOBILE {
+            return Err(ApiErrorResponse::bad_request(
+                "PKCE required for mobile flows: code_verifier and code_challenge_method=S256",
+            ));
+        }
+    }
 
     // Audit log: OAuth login initiated
     log_audit_event(AuditEvent::OAuthLoginInitiated {
         source: source.to_string(),
-        has_pkce: code_challenge.is_some(),
+        has_pkce: code_verifier.is_some(),
         timestamp: Utc::now(),
     });
 
@@ -147,11 +170,18 @@ pub async fn google_login(
         format!("{}:{}", csrf.secret(), source)
     };
 
-    let (auth_url, _) = client
+    let mut auth_request = client
         .authorize_url(|| CsrfToken::new(combined_state_str.clone()))
         .add_scope(Scope::new("email".to_string()))
-        .add_scope(Scope::new("profile".to_string()))
-        .url();
+        .add_scope(Scope::new("profile".to_string()));
+
+    if let Some(ref verifier) = code_verifier {
+        let pkce_verifier = PkceCodeVerifier::new(verifier.clone());
+        let pkce_challenge = PkceCodeChallenge::from_code_verifier_sha256(&pkce_verifier);
+        auth_request = auth_request.set_pkce_challenge(pkce_challenge);
+    }
+
+    let (auth_url, _) = auth_request.url();
 
     let mut cookie = Cookie::new("oauth_state", combined_state_str);
     cookie.set_path("/");
@@ -159,7 +189,18 @@ pub async fn google_login(
     cookie.set_same_site(SameSite::Lax);
     cookie.set_max_age(time::Duration::minutes(10));
 
-    Ok((jar.add(cookie), Redirect::to(auth_url.as_str())))
+    let mut jar = jar.add(cookie);
+
+    if let Some(verifier) = code_verifier {
+        let mut pkce_cookie = Cookie::new("oauth_pkce_verifier", verifier);
+        pkce_cookie.set_path("/");
+        pkce_cookie.set_http_only(true);
+        pkce_cookie.set_same_site(SameSite::Lax);
+        pkce_cookie.set_max_age(time::Duration::minutes(10));
+        jar = jar.add(pkce_cookie);
+    }
+
+    Ok((jar, Redirect::to(auth_url.as_str())))
 }
 
 pub async fn google_callback(
@@ -176,7 +217,11 @@ pub async fn google_callback(
         .value()
         .to_string();
 
-    let jar = jar.remove(Cookie::from("oauth_state"));
+    let mut jar = jar.remove(Cookie::from("oauth_state"));
+    let pkce_verifier = jar
+        .get("oauth_pkce_verifier")
+        .map(|cookie| cookie.value().to_string());
+    jar = jar.remove(Cookie::from("oauth_pkce_verifier"));
 
     if stored_state_str != query.state {
         tracing::error!("CSRF mismatch");
@@ -203,7 +248,7 @@ pub async fn google_callback(
     if let Some(ref expected_challenge) = oauth_state.code_challenge {
         PKCE_VALIDATIONS_TOTAL.inc();
 
-        let verifier = query.code_verifier.ok_or_else(|| {
+        let verifier = pkce_verifier.clone().ok_or_else(|| {
             tracing::error!("Missing code_verifier for PKCE flow");
             log_audit_event(AuditEvent::PkceValidationFailed {
                 source: oauth_state.source.clone(),
@@ -239,6 +284,7 @@ pub async fn google_callback(
         &state.config.google_client_id,
         &state.config.google_client_secret,
         &redirect_uri,
+        pkce_verifier.as_deref(),
     )
     .await
     .map_err(|e| {

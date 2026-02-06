@@ -6,13 +6,13 @@ pub struct GoogleLoginQuery {
     pub source: Option<String>,                // "web", "popup", "mobile"
     pub code_challenge: Option<String>,        // For PKCE
     pub code_challenge_method: Option<String>, // "S256"
+    pub code_verifier: Option<String>,         // PKCE code_verifier
 }
 
 #[derive(Deserialize)]
 pub struct GoogleCallbackQuery {
     pub code: String,
     pub state: String,
-    pub code_verifier: Option<String>, // PKCE code_verifier
 }
 
 #[derive(Serialize)]
