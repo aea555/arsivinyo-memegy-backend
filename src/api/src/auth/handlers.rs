@@ -142,6 +142,7 @@ pub async fn google_login(
                     "code_challenge does not match code_verifier",
                 ));
             }
+        }
     } else {
         if query.code_challenge.is_some() {
             return Err(ApiErrorResponse::bad_request(
