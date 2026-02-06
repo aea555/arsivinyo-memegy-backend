@@ -112,5 +112,18 @@ This will:
 - Launch the API server on port 3000
 - Start the background worker
 
+## Production Durability Notes
+
+- Configure production state paths outside the git checkout via:
+  - `PROD_POSTGRES_DATA_DIR`
+  - `PROD_VALKEY_DATA_DIR`
+  - `PROD_MINIO_DATA_DIR`
+- Recommended values:
+  - Postgres: `/var/lib/memegy/postgres`
+  - Valkey: `/var/lib/memegy/valkey`
+  - MinIO: `/var/lib/memegy/minio`
+- Deployment workflow uses `up -d --build --remove-orphans` and does not run `down`, so persistent data is less exposed to accidental reset.
+- Nightly production DB backups are handled by `.github/workflows/backup-production-db.yml` (plus manual `workflow_dispatch` support).
+
 ## License
 MIT

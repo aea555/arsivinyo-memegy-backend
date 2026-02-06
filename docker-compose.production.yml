@@ -14,7 +14,7 @@ services:
     ports:
       - "127.0.0.1:5432:5432"
     volumes:
-      - ./data/prod/postgres:/var/lib/postgresql/data
+      - ${PROD_POSTGRES_DATA_DIR:-./data/prod/postgres}:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
@@ -37,7 +37,7 @@ services:
     ports:
       - "127.0.0.1:6379:6379"
     volumes:
-      - ./data/prod/valkey:/data
+      - ${PROD_VALKEY_DATA_DIR:-./data/prod/valkey}:/data
     healthcheck:
       test: ["CMD-SHELL", "valkey-cli -a \"$${VALKEY_PASSWORD}\" ping | grep -q PONG"]
       interval: 5s
@@ -58,7 +58,7 @@ services:
       - "127.0.0.1:9000:9000"
       - "127.0.0.1:9001:9001"
     volumes:
-      - ./data/prod/minio:/data
+      - ${PROD_MINIO_DATA_DIR:-./data/prod/minio}:/data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 5s

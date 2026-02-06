@@ -17,13 +17,11 @@ jobs:
                   key: ${{ secrets.SSH_KEY }}
                   command_timeout: 45m
                   script: |
-                      # hata oluşursa durdur
-                      set -e 
+                      set -euo pipefail
                       cd ~/arsivinyo-memegy-backend/
-                      docker compose -f docker-compose.production.yml --env-file .env.production down
                       git fetch origin
                       git checkout -f dev || git checkout -b dev origin/dev
                       git reset --hard origin/dev
-                      docker compose -f docker-compose.production.yml --env-file .env.production up -d --build
-                      # docker image prune -f
+                      docker compose -f docker-compose.production.yml --env-file .env.production config >/dev/null
+                      docker compose -f docker-compose.production.yml --env-file .env.production up -d --build --remove-orphans
                       sleep 10
