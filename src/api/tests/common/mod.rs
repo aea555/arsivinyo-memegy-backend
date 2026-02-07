@@ -52,6 +52,17 @@ impl StorageBackend for MockStorage {
     async fn get_file_size(&self, _bucket: &str, _key: &str) -> anyhow::Result<u64> {
         Ok(1024) // Mock size matching test expectations
     }
+    async fn read_prefix(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _max_bytes: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        // Minimal MP4 ftyp signature
+        Ok(vec![
+            0x00, 0x00, 0x00, 0x18, b'f', b't', b'y', b'p', b'i', b's', b'o', b'm',
+        ])
+    }
     async fn download_file(
         &self,
         _bucket: &str,
@@ -132,6 +143,8 @@ pub async fn spawn_app() -> TestApp {
         presigned_url_expiry_secs: 3600,
         max_file_size_bytes: 1024 * 1024 * 10,
         limit_upload_bytes_hourly: 1024 * 1024 * 100,
+        upload_size_tolerance_bytes: 0,
+        min_video_size_bytes: 1024,
         otc_rate_limit_max_attempts: 5,
         otc_rate_limit_window_seconds: 60,
         feed_page_size: 20,
@@ -150,6 +163,8 @@ pub async fn spawn_app() -> TestApp {
         draft_video_cleanup_hours: 24,
         worker_retry_max_attempts: 3,
         worker_retry_backoff_base_secs: 2,
+        ffmpeg_transcode_timeout_secs: 180,
+        ffmpeg_thumbnail_timeout_secs: 30,
         mobile_app_scheme: "memegy://".to_string(),
         video_ws_enabled: true,
         video_ws_max_conn_per_user: 3,
@@ -316,6 +331,9 @@ impl TestApp {
             size_bytes: Set(1024),
             like_count: Set(0),
             is_anonymous: Set(is_anonymous),
+            processing_error_code: Set(None),
+            processing_error_message: Set(None),
+            failed_at: Set(None),
             deleted_at: Set(None),
             created_at: Set(chrono::Utc::now().into()),
             updated_at: Set(chrono::Utc::now().into()),

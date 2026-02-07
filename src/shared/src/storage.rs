@@ -29,6 +29,7 @@ pub trait StorageBackend: Send + Sync {
     ) -> Result<String>;
     async fn file_exists(&self, bucket: &str, key: &str) -> Result<bool>;
     async fn get_file_size(&self, bucket: &str, key: &str) -> Result<u64>;
+    async fn read_prefix(&self, bucket: &str, key: &str, max_bytes: usize) -> Result<Vec<u8>>;
     async fn download_file(&self, bucket: &str, key: &str, dest_path: &Path) -> Result<()>;
     async fn upload_file(
         &self,
@@ -164,6 +165,32 @@ impl StorageBackend for S3Storage {
             .await?;
 
         Ok(output.content_length.unwrap_or(0) as u64)
+    }
+
+    async fn read_prefix(&self, bucket: &str, key: &str, max_bytes: usize) -> Result<Vec<u8>> {
+        if max_bytes == 0 {
+            return Ok(Vec::new());
+        }
+
+        let range_end = max_bytes.saturating_sub(1);
+        let mut object = self
+            .client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .range(format!("bytes=0-{}", range_end))
+            .send()
+            .await?;
+
+        let mut result = Vec::with_capacity(max_bytes);
+        while let Some(bytes) = object.body.try_next().await? {
+            result.extend_from_slice(&bytes);
+            if result.len() >= max_bytes {
+                result.truncate(max_bytes);
+                break;
+            }
+        }
+        Ok(result)
     }
 
     async fn download_file(&self, bucket: &str, key: &str, dest_path: &Path) -> Result<()> {

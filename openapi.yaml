@@ -269,6 +269,14 @@ components:
           format: uri
           nullable: true
           description: Public playable URL if status is `PUBLISHED`, otherwise null
+        processing_error_code:
+          type: string
+          nullable: true
+          description: Machine-readable processing failure code (present when status is `FAILED`)
+        processing_error_message:
+          type: string
+          nullable: true
+          description: User-safe processing failure reason (present when status is `FAILED`)
       required:
         - id
         - status

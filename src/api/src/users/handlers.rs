@@ -74,6 +74,8 @@ pub(crate) fn video_model_to_user_dto(
         is_liked,
         like_count: v.like_count,
         url,
+        processing_error_code: v.processing_error_code,
+        processing_error_message: v.processing_error_message,
     }
 }
 
@@ -222,7 +224,7 @@ pub async fn get_my_videos(
 
     // Cache key specific to user and pagination
     // Versioned key to prevent stale schema/URL semantics from older cache entries.
-    let cache_key = format!("user:{}:videos:v4:{}:{}", user_id, page, per_page);
+    let cache_key = format!("user:{}:videos:v5:{}:{}", user_id, page, per_page);
 
     // Try cache
     if let Ok(mut conn) = state.queue.get_conn().await {

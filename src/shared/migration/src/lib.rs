@@ -10,6 +10,7 @@ mod m20260131_175303_create_download_jobs;
 mod m20260131_210000_add_fulltext_search;
 mod m20260201_000001_add_user_deletion_and_avatar;
 mod m20260203_214537_add_refresh_token_rotation_fields;
+mod m20260207_000001_add_video_processing_failure_fields;
 
 pub struct Migrator;
 
@@ -27,6 +28,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260131_210000_add_fulltext_search::Migration),
             Box::new(m20260201_000001_add_user_deletion_and_avatar::Migration),
             Box::new(m20260203_214537_add_refresh_token_rotation_fields::Migration),
+            Box::new(m20260207_000001_add_video_processing_failure_fields::Migration),
         ]
     }
 }

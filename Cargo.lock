@@ -6523,6 +6523,7 @@ dependencies = [
  "reqwest 0.12.28",
  "sea-orm",
  "sea-orm-migration",
+ "serde",
  "serde_json",
  "shared",
  "tempfile",

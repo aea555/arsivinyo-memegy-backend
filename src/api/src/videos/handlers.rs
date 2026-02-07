@@ -320,6 +320,9 @@ pub async fn init_upload(
         size_bytes: Set(payload.size_bytes),
         like_count: Set(0),
         is_anonymous: Set(false), // Regular upload, not anonymous
+        processing_error_code: Set(None),
+        processing_error_message: Set(None),
+        failed_at: Set(None),
         deleted_at: Set(None),    // Not deleted
         created_at: Set(Utc::now().into()),
         updated_at: Set(Utc::now().into()),
@@ -395,6 +398,9 @@ pub async fn init_anonymous_upload(
         size_bytes: Set(payload.size_bytes),
         like_count: Set(0),
         is_anonymous: Set(true), // ANONYMOUS upload
+        processing_error_code: Set(None),
+        processing_error_message: Set(None),
+        failed_at: Set(None),
         deleted_at: Set(None),   // Not deleted
         created_at: Set(Utc::now().into()),
         updated_at: Set(Utc::now().into()),
@@ -452,14 +458,11 @@ pub async fn confirm_upload(
         .await
         .map_err(|_| ApiErrorResponse::bad_request("File not uploaded or not accessible"))?;
 
-    // SECURITY: Enforce strict size check to prevent quota bypass
-    // If actual size is significantly larger than claimed size (allowing small buffer for differences), reject it.
-    // For strictness, we reject any size larger than claimed.
-    if actual_size > video.size_bytes as u64 {
+    if actual_size < state.config.min_video_size_bytes {
         txn.rollback().await?;
         return Err(ApiErrorResponse::bad_request(format!(
-            "File larger than declared. Declared: {} bytes, Actual: {} bytes",
-            video.size_bytes, actual_size
+            "File too small. Minimum: {} bytes, Actual: {} bytes",
+            state.config.min_video_size_bytes, actual_size
         )));
     }
 
@@ -471,17 +474,44 @@ pub async fn confirm_upload(
         ));
     }
 
-    // 4. Increment rate limit (only after verified upload)
+    let declared_size = video.size_bytes.max(0) as u64;
+    let tolerance = state.config.upload_size_tolerance_bytes;
+    let size_delta = actual_size.abs_diff(declared_size);
+    if size_delta > tolerance {
+        txn.rollback().await?;
+        return Err(ApiErrorResponse::bad_request(format!(
+            "File size mismatch. Declared: {} bytes, Actual: {} bytes, Allowed tolerance: {} bytes",
+            declared_size, actual_size, tolerance
+        )));
+    }
+
+    // 4. Verify object signature (magic bytes) to reject disguised non-video uploads.
+    let prefix = state
+        .storage
+        .read_prefix(&state.config.minio_bucket_raw, &video.s3_key, 4096)
+        .await
+        .map_err(|_| ApiErrorResponse::bad_request("Uploaded file cannot be inspected"))?;
+    if !looks_like_supported_video_container(&prefix) {
+        txn.rollback().await?;
+        return Err(ApiErrorResponse::bad_request(
+            "Unsupported or invalid video file signature. Supported containers: MP4/MOV/M4V/3GP, WebM/MKV, AVI, OGG.",
+        ));
+    }
+
+    // 5. Increment rate limit (only after verified upload)
     let rate_key = crate::services::rate_limiter::RateLimiter::upload_bytes_key(&user_id);
     let _ = state
         .rate_limiter
         .increment(&rate_key, state.config.rate_limit_window_secs)
         .await;
 
-    // 5. Update Status and Actual Size
+    // 6. Update Status and Actual Size
     let previous_status = video.status.clone();
     let mut active_video: videos::ActiveModel = video.clone().into();
     active_video.status = Set("PROCESSING".to_string());
+    active_video.processing_error_code = Set(None);
+    active_video.processing_error_message = Set(None);
+    active_video.failed_at = Set(None);
 
     // Update DB with actual size if different (e.g. user declared 10MB but uploaded 9MB)
     if actual_size != video.size_bytes as u64 {
@@ -491,7 +521,7 @@ pub async fn confirm_upload(
     active_video.updated_at = Set(Utc::now().into());
     let processing_video = active_video.update(&txn).await?;
 
-    // 6. Queue Job
+    // 7. Queue Job
     let job = VideoProcessJob {
         video_id,
         user_id,
@@ -507,11 +537,11 @@ pub async fn confirm_upload(
     // Commit transaction
     txn.commit().await?;
 
-    // 7. Invalidate User's Video List Cache
+    // 8. Invalidate User's Video List Cache
     // This ensures the new video immediately appears in their list
     invalidate_user_video_cache(&state, user_id).await;
 
-    // 8. Publish realtime processing signal (non-fatal).
+    // 9. Publish realtime processing signal (non-fatal).
     if let Err(e) = publish_video_status_signal(
         &state,
         user_id,
@@ -525,6 +555,30 @@ pub async fn confirm_upload(
     }
 
     Ok(StatusCode::ACCEPTED)
+}
+
+fn looks_like_supported_video_container(prefix: &[u8]) -> bool {
+    // ISO BMFF family: MP4/MOV/M4V/3GP usually has "ftyp" at bytes 4..8.
+    if prefix.len() >= 8 && &prefix[4..8] == b"ftyp" {
+        return true;
+    }
+
+    // EBML family: WebM/MKV
+    if prefix.len() >= 4 && prefix.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        return true;
+    }
+
+    // AVI: RIFF....AVI 
+    if prefix.len() >= 12 && &prefix[0..4] == b"RIFF" && &prefix[8..12] == b"AVI " {
+        return true;
+    }
+
+    // OGG container
+    if prefix.len() >= 4 && &prefix[0..4] == b"OggS" {
+        return true;
+    }
+
+    false
 }
 
 async fn invalidate_user_video_cache(state: &AppState, user_id: Uuid) {

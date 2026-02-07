@@ -41,6 +41,8 @@ pub struct Config {
     // File Upload Limits
     pub max_file_size_bytes: i64,
     pub limit_upload_bytes_hourly: i64,
+    pub upload_size_tolerance_bytes: u64,
+    pub min_video_size_bytes: u64,
 
     // Feed Configuration
     pub feed_page_size: u64,
@@ -69,6 +71,8 @@ pub struct Config {
     pub draft_video_cleanup_hours: u16,
     pub worker_retry_max_attempts: u8,
     pub worker_retry_backoff_base_secs: u64,
+    pub ffmpeg_transcode_timeout_secs: u64,
+    pub ffmpeg_thumbnail_timeout_secs: u64,
 
     // Realtime WebSocket
     pub video_ws_enabled: bool,
@@ -150,6 +154,12 @@ impl Config {
             limit_upload_bytes_hourly: env::var("LIMIT_UPLOAD_BYTES_HOURLY")
                 .unwrap_or_else(|_| "268435456".to_string()) // 256 MB
                 .parse()?,
+            upload_size_tolerance_bytes: env::var("UPLOAD_SIZE_TOLERANCE_BYTES")
+                .unwrap_or_else(|_| "0".to_string())
+                .parse()?,
+            min_video_size_bytes: env::var("MIN_VIDEO_SIZE_BYTES")
+                .unwrap_or_else(|_| "1024".to_string())
+                .parse()?,
 
             // Feed Configuration
             feed_page_size: env::var("FEED_PAGE_SIZE")
@@ -213,6 +223,12 @@ impl Config {
                 .parse()?,
             worker_retry_backoff_base_secs: env::var("WORKER_RETRY_BACKOFF_BASE_SECS")
                 .unwrap_or_else(|_| "2".to_string())
+                .parse()?,
+            ffmpeg_transcode_timeout_secs: env::var("FFMPEG_TRANSCODE_TIMEOUT_SECS")
+                .unwrap_or_else(|_| "180".to_string())
+                .parse()?,
+            ffmpeg_thumbnail_timeout_secs: env::var("FFMPEG_THUMBNAIL_TIMEOUT_SECS")
+                .unwrap_or_else(|_| "30".to_string())
                 .parse()?,
 
             // Realtime WebSocket
