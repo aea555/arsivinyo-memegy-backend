@@ -16,16 +16,19 @@ use uuid::Uuid;
 use super::dtos::*;
 use crate::auth::service::AuthService;
 use crate::{
-    auth::extractors::AuthUser,
+    auth::extractors::{AuthUser, ExtensionAuth},
     error::{ApiErrorResponse, ApiResult},
-    metrics::WS_EVENTS_PUBLISHED_TOTAL,
+    metrics::{
+        KEYBOARD_RATE_LIMIT_TOTAL, KEYBOARD_SEARCH_TOTAL, KEYBOARD_SEND_ATTEMPT_TOTAL,
+        KEYBOARD_TICKET_EXPIRED_TOTAL, WS_EVENTS_PUBLISHED_TOTAL,
+    },
     realtime::messages::{EVENT_PROCESSING, RealtimeSignalMessage},
     state::AppState,
     users::handlers::video_model_to_user_dto,
 };
 use redis::AsyncCommands;
 use shared::{
-    entities::{likes, videos},
+    entities::{likes, send_tickets, videos},
     queue::VideoProcessJob,
 };
 
@@ -318,12 +321,13 @@ pub async fn init_upload(
         s3_key: Set(s3_key.clone()),
         status: Set("DRAFT".to_string()),
         size_bytes: Set(payload.size_bytes),
+        duration_seconds: Set(None),
         like_count: Set(0),
         is_anonymous: Set(false), // Regular upload, not anonymous
         processing_error_code: Set(None),
         processing_error_message: Set(None),
         failed_at: Set(None),
-        deleted_at: Set(None),    // Not deleted
+        deleted_at: Set(None), // Not deleted
         created_at: Set(Utc::now().into()),
         updated_at: Set(Utc::now().into()),
     };
@@ -396,12 +400,13 @@ pub async fn init_anonymous_upload(
         s3_key: Set(s3_key.clone()),
         status: Set("DRAFT".to_string()),
         size_bytes: Set(payload.size_bytes),
+        duration_seconds: Set(None),
         like_count: Set(0),
         is_anonymous: Set(true), // ANONYMOUS upload
         processing_error_code: Set(None),
         processing_error_message: Set(None),
         failed_at: Set(None),
-        deleted_at: Set(None),   // Not deleted
+        deleted_at: Set(None), // Not deleted
         created_at: Set(Utc::now().into()),
         updated_at: Set(Utc::now().into()),
     };
@@ -568,7 +573,7 @@ fn looks_like_supported_video_container(prefix: &[u8]) -> bool {
         return true;
     }
 
-    // AVI: RIFF....AVI 
+    // AVI: RIFF....AVI
     if prefix.len() >= 12 && &prefix[0..4] == b"RIFF" && &prefix[8..12] == b"AVI " {
         return true;
     }
@@ -1536,6 +1541,192 @@ async fn track_search_analytics(
     }
 }
 
+async fn enforce_keyboard_rpm(
+    state: &AppState,
+    user_id: Uuid,
+    session_jti: Uuid,
+    limit: u64,
+    user_key: String,
+    session_key: String,
+    action: &str,
+) -> Result<(), ApiErrorResponse> {
+    match state
+        .rate_limiter
+        .check_and_increment(&user_key, limit, 60)
+        .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(current)) => {
+            KEYBOARD_RATE_LIMIT_TOTAL.inc();
+            tracing::warn!(
+                event = "rate_limited",
+                domain = "keyboard",
+                action = action,
+                user_id = %user_id,
+                session_jti = %session_jti,
+                current = current,
+                limit = limit
+            );
+            return Err(ApiErrorResponse::too_many_requests(
+                "Keyboard rate limit exceeded",
+            ));
+        }
+        Err(_) => {}
+    }
+
+    match state
+        .rate_limiter
+        .check_and_increment(&session_key, limit, 60)
+        .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(current)) => {
+            KEYBOARD_RATE_LIMIT_TOTAL.inc();
+            tracing::warn!(
+                event = "rate_limited",
+                domain = "keyboard",
+                action = action,
+                user_id = %user_id,
+                session_jti = %session_jti,
+                current = current,
+                limit = limit
+            );
+            return Err(ApiErrorResponse::too_many_requests(
+                "Keyboard rate limit exceeded",
+            ));
+        }
+        Err(_) => {}
+    }
+
+    Ok(())
+}
+
+pub async fn search_videos_keyboard(
+    State(state): State<AppState>,
+    extension: ExtensionAuth,
+    Query(params): Query<KeyboardSearchQuery>,
+) -> ApiResult<Json<Vec<KeyboardSearchItemDto>>> {
+    if !extension.has_scope("keyboard.search") {
+        return Err(ApiErrorResponse::forbidden(
+            "Missing scope: keyboard.search",
+        ));
+    }
+
+    enforce_keyboard_rpm(
+        &state,
+        extension.user_id,
+        extension.session_jti,
+        state.config.keyboard_search_rpm,
+        crate::services::rate_limiter::RateLimiter::keyboard_search_user_rpm_key(
+            &extension.user_id,
+        ),
+        crate::services::rate_limiter::RateLimiter::keyboard_search_session_rpm_key(
+            &extension.session_jti,
+        ),
+        "search",
+    )
+    .await?;
+
+    let search_config = SearchConfig::from_config(&state.config);
+    let query = validate_search_query(&params.q, &search_config)?;
+    let limit = params
+        .limit
+        .max(1)
+        .min(state.config.keyboard_search_max_limit);
+    let offset = params.offset;
+
+    let sql = match params.sort.as_str() {
+        "recent" => {
+            r#"
+            SELECT id, title, status, s3_bucket, s3_key, size_bytes, duration_seconds
+            FROM videos
+            WHERE search_vector @@ plainto_tsquery('english', $1)
+              AND deleted_at IS NULL
+              AND (UPPER(status) = 'PUBLISHED' OR UPPER(status) = 'COMPLETED' OR s3_bucket = $4)
+            ORDER BY created_at DESC
+            LIMIT $2 OFFSET $3
+            "#
+        }
+        "popular" => {
+            r#"
+            SELECT id, title, status, s3_bucket, s3_key, size_bytes, duration_seconds
+            FROM videos
+            WHERE search_vector @@ plainto_tsquery('english', $1)
+              AND deleted_at IS NULL
+              AND (UPPER(status) = 'PUBLISHED' OR UPPER(status) = 'COMPLETED' OR s3_bucket = $4)
+            ORDER BY like_count DESC, created_at DESC
+            LIMIT $2 OFFSET $3
+            "#
+        }
+        _ => {
+            r#"
+            SELECT id, title, status, s3_bucket, s3_key, size_bytes, duration_seconds,
+                   ts_rank(search_vector, plainto_tsquery('english', $1)) as rank
+            FROM videos
+            WHERE search_vector @@ plainto_tsquery('english', $1)
+              AND deleted_at IS NULL
+              AND (UPPER(status) = 'PUBLISHED' OR UPPER(status) = 'COMPLETED' OR s3_bucket = $4)
+            ORDER BY rank DESC, like_count DESC
+            LIMIT $2 OFFSET $3
+            "#
+        }
+    };
+
+    let rows = tokio::time::timeout(
+        std::time::Duration::from_secs(search_config.timeout_secs),
+        state.db.query_all(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            sql,
+            vec![
+                query.clone().into(),
+                (limit as i64).into(),
+                (offset as i64).into(),
+                state.config.minio_bucket_videos.clone().into(),
+            ],
+        )),
+    )
+    .await
+    .map_err(|_| ApiErrorResponse::internal_error("Keyboard search timed out"))?
+    .map_err(|e| ApiErrorResponse::internal_error(format!("Keyboard search failed: {}", e)))?;
+
+    let mut items = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id: Uuid = row.try_get("", "id")?;
+        let status: String = row.try_get("", "status")?;
+        let s3_bucket: String = row.try_get("", "s3_bucket")?;
+        let _s3_key: String = row.try_get("", "s3_key")?;
+        let published = status.eq_ignore_ascii_case("PUBLISHED")
+            || status.eq_ignore_ascii_case("COMPLETED")
+            || s3_bucket == state.config.minio_bucket_videos;
+
+        let safe_size_bytes: i64 = row.try_get("", "size_bytes")?;
+        let thumbnail_url = Some(format!(
+            "{}/{}/{}_thumb.jpg",
+            state.config.minio_public_endpoint, state.config.minio_bucket_videos, id
+        ));
+
+        items.push(KeyboardSearchItemDto {
+            id,
+            title: row.try_get("", "title")?,
+            thumbnail_url,
+            duration_seconds: row.try_get("", "duration_seconds").unwrap_or(None),
+            safe_size_bytes: safe_size_bytes.max(0) as u64,
+            published,
+        });
+    }
+
+    KEYBOARD_SEARCH_TOTAL.inc();
+    tracing::info!(
+        event = "keyboard_search",
+        user_id = %extension.user_id,
+        session_jti = %extension.session_jti,
+        query_len = query.len(),
+        result_count = items.len()
+    );
+
+    Ok(Json(items))
+}
+
 /// Search videos using PostgreSQL full-text search
 ///
 /// Security features:
@@ -1786,6 +1977,218 @@ pub async fn search_videos(
 
     Ok(Json(feed))
 }
+
+pub async fn create_send_ticket(
+    State(state): State<AppState>,
+    extension: ExtensionAuth,
+    Path(video_id): Path<Uuid>,
+    Json(payload): Json<CreateSendTicketRequest>,
+) -> ApiResult<Json<SendTicketResponse>> {
+    if !extension.has_scope("keyboard.send") {
+        return Err(ApiErrorResponse::forbidden("Missing scope: keyboard.send"));
+    }
+
+    let nonce = payload.nonce.trim();
+    if nonce.is_empty() || nonce.len() > 128 {
+        return Err(ApiErrorResponse::bad_request(
+            "nonce must be between 1 and 128 characters",
+        ));
+    }
+
+    if let Some(host_app_hint) = &payload.host_app_hint
+        && host_app_hint.len() > 128
+    {
+        return Err(ApiErrorResponse::bad_request(
+            "host_app_hint must be <= 128 characters",
+        ));
+    }
+
+    enforce_keyboard_rpm(
+        &state,
+        extension.user_id,
+        extension.session_jti,
+        state.config.keyboard_send_ticket_rpm,
+        crate::services::rate_limiter::RateLimiter::keyboard_send_user_rpm_key(&extension.user_id),
+        crate::services::rate_limiter::RateLimiter::keyboard_send_session_rpm_key(
+            &extension.session_jti,
+        ),
+        "send_ticket",
+    )
+    .await?;
+
+    if let Ok(mut conn) = state.queue.get_conn().await {
+        let nonce_key = crate::services::rate_limiter::RateLimiter::keyboard_nonce_key(
+            &extension.user_id,
+            nonce,
+        );
+        let nonce_set: Option<String> = redis::cmd("SET")
+            .arg(&nonce_key)
+            .arg("1")
+            .arg("EX")
+            .arg(state.config.keyboard_nonce_ttl_secs)
+            .arg("NX")
+            .query_async(&mut conn)
+            .await
+            .unwrap_or(None);
+        if nonce_set.is_none() {
+            return Err(ApiErrorResponse::bad_request("Duplicate send nonce"));
+        }
+    }
+
+    let today_start = Utc::now()
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc()
+        .fixed_offset();
+    let daily_count = send_tickets::Entity::find()
+        .filter(send_tickets::Column::UserId.eq(extension.user_id))
+        .filter(send_tickets::Column::CreatedAt.gte(today_start))
+        .count(&state.db)
+        .await
+        .map_err(ApiErrorResponse::db_error)?;
+    if daily_count >= state.config.keyboard_daily_send_cap {
+        KEYBOARD_RATE_LIMIT_TOTAL.inc();
+        tracing::warn!(
+            event = "rate_limited",
+            domain = "keyboard",
+            action = "send_daily_cap",
+            user_id = %extension.user_id,
+            session_jti = %extension.session_jti,
+            current = daily_count
+        );
+        return Err(ApiErrorResponse::too_many_requests(
+            "Keyboard daily send cap exceeded",
+        ));
+    }
+
+    let video = get_published_video_or_404(&state.db, video_id).await?;
+    let ticket_id = Uuid::new_v4();
+    let expires_at = Utc::now().fixed_offset()
+        + chrono::Duration::seconds(state.config.keyboard_ticket_ttl_secs as i64);
+
+    let ticket = send_tickets::ActiveModel {
+        ticket_id: Set(ticket_id),
+        user_id: Set(extension.user_id),
+        video_id: Set(video.id),
+        device_id_hash: Set(extension.device_id_hash.clone()),
+        host_app_hint: Set(payload.host_app_hint.clone()),
+        created_at: Set(Utc::now().fixed_offset()),
+        expires_at: Set(expires_at),
+        redeemed_at: Set(None),
+        status: Set("active".to_string()),
+    };
+    ticket.insert(&state.db).await?;
+
+    let media_url = format!("/videos/send-ticket/{}/media", ticket_id);
+    let fallback_share_url = format!(
+        "{}/{}/{}",
+        state.config.minio_public_endpoint, state.config.minio_bucket_videos, video.s3_key
+    );
+
+    KEYBOARD_SEND_ATTEMPT_TOTAL.inc();
+    tracing::info!(
+        event = "keyboard_send_attempt",
+        user_id = %extension.user_id,
+        session_jti = %extension.session_jti,
+        video_id = %video.id,
+        ticket_id = %ticket_id
+    );
+
+    Ok(Json(SendTicketResponse {
+        ticket_id,
+        media_url,
+        fallback_share_url,
+        expires_in_seconds: state.config.keyboard_ticket_ttl_secs,
+    }))
+}
+
+pub async fn redeem_send_ticket_media(
+    State(state): State<AppState>,
+    extension: ExtensionAuth,
+    Path(ticket_id): Path<Uuid>,
+) -> ApiResult<axum::response::Response> {
+    use axum::response::{IntoResponse, Redirect};
+
+    if !extension.has_scope("keyboard.send") {
+        return Err(ApiErrorResponse::forbidden("Missing scope: keyboard.send"));
+    }
+
+    let now = Utc::now().fixed_offset();
+    let ticket = send_tickets::Entity::find_by_id(ticket_id)
+        .filter(send_tickets::Column::UserId.eq(extension.user_id))
+        .one(&state.db)
+        .await
+        .map_err(ApiErrorResponse::db_error)?
+        .ok_or_else(|| ApiErrorResponse::not_found("Send ticket not found"))?;
+
+    if ticket.status != "active" || ticket.redeemed_at.is_some() {
+        return Err(ApiErrorResponse::bad_request(
+            "Send ticket already redeemed",
+        ));
+    }
+
+    if ticket.expires_at <= now {
+        KEYBOARD_TICKET_EXPIRED_TOTAL.inc();
+        send_tickets::Entity::update_many()
+            .col_expr(
+                send_tickets::Column::Status,
+                sea_orm::sea_query::Expr::value("expired"),
+            )
+            .filter(send_tickets::Column::TicketId.eq(ticket_id))
+            .filter(send_tickets::Column::Status.eq("active"))
+            .exec(&state.db)
+            .await
+            .ok();
+        tracing::info!(
+            event = "ticket_expired",
+            user_id = %extension.user_id,
+            session_jti = %extension.session_jti,
+            ticket_id = %ticket_id
+        );
+        return Err(ApiErrorResponse::bad_request("Send ticket expired"));
+    }
+
+    let video = get_published_video_or_404(&state.db, ticket.video_id).await?;
+    let result = send_tickets::Entity::update_many()
+        .col_expr(
+            send_tickets::Column::RedeemedAt,
+            sea_orm::sea_query::Expr::value(now),
+        )
+        .col_expr(
+            send_tickets::Column::Status,
+            sea_orm::sea_query::Expr::value("redeemed"),
+        )
+        .filter(send_tickets::Column::TicketId.eq(ticket_id))
+        .filter(send_tickets::Column::UserId.eq(extension.user_id))
+        .filter(send_tickets::Column::Status.eq("active"))
+        .filter(send_tickets::Column::RedeemedAt.is_null())
+        .filter(send_tickets::Column::ExpiresAt.gt(now))
+        .exec(&state.db)
+        .await
+        .map_err(ApiErrorResponse::db_error)?;
+
+    if result.rows_affected != 1 {
+        return Err(ApiErrorResponse::bad_request(
+            "Send ticket is no longer valid",
+        ));
+    }
+
+    let presigned_url = state
+        .storage
+        .generate_presigned_get(
+            &state.config.minio_bucket_videos,
+            &video.s3_key,
+            Duration::from_secs(state.config.keyboard_media_url_ttl_secs),
+        )
+        .await
+        .map_err(|e| {
+            ApiErrorResponse::internal_error(format!("Failed to generate media URL: {}", e))
+        })?;
+
+    Ok(Redirect::temporary(&presigned_url).into_response())
+}
+
 /// POST /videos/bulk-delete
 /// Bulk soft-delete videos owned by the authenticated user.
 pub async fn bulk_delete_videos(

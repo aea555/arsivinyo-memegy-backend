@@ -164,8 +164,8 @@ async fn main() -> Result<()> {
                             break; // Success!
                         }
                         Err(e) => {
-                            let should_retry = e.is_transient()
-                                && attempt < config.worker_retry_max_attempts;
+                            let should_retry =
+                                e.is_transient() && attempt < config.worker_retry_max_attempts;
                             let is_transient = e.is_transient();
                             last_error = Some(e.clone());
                             if should_retry {
@@ -266,8 +266,8 @@ async fn process_video(
         })?;
 
     // 2. Create temporary working directory
-    let temp_dir = TempDir::new()
-        .map_err(|e| ProcessingError::transient("TEMP_DIR_FAILED", e.to_string()))?;
+    let temp_dir =
+        TempDir::new().map_err(|e| ProcessingError::transient("TEMP_DIR_FAILED", e.to_string()))?;
     let input_path = temp_dir.path().join("input.mp4");
     let output_path = temp_dir.path().join("output.mp4");
     let thumb_path = temp_dir.path().join("thumb.jpg");
@@ -285,7 +285,8 @@ async fn process_video(
         .map_err(|e| ProcessingError::transient("RAW_DOWNLOAD_FAILED", e.to_string()))?;
 
     // 4. Preflight media validation with ffprobe.
-    run_ffprobe_preflight(&input_path, config.ffmpeg_transcode_timeout_secs).await?;
+    let duration_seconds =
+        run_ffprobe_preflight(&input_path, config.ffmpeg_transcode_timeout_secs).await?;
 
     // 5. Compress video with FFmpeg fallback profiles.
     tracing::info!("Compressing video with FFmpeg");
@@ -294,9 +295,13 @@ async fn process_video(
     // 6. Generate thumbnail (best effort; does not fail processing if both attempts fail).
     let mut thumbnail_ready = false;
     tracing::info!("Generating thumbnail from transcoded output");
-    if generate_thumbnail(&output_path, &thumb_path, config.ffmpeg_thumbnail_timeout_secs)
-        .await
-        .is_ok()
+    if generate_thumbnail(
+        &output_path,
+        &thumb_path,
+        config.ffmpeg_thumbnail_timeout_secs,
+    )
+    .await
+    .is_ok()
     {
         thumbnail_ready = true;
     } else {
@@ -304,9 +309,13 @@ async fn process_video(
             "Thumbnail generation from output failed for video {}, retrying from input",
             job.video_id
         );
-        if generate_thumbnail(&input_path, &thumb_path, config.ffmpeg_thumbnail_timeout_secs)
-            .await
-            .is_ok()
+        if generate_thumbnail(
+            &input_path,
+            &thumb_path,
+            config.ffmpeg_thumbnail_timeout_secs,
+        )
+        .await
+        .is_ok()
         {
             thumbnail_ready = true;
         } else {
@@ -361,6 +370,7 @@ async fn process_video(
     active.status = Set("PUBLISHED".to_string());
     active.s3_bucket = Set(config.minio_bucket_videos.clone());
     active.s3_key = Set(video_key.clone());
+    active.duration_seconds = Set(duration_seconds);
     active.processing_error_code = Set(None);
     active.processing_error_message = Set(None);
     active.failed_at = Set(None);
@@ -479,7 +489,10 @@ async fn publish_video_status_signal(
     Ok(())
 }
 
-async fn run_ffprobe_preflight(input: &Path, timeout_secs: u64) -> Result<(), ProcessingError> {
+async fn run_ffprobe_preflight(
+    input: &Path,
+    timeout_secs: u64,
+) -> Result<Option<i32>, ProcessingError> {
     let output = run_command_with_timeout(
         "ffprobe",
         vec![
@@ -517,10 +530,14 @@ async fn run_ffprobe_preflight(input: &Path, timeout_secs: u64) -> Result<(), Pr
         ));
     }
 
-    if let Some(format) = parsed.format
-        && let Some(duration_str) = format.duration
-        && let Ok(duration) = duration_str.parse::<f64>()
-        && duration <= 0.0
+    let duration_seconds = parsed
+        .format
+        .and_then(|format| format.duration)
+        .and_then(|duration_str| duration_str.parse::<f64>().ok())
+        .map(|duration| duration.round() as i32);
+
+    if let Some(duration) = duration_seconds
+        && duration <= 0
     {
         return Err(ProcessingError::permanent(
             "INVALID_MEDIA",
@@ -528,7 +545,7 @@ async fn run_ffprobe_preflight(input: &Path, timeout_secs: u64) -> Result<(), Pr
         ));
     }
 
-    Ok(())
+    Ok(duration_seconds)
 }
 
 fn build_transcode_profiles(input: &Path, output: &Path) -> Vec<TranscodeProfile<'static>> {
@@ -744,9 +761,11 @@ async fn run_command_with_timeout(
     command.kill_on_drop(true);
     command.args(&args);
 
-    let timed_output =
-        tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), command.output())
-            .await;
+    let timed_output = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        command.output(),
+    )
+    .await;
 
     match timed_output {
         Ok(Ok(output)) => Ok(output),

@@ -67,6 +67,16 @@ pub struct Config {
     pub search_cache_ttl_secs: usize,
     pub search_rpm_limit: u64,
 
+    // Keyboard Extension
+    pub extension_token_ttl_secs: usize,
+    pub keyboard_search_rpm: u64,
+    pub keyboard_search_max_limit: u64,
+    pub keyboard_send_ticket_rpm: u64,
+    pub keyboard_daily_send_cap: u64,
+    pub keyboard_nonce_ttl_secs: usize,
+    pub keyboard_ticket_ttl_secs: u64,
+    pub keyboard_media_url_ttl_secs: u64,
+
     // Worker
     pub draft_video_cleanup_hours: u16,
     pub worker_retry_max_attempts: u8,
@@ -211,6 +221,32 @@ impl Config {
                 .unwrap_or_else(|_| "10".to_string())
                 .parse()?,
             search_rpm_limit: env::var("SEARCH_RPM_LIMIT")
+                .unwrap_or_else(|_| "30".to_string())
+                .parse()?,
+
+            // Keyboard Extension
+            extension_token_ttl_secs: env::var("EXTENSION_TOKEN_TTL_SECS")
+                .unwrap_or_else(|_| "600".to_string()) // 10 minutes
+                .parse()?,
+            keyboard_search_rpm: env::var("KEYBOARD_SEARCH_RPM")
+                .unwrap_or_else(|_| "60".to_string())
+                .parse()?,
+            keyboard_search_max_limit: env::var("KEYBOARD_SEARCH_MAX_LIMIT")
+                .unwrap_or_else(|_| "20".to_string())
+                .parse()?,
+            keyboard_send_ticket_rpm: env::var("KEYBOARD_SEND_TICKET_RPM")
+                .unwrap_or_else(|_| "30".to_string())
+                .parse()?,
+            keyboard_daily_send_cap: env::var("KEYBOARD_DAILY_SEND_CAP")
+                .unwrap_or_else(|_| "100".to_string())
+                .parse()?,
+            keyboard_nonce_ttl_secs: env::var("KEYBOARD_NONCE_TTL_SECS")
+                .unwrap_or_else(|_| "300".to_string())
+                .parse()?,
+            keyboard_ticket_ttl_secs: env::var("KEYBOARD_TICKET_TTL_SECS")
+                .unwrap_or_else(|_| "45".to_string())
+                .parse()?,
+            keyboard_media_url_ttl_secs: env::var("KEYBOARD_MEDIA_URL_TTL_SECS")
                 .unwrap_or_else(|_| "30".to_string())
                 .parse()?,
 

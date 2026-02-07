@@ -3,7 +3,9 @@
 pub mod prelude;
 
 pub mod download_jobs;
+pub mod extension_sessions;
 pub mod likes;
 pub mod refresh_tokens;
+pub mod send_tickets;
 pub mod users;
 pub mod videos;

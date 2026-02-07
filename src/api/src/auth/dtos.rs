@@ -59,3 +59,19 @@ pub struct ExchangeOtcResponse {
     pub refresh_token: String,
     pub user: UserDto,
 }
+
+#[derive(Deserialize)]
+pub struct ExtensionSessionRequest {
+    pub platform: String,
+    pub device_id_hash: String,
+    #[serde(default)]
+    pub requested_scopes: Option<Vec<String>>,
+}
+
+#[derive(Serialize)]
+pub struct ExtensionSessionResponse {
+    pub extension_access_token: String,
+    pub expires_in_seconds: usize,
+    pub session_jti: Uuid,
+    pub scope: Vec<String>,
+}

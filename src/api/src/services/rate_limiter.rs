@@ -132,4 +132,29 @@ impl RateLimiter {
     pub fn ws_connect_user_key(user_id: &uuid::Uuid) -> String {
         format!("ratelimit:ws:connect:user:{}", user_id)
     }
+
+    /// Generate key for keyboard search RPM limit per user
+    pub fn keyboard_search_user_rpm_key(user_id: &uuid::Uuid) -> String {
+        format!("ratelimit:keyboard:search:user:{}", user_id)
+    }
+
+    /// Generate key for keyboard search RPM limit per extension session
+    pub fn keyboard_search_session_rpm_key(session_jti: &uuid::Uuid) -> String {
+        format!("ratelimit:keyboard:search:session:{}", session_jti)
+    }
+
+    /// Generate key for keyboard send-ticket RPM limit per user
+    pub fn keyboard_send_user_rpm_key(user_id: &uuid::Uuid) -> String {
+        format!("ratelimit:keyboard:send:user:{}", user_id)
+    }
+
+    /// Generate key for keyboard send-ticket RPM limit per extension session
+    pub fn keyboard_send_session_rpm_key(session_jti: &uuid::Uuid) -> String {
+        format!("ratelimit:keyboard:send:session:{}", session_jti)
+    }
+
+    /// Generate key for keyboard send nonce replay prevention
+    pub fn keyboard_nonce_key(user_id: &uuid::Uuid, nonce: &str) -> String {
+        format!("keyboard:nonce:{}:{}", user_id, nonce)
+    }
 }

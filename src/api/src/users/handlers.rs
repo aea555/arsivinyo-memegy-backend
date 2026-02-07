@@ -194,6 +194,7 @@ pub async fn delete_account(
             .ok();
     }
     AuthService::logout_all(&state.db, user_id).await?;
+    AuthService::revoke_extension_sessions(&state.db, user_id).await?;
 
     // 3. Invalidate Cache
     if let Ok(mut conn) = state.queue.get_conn().await {

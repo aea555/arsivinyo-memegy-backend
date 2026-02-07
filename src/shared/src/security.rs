@@ -16,6 +16,18 @@ pub struct Claims {
     pub iat: usize, // Issued At
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ExtensionClaims {
+    pub sub: Uuid, // User ID
+    pub jti: Uuid, // Session JTI
+    pub exp: usize,
+    pub iat: usize,
+    pub scope: Vec<String>,
+    pub platform: String,
+    pub device_id_hash: String,
+    pub token_use: String,
+}
+
 pub fn hash_token(token: &str) -> Result<String> {
     let salt = SaltString::generate(&mut OsRng);
     let argon2 = Argon2::default();
@@ -63,6 +75,53 @@ pub fn verify_jwt(token: &str, secret: &str) -> Result<Claims> {
         &validation,
     )
     .map_err(|e| anyhow!(e.to_string()))?;
+
+    Ok(token_data.claims)
+}
+
+pub fn create_extension_access_token(
+    user_id: Uuid,
+    session_jti: Uuid,
+    platform: &str,
+    device_id_hash: &str,
+    scope: &[String],
+    secret: &str,
+    ttl_secs: usize,
+) -> Result<String> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as usize;
+    let exp = now + ttl_secs;
+
+    let claims = ExtensionClaims {
+        sub: user_id,
+        jti: session_jti,
+        exp,
+        iat: now,
+        scope: scope.to_vec(),
+        platform: platform.to_string(),
+        device_id_hash: device_id_hash.to_string(),
+        token_use: "extension".to_string(),
+    };
+
+    encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .map_err(|e| anyhow!(e.to_string()))
+}
+
+pub fn verify_extension_jwt(token: &str, secret: &str) -> Result<ExtensionClaims> {
+    let validation = Validation::default();
+    let token_data = decode::<ExtensionClaims>(
+        token,
+        &DecodingKey::from_secret(secret.as_bytes()),
+        &validation,
+    )
+    .map_err(|e| anyhow!(e.to_string()))?;
+
+    if token_data.claims.token_use != "extension" {
+        return Err(anyhow!("Invalid token_use"));
+    }
 
     Ok(token_data.claims)
 }
@@ -156,5 +215,30 @@ mod tests {
         assert!(verify_pkce_challenge(verifier, challenge));
         assert!(!verify_pkce_challenge(verifier, "wrong_challenge"));
         assert!(!verify_pkce_challenge("short", challenge));
+    }
+
+    #[test]
+    fn test_extension_jwt_roundtrip() {
+        let user_id = Uuid::new_v4();
+        let session_jti = Uuid::new_v4();
+        let secret = "test_secret";
+        let scope = vec!["keyboard.search".to_string(), "keyboard.send".to_string()];
+
+        let token = create_extension_access_token(
+            user_id,
+            session_jti,
+            "android",
+            "device_hash_abc",
+            &scope,
+            secret,
+            60,
+        )
+        .unwrap();
+
+        let claims = verify_extension_jwt(&token, secret).unwrap();
+        assert_eq!(claims.sub, user_id);
+        assert_eq!(claims.jti, session_jti);
+        assert_eq!(claims.scope, scope);
+        assert_eq!(claims.platform, "android");
     }
 }

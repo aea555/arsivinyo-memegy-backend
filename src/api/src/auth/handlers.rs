@@ -4,6 +4,10 @@ use axum::{
     response::IntoResponse,
 };
 use axum_extra::extract::cookie::Cookie;
+use axum_extra::{
+    TypedHeader,
+    headers::{Authorization, authorization::Bearer},
+};
 
 use crate::{
     audit::logger::{AuditEvent, log_audit_event},
@@ -20,10 +24,10 @@ use oauth2::{
     RedirectUrl, Scope, TokenUrl, basic::BasicClient,
 };
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
-use shared::entities::{refresh_tokens, users};
+use shared::entities::{extension_sessions, refresh_tokens, users};
 use shared::security::{
-    compute_code_challenge, create_access_token, generate_refresh_token, hash_token,
-    validate_code_verifier,
+    compute_code_challenge, create_access_token, create_extension_access_token,
+    generate_refresh_token, hash_token, validate_code_verifier,
 };
 use uuid::Uuid;
 
@@ -50,6 +54,34 @@ fn parse_oauth_state(state: &str) -> Result<OAuthState, &'static str> {
         source: parts[1].to_string(),
         code_challenge: parts.get(2).map(|s| s.to_string()),
     })
+}
+
+fn normalize_extension_scopes(
+    requested_scopes: Option<Vec<String>>,
+) -> Result<Vec<String>, ApiErrorResponse> {
+    let allowed = ["keyboard.search", "keyboard.send"];
+    let mut scopes = requested_scopes
+        .unwrap_or_else(|| vec!["keyboard.search".to_string(), "keyboard.send".to_string()]);
+
+    scopes.sort();
+    scopes.dedup();
+
+    if scopes.is_empty() {
+        return Err(ApiErrorResponse::bad_request(
+            "requested_scopes cannot be empty",
+        ));
+    }
+
+    for scope in &scopes {
+        if !allowed.contains(&scope.as_str()) {
+            return Err(ApiErrorResponse::bad_request(format!(
+                "Invalid scope requested: {}",
+                scope
+            )));
+        }
+    }
+
+    Ok(scopes)
 }
 
 fn oauth_client(state: &AppState) -> BasicClient {
@@ -412,8 +444,82 @@ pub async fn refresh_token(
     }))
 }
 
-pub async fn logout(State(state): State<AppState>, AuthUser(user_id): AuthUser) -> ApiResult<()> {
+pub async fn create_extension_session(
+    State(state): State<AppState>,
+    AuthUser(user_id): AuthUser,
+    Json(payload): Json<ExtensionSessionRequest>,
+) -> ApiResult<Json<ExtensionSessionResponse>> {
+    let platform = payload.platform.trim().to_ascii_lowercase();
+    if platform != "ios" && platform != "android" {
+        return Err(ApiErrorResponse::bad_request(
+            "platform must be one of: ios, android",
+        ));
+    }
+
+    let device_id_hash = payload.device_id_hash.trim().to_string();
+    if device_id_hash.len() < 16 || device_id_hash.len() > 256 {
+        return Err(ApiErrorResponse::bad_request(
+            "device_id_hash length must be between 16 and 256",
+        ));
+    }
+
+    let scope = normalize_extension_scopes(payload.requested_scopes)?;
+    let session_jti = Uuid::new_v4();
+    let issued_at = Utc::now();
+    let expires_at = issued_at + Duration::seconds(state.config.extension_token_ttl_secs as i64);
+
+    let model = extension_sessions::ActiveModel {
+        jti: Set(session_jti),
+        user_id: Set(user_id),
+        device_id_hash: Set(device_id_hash.clone()),
+        platform: Set(platform.clone()),
+        scope: Set(scope.clone()),
+        issued_at: Set(issued_at.into()),
+        expires_at: Set(expires_at.into()),
+        revoked_at: Set(None),
+    };
+    model.insert(&state.db).await?;
+
+    let extension_access_token = create_extension_access_token(
+        user_id,
+        session_jti,
+        &platform,
+        &device_id_hash,
+        &scope,
+        &state.config.jwt_secret,
+        state.config.extension_token_ttl_secs,
+    )?;
+
+    Ok(Json(ExtensionSessionResponse {
+        extension_access_token,
+        expires_in_seconds: state.config.extension_token_ttl_secs,
+        session_jti,
+        scope,
+    }))
+}
+
+pub async fn logout(
+    State(state): State<AppState>,
+    TypedHeader(auth): TypedHeader<Authorization<Bearer>>,
+) -> ApiResult<()> {
+    let claims = AuthService::validate_token(auth.token(), &state.config.jwt_secret)
+        .map_err(|_| ApiErrorResponse::unauthorized("Invalid token"))?;
+
+    if state.token_revocation.is_revoked(claims.jti).await {
+        return Err(ApiErrorResponse::unauthorized("Token revoked"));
+    }
+    let user_id = claims.sub;
+
     AuthService::logout_all(&state.db, user_id).await?;
+    AuthService::revoke_extension_sessions(&state.db, user_id).await?;
+
+    let now_secs = Utc::now().timestamp() as usize;
+    if claims.exp > now_secs {
+        let _ = state
+            .token_revocation
+            .revoke_token(claims.jti, claims.exp - now_secs)
+            .await;
+    }
     Ok(())
 }
 
@@ -425,7 +531,7 @@ pub async fn dev_login(
 ) -> ApiResult<Json<AuthResponse>> {
     // Only allow in development mode or test environment
     let log_level = std::env::var("RUST_LOG").unwrap_or_default();
-    if !log_level.contains("debug") && std::env::var("APP_ENV").unwrap_or_default() != "test" {
+    if !log_level.contains("debug") && state.config.environment != "test" {
         return Err(ApiErrorResponse::forbidden(
             "Dev login is only available in debug mode",
         ));

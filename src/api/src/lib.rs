@@ -99,6 +99,10 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/auth/refresh", post(auth::handlers::refresh_token))
         .route("/auth/logout", post(auth::handlers::logout))
+        .route(
+            "/auth/extension/session",
+            post(auth::handlers::create_extension_session),
+        )
         .route("/auth/dev/login", post(auth::handlers::dev_login))
         .route("/auth/exchange-otc", post(auth::handlers::exchange_otc));
 

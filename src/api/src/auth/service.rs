@@ -3,7 +3,7 @@ use anyhow::{Result, anyhow};
 use chrono::{Duration, Utc};
 use sea_orm::*;
 use serde::Deserialize;
-use shared::entities::{refresh_tokens, users};
+use shared::entities::{extension_sessions, refresh_tokens, users};
 use shared::security::{
     Claims, create_access_token, generate_refresh_token, hash_token, verify_token_hash,
 };
@@ -295,6 +295,19 @@ impl AuthService {
     pub async fn logout_all(db: &DatabaseConnection, user_id: Uuid) -> Result<()> {
         refresh_tokens::Entity::delete_many()
             .filter(refresh_tokens::Column::UserId.eq(user_id))
+            .exec(db)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn revoke_extension_sessions(db: &DatabaseConnection, user_id: Uuid) -> Result<()> {
+        extension_sessions::Entity::update_many()
+            .col_expr(
+                extension_sessions::Column::RevokedAt,
+                sea_orm::sea_query::Expr::value(Utc::now().fixed_offset()),
+            )
+            .filter(extension_sessions::Column::UserId.eq(user_id))
+            .filter(extension_sessions::Column::RevokedAt.is_null())
             .exec(db)
             .await?;
         Ok(())

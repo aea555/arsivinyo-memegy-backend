@@ -67,11 +67,15 @@ The documentation includes:
 - `GET /auth/google/callback`: Callback from Google. Returns Access/Refresh tokens.
 - `POST /auth/refresh`: Refresh access token.
 - `POST /auth/logout`: Invalidate session.
+- `POST /auth/extension/session`: Mint short-lived keyboard extension token.
 
 ### Videos
 - `POST /videos/init`: Request upload URL. Body: `{ "filename": "meme.mp4", "size_bytes": 123456 }`.
 - `POST /videos/{id}/confirm`: Confirm upload completion.
 - `GET /feed`: Get video feed. Params: `?sort=random|latest|popular&page=0`.
+- `GET /videos/search/keyboard`: Keyboard-optimized compact search DTO.
+- `POST /videos/{id}/send-ticket`: Create short-lived single-use send ticket.
+- `GET /videos/send-ticket/{ticket_id}/media`: Redeem send ticket to media redirect.
 - `PUT /videos/{id}/like`: Idempotently like a video. Returns current `{ is_liked, like_count }`.
 - `DELETE /videos/{id}/like`: Idempotently unlike a video. Returns current `{ is_liked, like_count }`.
 - `GET /users/me/videos/ws`: WebSocket realtime stream for upload status changes.

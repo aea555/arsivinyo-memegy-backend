@@ -20,6 +20,18 @@ pub fn videos_router(_config: &Config) -> Router<AppState> {
         .route("/videos/:id/confirm", post(handlers::confirm_upload))
         // Search
         .route("/videos/search", get(handlers::search_videos))
+        .route(
+            "/videos/search/keyboard",
+            get(handlers::search_videos_keyboard),
+        )
+        .route(
+            "/videos/:id/send-ticket",
+            post(handlers::create_send_ticket),
+        )
+        .route(
+            "/videos/send-ticket/:ticket_id/media",
+            get(handlers::redeem_send_ticket_media),
+        )
         // Download
         .route("/videos/:id/download", get(handlers::download_video))
         .route(

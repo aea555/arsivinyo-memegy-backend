@@ -129,6 +129,45 @@ components:
         - access_token
         - refresh_token
 
+    ExtensionSessionRequest:
+      type: object
+      properties:
+        platform:
+          type: string
+          enum: [ios, android]
+        device_id_hash:
+          type: string
+          minLength: 16
+          maxLength: 256
+        requested_scopes:
+          type: array
+          items:
+            type: string
+            enum: [keyboard.search, keyboard.send]
+      required:
+        - platform
+        - device_id_hash
+
+    ExtensionSessionResponse:
+      type: object
+      properties:
+        extension_access_token:
+          type: string
+        expires_in_seconds:
+          type: integer
+        session_jti:
+          type: string
+          format: uuid
+        scope:
+          type: array
+          items:
+            type: string
+      required:
+        - extension_access_token
+        - expires_in_seconds
+        - session_jti
+        - scope
+
     InitUploadRequest:
       type: object
       properties:
@@ -234,6 +273,62 @@ components:
         - url
         - like_count
         - created_at
+
+    KeyboardSearchItem:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        title:
+          type: string
+          nullable: true
+        thumbnail_url:
+          type: string
+          format: uri
+          nullable: true
+        duration_seconds:
+          type: integer
+          nullable: true
+        safe_size_bytes:
+          type: integer
+          format: int64
+        published:
+          type: boolean
+      required:
+        - id
+        - safe_size_bytes
+        - published
+
+    CreateSendTicketRequest:
+      type: object
+      properties:
+        host_app_hint:
+          type: string
+          nullable: true
+        nonce:
+          type: string
+      required:
+        - nonce
+
+    SendTicketResponse:
+      type: object
+      properties:
+        ticket_id:
+          type: string
+          format: uuid
+        media_url:
+          type: string
+        fallback_share_url:
+          type: string
+          format: uri
+        expires_in_seconds:
+          type: integer
+      required:
+        - ticket_id
+        - media_url
+        - fallback_share_url
+        - expires_in_seconds
 
     UserVideoItem:
       type: object
@@ -679,6 +774,36 @@ paths:
       responses:
         "200":
           description: Successfully logged out
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /auth/extension/session:
+    post:
+      tags:
+        - Authentication
+      summary: Mint keyboard extension session token
+      description: |
+        Creates a short-lived extension-scoped token for keyboard extension usage.
+      operationId: createExtensionSession
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExtensionSessionRequest"
+      responses:
+        "200":
+          description: Extension session token minted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExtensionSessionResponse"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
         "401":
           $ref: "#/components/responses/UnauthorizedError"
         "500":
@@ -1184,6 +1309,156 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /videos/search/keyboard:
+    get:
+      tags:
+        - Videos
+      summary: Keyboard-optimized video search
+      description: |
+        Compact payload search endpoint for keyboard extension usage.
+        Requires extension token with `keyboard.search` scope.
+      operationId: searchVideosKeyboard
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 20
+            default: 20
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: sort
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [relevance, recent, popular]
+            default: relevance
+      responses:
+        "200":
+          description: Keyboard search results
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/KeyboardSearchItem"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          description: Missing required extension scope
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/TooManyRequestsError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /videos/{id}/send-ticket:
+    post:
+      tags:
+        - Videos
+      summary: Create keyboard send ticket
+      description: |
+        Creates a short-lived single-use send ticket for keyboard media handoff.
+        Requires extension token with `keyboard.send` scope.
+      operationId: createSendTicket
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSendTicketRequest"
+      responses:
+        "200":
+          description: Send ticket created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SendTicketResponse"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          description: Missing required extension scope
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "429":
+          $ref: "#/components/responses/TooManyRequestsError"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /videos/send-ticket/{ticket_id}/media:
+    get:
+      tags:
+        - Videos
+      summary: Redeem send ticket media URL
+      description: |
+        Validates and redeems single-use send ticket, then redirects to a short-lived media URL.
+        Requires extension token with `keyboard.send` scope.
+      operationId: redeemSendTicketMedia
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: ticket_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "307":
+          description: Redirect to media URL
+          headers:
+            Location:
+              schema:
+                type: string
+                format: uri
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          description: Missing required extension scope
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
         "500":
           $ref: "#/components/responses/InternalServerError"
 

@@ -100,6 +100,41 @@ fn default_sort() -> String {
 }
 
 #[derive(Deserialize)]
+pub struct KeyboardSearchQuery {
+    pub q: String,
+    #[serde(default = "default_limit")]
+    pub limit: u64,
+    #[serde(default)]
+    pub offset: u64,
+    #[serde(default = "default_sort")]
+    pub sort: String,
+}
+
+#[derive(Serialize)]
+pub struct KeyboardSearchItemDto {
+    pub id: Uuid,
+    pub title: Option<String>,
+    pub thumbnail_url: Option<String>,
+    pub duration_seconds: Option<i32>,
+    pub safe_size_bytes: u64,
+    pub published: bool,
+}
+
+#[derive(Deserialize)]
+pub struct CreateSendTicketRequest {
+    pub host_app_hint: Option<String>,
+    pub nonce: String,
+}
+
+#[derive(Serialize)]
+pub struct SendTicketResponse {
+    pub ticket_id: Uuid,
+    pub media_url: String,
+    pub fallback_share_url: String,
+    pub expires_in_seconds: u64,
+}
+
+#[derive(Deserialize)]
 pub struct BulkDeleteRequest {
     pub video_ids: Vec<Uuid>,
 }

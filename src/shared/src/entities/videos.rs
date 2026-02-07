@@ -14,6 +14,7 @@ pub struct Model {
     pub s3_key: String,
     pub status: String,
     pub size_bytes: i64,
+    pub duration_seconds: Option<i32>,
     pub like_count: i64,
     pub is_anonymous: bool,
     pub processing_error_code: Option<String>,

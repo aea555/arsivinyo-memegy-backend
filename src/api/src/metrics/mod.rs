@@ -62,6 +62,23 @@ lazy_static! {
     pub static ref WS_CONNECTION_DROPPED_TOTAL: IntCounter = IntCounter::with_opts(
         Opts::new("ws_connection_dropped_total", "Websocket connections dropped due to overflow or send failure")
     ).expect("metric can be created");
+
+    // Keyboard extension metrics
+    pub static ref KEYBOARD_SEARCH_TOTAL: IntCounter = IntCounter::with_opts(
+        Opts::new("keyboard_search_total", "Keyboard search requests")
+    ).expect("metric can be created");
+
+    pub static ref KEYBOARD_SEND_ATTEMPT_TOTAL: IntCounter = IntCounter::with_opts(
+        Opts::new("keyboard_send_attempt_total", "Keyboard send-ticket attempts")
+    ).expect("metric can be created");
+
+    pub static ref KEYBOARD_RATE_LIMIT_TOTAL: IntCounter = IntCounter::with_opts(
+        Opts::new("keyboard_rate_limit_total", "Keyboard rate-limit rejections")
+    ).expect("metric can be created");
+
+    pub static ref KEYBOARD_TICKET_EXPIRED_TOTAL: IntCounter = IntCounter::with_opts(
+        Opts::new("keyboard_ticket_expired_total", "Expired keyboard send-ticket usage attempts")
+    ).expect("metric can be created");
 }
 
 pub fn register_metrics() {
@@ -77,6 +94,10 @@ pub fn register_metrics() {
     let _ = REGISTRY.register(Box::new(WS_EVENTS_PUBLISHED_TOTAL.clone()));
     let _ = REGISTRY.register(Box::new(WS_EVENTS_FANOUT_TOTAL.clone()));
     let _ = REGISTRY.register(Box::new(WS_CONNECTION_DROPPED_TOTAL.clone()));
+    let _ = REGISTRY.register(Box::new(KEYBOARD_SEARCH_TOTAL.clone()));
+    let _ = REGISTRY.register(Box::new(KEYBOARD_SEND_ATTEMPT_TOTAL.clone()));
+    let _ = REGISTRY.register(Box::new(KEYBOARD_RATE_LIMIT_TOTAL.clone()));
+    let _ = REGISTRY.register(Box::new(KEYBOARD_TICKET_EXPIRED_TOTAL.clone()));
 }
 
 pub fn metrics_handler() -> String {
