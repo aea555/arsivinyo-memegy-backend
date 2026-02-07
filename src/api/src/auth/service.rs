@@ -27,6 +27,25 @@ pub enum RegisterUserError {
     Other(anyhow::Error),
 }
 
+pub enum RefreshAccessTokenError {
+    InvalidAccessToken,
+    InvalidOrExpiredRefreshToken,
+    ReuseDetected,
+    Internal(anyhow::Error),
+}
+
+impl From<sea_orm::DbErr> for RefreshAccessTokenError {
+    fn from(value: sea_orm::DbErr) -> Self {
+        Self::Internal(value.into())
+    }
+}
+
+impl From<anyhow::Error> for RefreshAccessTokenError {
+    fn from(value: anyhow::Error) -> Self {
+        Self::Internal(value)
+    }
+}
+
 impl AuthService {
     pub async fn verify_google_code(
         code: String,
@@ -318,9 +337,10 @@ impl AuthService {
         jwt_secret: &str,
         access_token_ttl_secs: usize,
         refresh_token_ttl_days: u16,
-    ) -> Result<(String, String)> {
+    ) -> std::result::Result<(String, String), RefreshAccessTokenError> {
         // 1. Get claims from old token (even if expired)
-        let old_claims = Self::get_claims_ignoring_expiry(old_access_token, jwt_secret)?;
+        let old_claims = Self::get_claims_ignoring_expiry(old_access_token, jwt_secret)
+            .map_err(|_| RefreshAccessTokenError::InvalidAccessToken)?;
         let user_id = old_claims.sub;
 
         // 2. Find and validate the refresh token (with lock to prevent concurrent refresh)
@@ -351,7 +371,7 @@ impl AuthService {
 
         let old_refresh = match matching_token_model {
             Some(token) => token,
-            None => return Err(anyhow!("Invalid or expired refresh token")),
+            None => return Err(RefreshAccessTokenError::InvalidOrExpiredRefreshToken),
         };
 
         // 4. Check for Reuse / Rotation Logic
@@ -382,7 +402,7 @@ impl AuthService {
                     .await?;
 
                 txn.commit().await?; // Commit the deletion
-                return Err(anyhow!("Refresh token reuse detected. Session revoked."));
+                return Err(RefreshAccessTokenError::ReuseDetected);
             }
         }
 
@@ -400,20 +420,14 @@ impl AuthService {
         }
 
         // 6. Issue NEW access and refresh tokens
-        let new_access_token = create_access_token(user_id, jwt_secret, access_token_ttl_secs)?;
+        let new_access_token = create_access_token(user_id, jwt_secret, access_token_ttl_secs)
+            .map_err(RefreshAccessTokenError::Internal)?;
         let new_refresh_token = generate_refresh_token();
-        let new_refresh_hash = hash_token(&new_refresh_token)?;
+        let new_refresh_hash =
+            hash_token(&new_refresh_token).map_err(RefreshAccessTokenError::Internal)?;
         let new_token_id = Uuid::new_v4();
 
-        // 7. Update Old Token (Mark as replaced) IF it wasn't already replaced
-        if old_refresh.replaced_by.is_none() {
-            let mut active_old: refresh_tokens::ActiveModel = old_refresh.into();
-            active_old.replaced_by = Set(Some(new_token_id));
-            active_old.replaced_at = Set(Some(Utc::now().into()));
-            active_old.update(&txn).await?;
-        }
-
-        // 8. Store new refresh token
+        // 7. Store new refresh token first so FK from old.replaced_by can reference it
         let expires_at = Utc::now() + Duration::days(refresh_token_ttl_days as i64);
         let new_rt_model = refresh_tokens::ActiveModel {
             id: Set(new_token_id),
@@ -425,6 +439,14 @@ impl AuthService {
             ..Default::default()
         };
         new_rt_model.insert(&txn).await?;
+
+        // 8. Update old token (mark as replaced) only when this token had not been rotated before
+        if old_refresh.replaced_by.is_none() {
+            let mut active_old: refresh_tokens::ActiveModel = old_refresh.into();
+            active_old.replaced_by = Set(Some(new_token_id));
+            active_old.replaced_at = Set(Some(Utc::now().into()));
+            active_old.update(&txn).await?;
+        }
 
         txn.commit().await?;
 

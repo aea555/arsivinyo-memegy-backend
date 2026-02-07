@@ -41,7 +41,7 @@ use uuid::Uuid;
 
 use super::constants::*;
 use super::dtos::*;
-use super::service::{AuthService, RegisterUserError};
+use super::service::{AuthService, RefreshAccessTokenError, RegisterUserError};
 
 #[derive(Debug)]
 struct OAuthState {
@@ -577,7 +577,7 @@ pub async fn refresh_token(
     State(state): State<AppState>,
     Json(payload): Json<RefreshRequest>,
 ) -> ApiResult<Json<RefreshResponse>> {
-    let (new_access_token, new_refresh_token) = AuthService::refresh_access_token(
+    let (new_access_token, new_refresh_token) = match AuthService::refresh_access_token(
         &state.db,
         &state.token_revocation,
         &payload.access_token,
@@ -586,7 +586,30 @@ pub async fn refresh_token(
         state.config.access_token_ttl_secs,
         state.config.refresh_token_ttl_days,
     )
-    .await?;
+    .await
+    {
+        Ok(tokens) => tokens,
+        Err(RefreshAccessTokenError::InvalidAccessToken)
+        | Err(RefreshAccessTokenError::InvalidOrExpiredRefreshToken) => {
+            return Err(ApiErrorResponse::unauthorized("Invalid or expired token"));
+        }
+        Err(RefreshAccessTokenError::ReuseDetected) => {
+            return Err(ApiErrorResponse::unauthorized(
+                "Session revoked due to refresh token reuse",
+            ));
+        }
+        Err(RefreshAccessTokenError::Internal(e)) => {
+            tracing::error!("Token refresh failed: {:?}", e);
+            if cfg!(debug_assertions) {
+                return Err(ApiErrorResponse::with_details(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to refresh token",
+                    format!("{:?}", e),
+                ));
+            }
+            return Err(ApiErrorResponse::internal_error("Failed to refresh token"));
+        }
+    };
 
     Ok(Json(RefreshResponse {
         access_token: new_access_token,

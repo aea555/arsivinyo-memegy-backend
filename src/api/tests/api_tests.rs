@@ -59,6 +59,82 @@ async fn auth_flow_works() {
 }
 
 #[tokio::test]
+async fn refresh_token_works_and_rotates_tokens() {
+    let app = spawn_app().await;
+    let client = Client::new();
+
+    let login_response = client
+        .post(&format!("{}/auth/dev/login", app.address))
+        .json(&serde_json::json!({
+            "username": "refresh_user",
+            "email": "refresh@example.com"
+        }))
+        .send()
+        .await
+        .expect("Failed to login");
+    assert!(login_response.status().is_success());
+    let login_body: serde_json::Value = login_response.json().await.unwrap();
+    let old_access = login_body["access_token"].as_str().unwrap().to_string();
+    let old_refresh = login_body["refresh_token"].as_str().unwrap().to_string();
+
+    let refresh_response = client
+        .post(&format!("{}/auth/refresh", app.address))
+        .json(&serde_json::json!({
+            "access_token": old_access,
+            "refresh_token": old_refresh
+        }))
+        .send()
+        .await
+        .expect("Failed to refresh token");
+
+    let status = refresh_response.status().as_u16();
+    let body_text = refresh_response.text().await.unwrap();
+    assert_eq!(
+        status, 200,
+        "refresh failed with status={}, body={}",
+        status, body_text
+    );
+    let refresh_body: serde_json::Value = serde_json::from_str(&body_text).unwrap();
+    let new_access = refresh_body["access_token"].as_str().unwrap();
+    let new_refresh = refresh_body["refresh_token"].as_str().unwrap();
+    assert!(!new_access.is_empty());
+    assert!(!new_refresh.is_empty());
+    assert_ne!(refresh_body["refresh_token"], login_body["refresh_token"]);
+}
+
+#[tokio::test]
+async fn refresh_token_invalid_input_returns_401_not_500() {
+    let app = spawn_app().await;
+    let client = Client::new();
+
+    let login_response = client
+        .post(&format!("{}/auth/dev/login", app.address))
+        .json(&serde_json::json!({
+            "username": "refresh_invalid_user",
+            "email": "refresh-invalid@example.com"
+        }))
+        .send()
+        .await
+        .expect("Failed to login");
+    assert!(login_response.status().is_success());
+    let login_body: serde_json::Value = login_response.json().await.unwrap();
+
+    let refresh_response = client
+        .post(&format!("{}/auth/refresh", app.address))
+        .json(&serde_json::json!({
+            "access_token": login_body["access_token"],
+            "refresh_token": "not-a-valid-refresh-token"
+        }))
+        .send()
+        .await
+        .expect("Failed to call refresh endpoint");
+
+    let status = refresh_response.status().as_u16();
+    let body = refresh_response.text().await.unwrap();
+    assert_eq!(status, 401, "status={}, body={}", status, body);
+}
+
+#[tokio::test]
 async fn video_upload_flow_works() {
     let app = spawn_app().await;
 
