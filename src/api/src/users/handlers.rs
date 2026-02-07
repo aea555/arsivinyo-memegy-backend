@@ -15,7 +15,7 @@ use futures_util::{SinkExt, StreamExt};
 use redis::AsyncCommands;
 use sea_orm::*;
 use serde::Deserialize;
-use shared::entities::{users, videos};
+use shared::entities::{likes, users, videos};
 use tokio::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -39,6 +39,7 @@ pub struct PaginationQuery {
 pub(crate) fn video_model_to_user_dto(
     v: videos::Model,
     config: &shared::config::Config,
+    is_liked: bool,
 ) -> UserVideoDto {
     let is_published_like =
         v.status.eq_ignore_ascii_case("PUBLISHED") || v.status.eq_ignore_ascii_case("COMPLETED");
@@ -70,9 +71,35 @@ pub(crate) fn video_model_to_user_dto(
         created_at: v.created_at,
         updated_at: v.updated_at,
         is_anonymous: v.is_anonymous,
+        is_liked,
         like_count: v.like_count,
         url,
     }
+}
+
+async fn load_liked_video_id_set(
+    db: &DatabaseConnection,
+    user_id: Uuid,
+    video_ids: &[Uuid],
+) -> ApiResult<std::collections::HashSet<Uuid>> {
+    if video_ids.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+
+    let liked_video_ids: Vec<Uuid> = likes::Entity::find()
+        .select_only()
+        .column(likes::Column::VideoId)
+        .filter(
+            Condition::all()
+                .add(likes::Column::UserId.eq(user_id))
+                .add(likes::Column::VideoId.is_in(video_ids.to_vec())),
+        )
+        .into_tuple()
+        .all(db)
+        .await
+        .map_err(ApiErrorResponse::db_error)?;
+
+    Ok(liked_video_ids.into_iter().collect())
 }
 
 /// GET /users/me
@@ -195,7 +222,7 @@ pub async fn get_my_videos(
 
     // Cache key specific to user and pagination
     // Versioned key to prevent stale schema/URL semantics from older cache entries.
-    let cache_key = format!("user:{}:videos:v3:{}:{}", user_id, page, per_page);
+    let cache_key = format!("user:{}:videos:v4:{}:{}", user_id, page, per_page);
 
     // Try cache
     if let Ok(mut conn) = state.queue.get_conn().await {
@@ -219,9 +246,15 @@ pub async fn get_my_videos(
         .await
         .map_err(ApiErrorResponse::db_error)?;
 
+    let video_ids: Vec<Uuid> = items.iter().map(|v| v.id).collect();
+    let liked_video_ids = load_liked_video_id_set(&state.db, user_id, &video_ids).await?;
+
     let dtos: Vec<UserVideoDto> = items
         .into_iter()
-        .map(|v| video_model_to_user_dto(v, &state.config))
+        .map(|v| {
+            let is_liked = liked_video_ids.contains(&v.id);
+            video_model_to_user_dto(v, &state.config, is_liked)
+        })
         .collect();
 
     // Cache result (short TTL, e.g., 5 mins, invalidated on upload/delete)
@@ -384,9 +417,15 @@ async fn load_user_videos_snapshot(
         .await
         .map_err(ApiErrorResponse::db_error)?;
 
+    let video_ids: Vec<Uuid> = items.iter().map(|v| v.id).collect();
+    let liked_video_ids = load_liked_video_id_set(&state.db, user_id, &video_ids).await?;
+
     Ok(items
         .into_iter()
-        .map(|v| video_model_to_user_dto(v, &state.config))
+        .map(|v| {
+            let is_liked = liked_video_ids.contains(&v.id);
+            video_model_to_user_dto(v, &state.config, is_liked)
+        })
         .collect())
 }
 

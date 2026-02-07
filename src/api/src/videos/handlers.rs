@@ -544,7 +544,11 @@ async fn publish_video_status_signal(
     previous_status: Option<String>,
     video: videos::Model,
 ) -> anyhow::Result<()> {
-    let dto = video_model_to_user_dto(video, &state.config);
+    let is_liked = likes::Entity::find_by_id((user_id, video.id))
+        .one(&state.db)
+        .await?
+        .is_some();
+    let dto = video_model_to_user_dto(video, &state.config, is_liked);
     let signal = RealtimeSignalMessage::status(event_type, previous_status, dto);
     let payload = serde_json::to_string(&signal)?;
     state

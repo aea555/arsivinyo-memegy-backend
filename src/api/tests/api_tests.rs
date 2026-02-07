@@ -448,7 +448,7 @@ async fn my_videos_returns_playable_url_for_published_only() {
     let token = app.login_as_dev("myvideos_user", email).await;
 
     use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
-    use shared::entities::{users, videos};
+    use shared::entities::{likes, users, videos};
 
     let user = users::Entity::find()
         .filter(users::Column::Email.eq(email))
@@ -494,6 +494,13 @@ async fn my_videos_returns_playable_url_for_published_only() {
     };
     processing.insert(&app.db).await.unwrap();
 
+    let like = likes::ActiveModel {
+        user_id: Set(user.id),
+        video_id: Set(published_id),
+        ..Default::default()
+    };
+    like.insert(&app.db).await.unwrap();
+
     let response: Response = client
         .get(&format!("{}/users/me/videos", app.address))
         .header("Authorization", format!("Bearer {}", token))
@@ -512,12 +519,14 @@ async fn my_videos_returns_playable_url_for_published_only() {
         published_item["url"].as_str(),
         Some("http://mock/videos/published.mp4")
     );
+    assert_eq!(published_item["is_liked"], true);
 
     let processing_item = body
         .iter()
         .find(|item| item["id"] == processing_id.to_string())
         .expect("Processing video should exist");
     assert!(processing_item["url"].is_null());
+    assert_eq!(processing_item["is_liked"], false);
 }
 
 #[tokio::test]

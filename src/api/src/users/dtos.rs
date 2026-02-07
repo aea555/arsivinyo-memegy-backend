@@ -10,6 +10,7 @@ pub struct UserVideoDto {
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
     pub updated_at: chrono::DateTime<chrono::FixedOffset>,
     pub is_anonymous: bool,
+    pub is_liked: bool,
     pub like_count: i64,
     pub url: Option<String>,
 }

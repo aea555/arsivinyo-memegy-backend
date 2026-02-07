@@ -258,6 +258,9 @@ components:
           format: date-time
         is_anonymous:
           type: boolean
+        is_liked:
+          type: boolean
+          description: Whether the authenticated user has liked this video
         like_count:
           type: integer
           format: int64
@@ -272,6 +275,7 @@ components:
         - created_at
         - updated_at
         - is_anonymous
+        - is_liked
         - like_count
         - url
 
