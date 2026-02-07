@@ -39,6 +39,27 @@ pub enum AuditEvent {
         endpoint: String,
         timestamp: DateTime<Utc>,
     },
+    UsernameSignupRequired {
+        source: String,
+        timestamp: DateTime<Utc>,
+    },
+    UsernameSignupCompleted {
+        user_id: Uuid,
+        timestamp: DateTime<Utc>,
+    },
+    UsernameSignupFailed {
+        reason: String,
+        timestamp: DateTime<Utc>,
+    },
+    UsernameUpdated {
+        user_id: Uuid,
+        timestamp: DateTime<Utc>,
+    },
+    UsernameUpdateRejected {
+        user_id: Option<Uuid>,
+        reason: String,
+        timestamp: DateTime<Utc>,
+    },
 }
 
 pub fn log_audit_event(event: AuditEvent) {
@@ -130,6 +151,51 @@ pub fn log_audit_event(event: AuditEvent) {
                 endpoint = %endpoint,
                 timestamp = %timestamp,
                 "Rate limit exceeded"
+            );
+        }
+        AuditEvent::UsernameSignupRequired { source, timestamp } => {
+            tracing::info!(
+                event = "username_signup_required",
+                source = %source,
+                timestamp = %timestamp,
+                "Username setup required before account completion"
+            );
+        }
+        AuditEvent::UsernameSignupCompleted { user_id, timestamp } => {
+            tracing::info!(
+                event = "username_signup_completed",
+                user_id = %user_id,
+                timestamp = %timestamp,
+                "Username setup completed"
+            );
+        }
+        AuditEvent::UsernameSignupFailed { reason, timestamp } => {
+            tracing::warn!(
+                event = "username_signup_failed",
+                reason = %reason,
+                timestamp = %timestamp,
+                "Username setup failed"
+            );
+        }
+        AuditEvent::UsernameUpdated { user_id, timestamp } => {
+            tracing::info!(
+                event = "username_updated",
+                user_id = %user_id,
+                timestamp = %timestamp,
+                "Username updated"
+            );
+        }
+        AuditEvent::UsernameUpdateRejected {
+            user_id,
+            reason,
+            timestamp,
+        } => {
+            tracing::warn!(
+                event = "username_update_rejected",
+                user_id = ?user_id,
+                reason = %reason,
+                timestamp = %timestamp,
+                "Username update rejected"
             );
         }
     }

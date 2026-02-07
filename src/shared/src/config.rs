@@ -23,6 +23,8 @@ pub struct Config {
     pub jwt_secret: String,
     pub access_token_ttl_secs: usize,
     pub refresh_token_ttl_days: u16,
+    pub auth_require_username_on_google_signup: bool,
+    pub username_reserved_values: String,
 
     // OAuth Provider
     pub google_client_id: String,
@@ -54,6 +56,9 @@ pub struct Config {
     pub ip_rate_limit_rpm: u64,
     pub like_actions_rpm_limit: u64,
     pub like_actions_window_secs: usize,
+    pub username_signup_rpm_per_ip: u64,
+    pub username_signup_attempts_per_ticket: u64,
+    pub username_update_rpm_per_user: u64,
 
     // OTC Rate Limiting
     pub otc_rate_limit_max_attempts: u32,
@@ -134,6 +139,13 @@ impl Config {
             refresh_token_ttl_days: env::var("REFRESH_TOKEN_TTL_DAYS")
                 .unwrap_or_else(|_| "14".to_string())
                 .parse()?,
+            auth_require_username_on_google_signup: env::var(
+                "AUTH_REQUIRE_USERNAME_ON_GOOGLE_SIGNUP",
+            )
+            .unwrap_or_else(|_| "true".to_string())
+            .parse()
+            .unwrap_or(true),
+            username_reserved_values: env::var("USERNAME_RESERVED_VALUES").unwrap_or_default(),
 
             // OAuth Provider
             google_client_id: env::var("GOOGLE_CLIENT_ID").expect("GOOGLE_CLIENT_ID must be set"),
@@ -194,6 +206,15 @@ impl Config {
                 .parse()?,
             like_actions_window_secs: env::var("LIKE_ACTIONS_WINDOW_SECS")
                 .unwrap_or_else(|_| "60".to_string())
+                .parse()?,
+            username_signup_rpm_per_ip: env::var("USERNAME_SIGNUP_RPM_PER_IP")
+                .unwrap_or_else(|_| "20".to_string())
+                .parse()?,
+            username_signup_attempts_per_ticket: env::var("USERNAME_SIGNUP_ATTEMPTS_PER_TICKET")
+                .unwrap_or_else(|_| "10".to_string())
+                .parse()?,
+            username_update_rpm_per_user: env::var("USERNAME_UPDATE_RPM_PER_USER")
+                .unwrap_or_else(|_| "5".to_string())
                 .parse()?,
 
             // OTC Rate Limiting

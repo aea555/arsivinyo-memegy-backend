@@ -100,6 +100,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/auth/refresh", post(auth::handlers::refresh_token))
         .route("/auth/logout", post(auth::handlers::logout))
         .route(
+            "/auth/signup/complete",
+            post(auth::handlers::signup_complete),
+        )
+        .route(
             "/auth/extension/session",
             post(auth::handlers::create_extension_session),
         )

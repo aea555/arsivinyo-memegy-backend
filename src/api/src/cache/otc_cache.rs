@@ -5,13 +5,26 @@ use shared::queue::QueueService;
 
 /// Token data stored temporarily for OTC exchange
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct OtcTokenData {
+pub struct OtcAuthTokenData {
     pub access_token: String,
     pub refresh_token: String,
     pub user_id: uuid::Uuid,
     pub username: String,
     pub email: String,
     pub avatar_url: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct OtcSignupRequiredData {
+    pub signup_ticket: String,
+    pub suggested_username: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OtcTokenData {
+    AuthSuccess(OtcAuthTokenData),
+    SignupRequired(OtcSignupRequiredData),
 }
 
 /// Service for storing and retrieving one-time codes

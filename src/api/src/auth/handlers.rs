@@ -1,6 +1,7 @@
 use axum::{
     Json,
-    extract::{Query, State},
+    extract::{ConnectInfo, Query, State},
+    http::StatusCode,
     response::IntoResponse,
 };
 use axum_extra::extract::cookie::Cookie;
@@ -12,9 +13,14 @@ use axum_extra::{
 use crate::{
     audit::logger::{AuditEvent, log_audit_event},
     auth::extractors::AuthUser,
+    cache::otc_cache::{OtcAuthTokenData, OtcSignupRequiredData, OtcTokenData},
     error::{ApiErrorResponse, ApiResult},
     metrics::*,
     state::AppState,
+    users::username::{
+        USERNAME_MAX_LEN, USERNAME_MIN_LEN, USERNAME_PATTERN, suggest_username_from_google_name,
+        validate_username,
+    },
 };
 use axum::response::Redirect;
 use axum_extra::extract::cookie::{CookieJar, SameSite};
@@ -23,22 +29,107 @@ use oauth2::{
     AuthType, AuthUrl, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge, PkceCodeVerifier,
     RedirectUrl, Scope, TokenUrl, basic::BasicClient,
 };
+use redis::AsyncCommands;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use shared::entities::{extension_sessions, refresh_tokens, users};
 use shared::security::{
-    compute_code_challenge, create_access_token, create_extension_access_token,
+    compute_code_challenge, create_access_token, create_extension_access_token, generate_otc,
     generate_refresh_token, hash_token, validate_code_verifier,
 };
+use tokio::time::{Duration as TokioDuration, sleep};
 use uuid::Uuid;
 
 use super::constants::*;
 use super::dtos::*;
-use super::service::AuthService;
+use super::service::{AuthService, RegisterUserError};
 
 #[derive(Debug)]
 struct OAuthState {
     source: String,
     code_challenge: Option<String>,
+}
+
+const SIGNUP_TICKET_TTL_SECS: usize = 600;
+const SIGNUP_RESULT_TTL_SECS: usize = 600;
+const SIGNUP_LOCK_TTL_SECS: usize = 15;
+const SIGNUP_LOCK_POLL_RETRIES: usize = 8;
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
+struct SignupTicketData {
+    google_id: String,
+    email: String,
+    avatar_url: String,
+    source: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+fn signup_ticket_key(ticket: &str) -> String {
+    format!("signup:ticket:{}", ticket)
+}
+
+fn signup_result_key(ticket: &str) -> String {
+    format!("signup:result:{}", ticket)
+}
+
+fn signup_lock_key(ticket: &str) -> String {
+    format!("signup:lock:{}", ticket)
+}
+
+async fn read_signup_result(state: &AppState, signup_ticket: &str) -> Option<AuthResponse> {
+    let key = signup_result_key(signup_ticket);
+    let mut conn = state.queue.get_conn().await.ok()?;
+    let cached: Option<String> = conn.get(key).await.ok()?;
+    cached.and_then(|json| serde_json::from_str::<AuthResponse>(&json).ok())
+}
+
+async fn write_signup_result(
+    state: &AppState,
+    signup_ticket: &str,
+    response: &AuthResponse,
+) -> anyhow::Result<()> {
+    let key = signup_result_key(signup_ticket);
+    let json = serde_json::to_string(response)?;
+    let mut conn = state.queue.get_conn().await?;
+    let _: () = redis::cmd("SET")
+        .arg(&key)
+        .arg(&json)
+        .arg("EX")
+        .arg(SIGNUP_RESULT_TTL_SECS)
+        .query_async(&mut conn)
+        .await?;
+    Ok(())
+}
+
+async fn read_signup_ticket(state: &AppState, signup_ticket: &str) -> Option<SignupTicketData> {
+    let key = signup_ticket_key(signup_ticket);
+    let mut conn = state.queue.get_conn().await.ok()?;
+    let raw: Option<String> = conn.get(key).await.ok()?;
+    raw.and_then(|json| serde_json::from_str::<SignupTicketData>(&json).ok())
+}
+
+async fn write_signup_ticket(
+    state: &AppState,
+    signup_ticket: &str,
+    data: &SignupTicketData,
+) -> anyhow::Result<()> {
+    let key = signup_ticket_key(signup_ticket);
+    let json = serde_json::to_string(data)?;
+    let mut conn = state.queue.get_conn().await?;
+    let _: () = redis::cmd("SET")
+        .arg(&key)
+        .arg(&json)
+        .arg("EX")
+        .arg(SIGNUP_TICKET_TTL_SECS)
+        .query_async(&mut conn)
+        .await?;
+    Ok(())
+}
+
+async fn delete_signup_ticket(state: &AppState, signup_ticket: &str) {
+    let key = signup_ticket_key(signup_ticket);
+    if let Ok(mut conn) = state.queue.get_conn().await {
+        let _: Result<(), _> = conn.del(key).await;
+    }
 }
 
 fn parse_oauth_state(state: &str) -> Result<OAuthState, &'static str> {
@@ -121,7 +212,7 @@ pub async fn google_login(
     let mut code_challenge: Option<String> = None;
     let mut code_verifier: Option<String> = None;
 
-    if query.code_challenge.is_some() || query.code_verifier.is_some() || source == SOURCE_MOBILE {
+    if query.code_challenge.is_some() || query.code_verifier.is_some() {
         match query.code_challenge_method.as_deref() {
             Some(method) if method == PKCE_METHOD_S256 => {}
             Some(method) if method == PKCE_METHOD_PLAIN => {
@@ -135,6 +226,12 @@ pub async fn google_login(
                 ));
             }
         }
+    }
+
+    if source == SOURCE_MOBILE && query.code_verifier.is_none() {
+        return Err(ApiErrorResponse::bad_request(
+            "PKCE required for mobile flows: code_verifier and code_challenge_method=S256",
+        ));
     }
 
     if let Some(verifier) = query.code_verifier.clone() {
@@ -325,43 +422,96 @@ pub async fn google_callback(
         ApiErrorResponse::unauthorized("Failed to verify Google authentication")
     })?;
 
-    let (access_token, refresh_token, user) = AuthService::login_or_register(
-        &state.db,
-        google_user,
-        &state.config.jwt_secret,
-        state.config.access_token_ttl_secs,
-        state.config.refresh_token_ttl_days,
-    )
-    .await
-    .map_err(|e| {
-        tracing::error!("Login/register failed: {:?}", e);
-        ApiErrorResponse::internal_error("Failed to complete authentication")
-    })?;
-
     // Capture pkce_validated flag before oauth_state is consumed
     let pkce_validated = oauth_state.code_challenge.is_some();
+    let token_data = if let Some((access_token, refresh_token, user)) =
+        AuthService::login_existing_user(
+            &state.db,
+            google_user.clone(),
+            &state.config.jwt_secret,
+            state.config.access_token_ttl_secs,
+            state.config.refresh_token_ttl_days,
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!("Existing login failed: {:?}", e);
+            ApiErrorResponse::internal_error("Failed to complete authentication")
+        })? {
+        log_audit_event(AuditEvent::OAuthCallbackSuccess {
+            user_id: user.id,
+            source: oauth_state.source.clone(),
+            pkce_validated,
+            timestamp: Utc::now(),
+        });
 
-    // Audit log: OAuth callback success
-    log_audit_event(AuditEvent::OAuthCallbackSuccess {
-        user_id: user.id,
-        source: oauth_state.source.clone(),
-        pkce_validated,
-        timestamp: Utc::now(),
-    });
+        OtcTokenData::AuthSuccess(OtcAuthTokenData {
+            access_token,
+            refresh_token,
+            user_id: user.id,
+            username: user.username,
+            email: user.email,
+            avatar_url: user.avatar_url,
+        })
+    } else if state.config.auth_require_username_on_google_signup {
+        let signup_ticket = generate_otc();
+        let suggested_username = suggest_username_from_google_name(&google_user.name);
+        let ticket_data = SignupTicketData {
+            google_id: google_user.id,
+            email: google_user.email,
+            avatar_url: google_user.picture,
+            source: oauth_state.source.clone(),
+            created_at: Utc::now(),
+        };
 
-    // Generate OTC and store tokens
-    use crate::cache::otc_cache::OtcTokenData;
-    use shared::security::generate_otc;
+        write_signup_ticket(&state, &signup_ticket, &ticket_data)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to persist signup ticket: {:?}", e);
+                ApiErrorResponse::internal_error("Failed to complete authentication")
+            })?;
+
+        USERNAME_SIGNUP_REQUIRED_TOTAL.inc();
+        log_audit_event(AuditEvent::UsernameSignupRequired {
+            source: oauth_state.source.clone(),
+            timestamp: Utc::now(),
+        });
+
+        OtcTokenData::SignupRequired(OtcSignupRequiredData {
+            signup_ticket,
+            suggested_username,
+        })
+    } else {
+        let (access_token, refresh_token, user) = AuthService::login_or_register(
+            &state.db,
+            google_user,
+            &state.config.jwt_secret,
+            state.config.access_token_ttl_secs,
+            state.config.refresh_token_ttl_days,
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!("Login/register failed: {:?}", e);
+            ApiErrorResponse::internal_error("Failed to complete authentication")
+        })?;
+
+        log_audit_event(AuditEvent::OAuthCallbackSuccess {
+            user_id: user.id,
+            source: oauth_state.source.clone(),
+            pkce_validated,
+            timestamp: Utc::now(),
+        });
+
+        OtcTokenData::AuthSuccess(OtcAuthTokenData {
+            access_token,
+            refresh_token,
+            user_id: user.id,
+            username: user.username,
+            email: user.email,
+            avatar_url: user.avatar_url,
+        })
+    };
 
     let otc = generate_otc();
-    let token_data = OtcTokenData {
-        access_token,
-        refresh_token,
-        user_id: user.id,
-        username: user.username.clone(),
-        email: user.email.clone(),
-        avatar_url: user.avatar_url.clone(),
-    };
 
     state
         .otc_cache
@@ -442,6 +592,197 @@ pub async fn refresh_token(
         access_token: new_access_token,
         refresh_token: new_refresh_token,
     }))
+}
+
+pub async fn signup_complete(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    Json(payload): Json<SignupCompleteRequest>,
+) -> ApiResult<Json<AuthResponse>> {
+    let validated = validate_username(&payload.username, &state.config).map_err(|e| {
+        log_audit_event(AuditEvent::UsernameSignupFailed {
+            reason: format!("invalid_username:{}", e.message()),
+            timestamp: Utc::now(),
+        });
+        ApiErrorResponse::bad_request(e.message())
+    })?;
+
+    let client_ip = addr.ip().to_string();
+    let ip_rate_key =
+        crate::services::rate_limiter::RateLimiter::username_signup_ip_key(&client_ip);
+    match state
+        .rate_limiter
+        .check_and_increment(&ip_rate_key, state.config.username_signup_rpm_per_ip, 60)
+        .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(_)) => {
+            USERNAME_RATE_LIMIT_EXCEEDED_TOTAL.inc();
+            return Err(ApiErrorResponse::too_many_requests(
+                "Too many username setup attempts from this IP",
+            ));
+        }
+        Err(e) => {
+            tracing::warn!("Signup IP rate limit check failed (fail-open): {:?}", e);
+        }
+    }
+
+    let ticket_rate_key = crate::services::rate_limiter::RateLimiter::username_signup_ticket_key(
+        &payload.signup_ticket,
+    );
+    match state
+        .rate_limiter
+        .check_and_increment(
+            &ticket_rate_key,
+            state.config.username_signup_attempts_per_ticket,
+            SIGNUP_TICKET_TTL_SECS,
+        )
+        .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(_)) => {
+            USERNAME_RATE_LIMIT_EXCEEDED_TOTAL.inc();
+            return Err(ApiErrorResponse::too_many_requests(
+                "Too many username setup attempts for this signup session",
+            ));
+        }
+        Err(e) => {
+            tracing::warn!("Signup ticket rate limit check failed (fail-open): {:?}", e);
+        }
+    }
+
+    if let Some(existing) = read_signup_result(&state, &payload.signup_ticket).await {
+        return Ok(Json(existing));
+    }
+
+    let lock_key = signup_lock_key(&payload.signup_ticket);
+    let lock_value = Uuid::new_v4().to_string();
+    let mut lock_enabled = false;
+    let mut lock_acquired = false;
+
+    if let Ok(mut conn) = state.queue.get_conn().await {
+        lock_enabled = true;
+        let set_result: Option<String> = redis::cmd("SET")
+            .arg(&lock_key)
+            .arg(&lock_value)
+            .arg("NX")
+            .arg("EX")
+            .arg(SIGNUP_LOCK_TTL_SECS)
+            .query_async(&mut conn)
+            .await
+            .ok();
+        lock_acquired = set_result.is_some();
+    } else {
+        tracing::warn!("Redis unavailable for signup lock (continuing without lock)");
+    }
+
+    if lock_enabled && !lock_acquired {
+        for _ in 0..SIGNUP_LOCK_POLL_RETRIES {
+            sleep(TokioDuration::from_millis(125)).await;
+            if let Some(existing) = read_signup_result(&state, &payload.signup_ticket).await {
+                return Ok(Json(existing));
+            }
+        }
+        return Err(ApiErrorResponse::too_many_requests(
+            "Signup completion already in progress, retry shortly",
+        ));
+    }
+
+    let result = async {
+        if let Some(existing) = read_signup_result(&state, &payload.signup_ticket).await {
+            return Ok(Json(existing));
+        }
+
+        let signup_ticket_data = read_signup_ticket(&state, &payload.signup_ticket)
+            .await
+            .ok_or_else(|| {
+                log_audit_event(AuditEvent::UsernameSignupFailed {
+                    reason: "invalid_or_expired_ticket".to_string(),
+                    timestamp: Utc::now(),
+                });
+                ApiErrorResponse::unauthorized("Invalid or expired signup ticket")
+            })?;
+
+        let google_user = super::service::GoogleUserResult {
+            id: signup_ticket_data.google_id,
+            email: signup_ticket_data.email,
+            verified_email: true,
+            name: String::new(),
+            picture: signup_ticket_data.avatar_url,
+        };
+
+        let (access_token, refresh_token, user) = match AuthService::register_with_username(
+            &state.db,
+            google_user,
+            validated.original,
+            validated.normalized,
+            &state.config.jwt_secret,
+            state.config.access_token_ttl_secs,
+            state.config.refresh_token_ttl_days,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(RegisterUserError::UsernameTaken) => {
+                USERNAME_SIGNUP_CONFLICT_TOTAL.inc();
+                log_audit_event(AuditEvent::UsernameSignupFailed {
+                    reason: "username_taken".to_string(),
+                    timestamp: Utc::now(),
+                });
+                return Err(ApiErrorResponse::conflict("Username already taken"));
+            }
+            Err(RegisterUserError::Other(e)) => {
+                tracing::error!("Signup completion failed: {:?}", e);
+                log_audit_event(AuditEvent::UsernameSignupFailed {
+                    reason: "internal_error".to_string(),
+                    timestamp: Utc::now(),
+                });
+                return Err(ApiErrorResponse::internal_error(
+                    "Failed to complete signup",
+                ));
+            }
+        };
+
+        let response = AuthResponse {
+            access_token,
+            refresh_token,
+            user: UserDto {
+                id: user.id,
+                username: user.username,
+                email: user.email,
+                avatar_url: user.avatar_url,
+            },
+        };
+
+        if let Err(e) = write_signup_result(&state, &payload.signup_ticket, &response).await {
+            tracing::warn!("Failed to cache signup idempotency result: {:?}", e);
+        }
+        delete_signup_ticket(&state, &payload.signup_ticket).await;
+
+        USERNAME_SIGNUP_COMPLETE_TOTAL.inc();
+        log_audit_event(AuditEvent::UsernameSignupCompleted {
+            user_id: response.user.id,
+            timestamp: Utc::now(),
+        });
+
+        Ok(Json(response))
+    }
+    .await;
+
+    if lock_enabled && lock_acquired {
+        if let Ok(mut conn) = state.queue.get_conn().await {
+            let script = redis::Script::new(
+                "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end",
+            );
+            let _: Result<i32, _> = script
+                .key(&lock_key)
+                .arg(&lock_value)
+                .invoke_async(&mut conn)
+                .await;
+        }
+    }
+
+    result
 }
 
 pub async fn create_extension_session(
@@ -597,9 +938,9 @@ pub async fn dev_login(
 /// Exchange one-time code for access/refresh tokens
 pub async fn exchange_otc(
     State(state): State<AppState>,
-    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Json(payload): Json<ExchangeOtcRequest>,
-) -> ApiResult<Json<ExchangeOtcResponse>> {
+) -> ApiResult<impl IntoResponse> {
     let client_ip = addr.ip().to_string();
     let timer = OTC_EXCHANGE_DURATION.start_timer();
 
@@ -643,26 +984,43 @@ pub async fn exchange_otc(
             ApiErrorResponse::bad_request("Invalid or expired code")
         })?;
 
-    // Audit log: OTC exchange success
-    log_audit_event(AuditEvent::OtcExchangeSuccess {
-        user_id: token_data.user_id,
-        client_ip,
-        timestamp: Utc::now(),
-    });
-
     OTC_EXCHANGES_TOTAL.inc();
     timer.observe_duration();
 
-    let response = ExchangeOtcResponse {
-        access_token: token_data.access_token,
-        refresh_token: token_data.refresh_token,
-        user: UserDto {
-            id: token_data.user_id,
-            username: token_data.username,
-            email: token_data.email,
-            avatar_url: token_data.avatar_url,
-        },
-    };
+    match token_data {
+        OtcTokenData::AuthSuccess(token_data) => {
+            log_audit_event(AuditEvent::OtcExchangeSuccess {
+                user_id: token_data.user_id,
+                client_ip,
+                timestamp: Utc::now(),
+            });
 
-    Ok(Json(response))
+            let response = ExchangeOtcResponse {
+                access_token: token_data.access_token,
+                refresh_token: token_data.refresh_token,
+                user: UserDto {
+                    id: token_data.user_id,
+                    username: token_data.username,
+                    email: token_data.email,
+                    avatar_url: token_data.avatar_url,
+                },
+            };
+
+            Ok((StatusCode::OK, Json(response)).into_response())
+        }
+        OtcTokenData::SignupRequired(signup_data) => {
+            let response = UsernameRequiredResponse {
+                error: "username_required".to_string(),
+                signup_ticket: signup_data.signup_ticket,
+                suggested_username: signup_data.suggested_username,
+                rules: UsernameRulesDto {
+                    min_length: USERNAME_MIN_LEN,
+                    max_length: USERNAME_MAX_LEN,
+                    pattern: USERNAME_PATTERN.to_string(),
+                },
+            };
+
+            Ok((StatusCode::CONFLICT, Json(response)).into_response())
+        }
+    }
 }

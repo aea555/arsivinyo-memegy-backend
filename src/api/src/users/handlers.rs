@@ -20,20 +20,33 @@ use tokio::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::{
+    audit::logger::{AuditEvent, log_audit_event},
     auth::{dtos::UserDto, service::AuthService},
     error::{ApiErrorResponse, ApiResult},
-    metrics::WS_CONNECTION_REJECTED_TOTAL,
+    metrics::{
+        USERNAME_RATE_LIMIT_EXCEEDED_TOTAL, USERNAME_UPDATE_CONFLICT_TOTAL, USERNAME_UPDATE_TOTAL,
+        WS_CONNECTION_REJECTED_TOTAL,
+    },
     realtime::{hub::HubRegisterError, messages::RealtimeSignalMessage},
     services::rate_limiter::RateLimiter,
     state::AppState,
+    users::username::{
+        is_username_unique_violation, username_exists_case_insensitive, validate_username,
+    },
 };
 
-use super::dtos::UserVideoDto;
+use super::dtos::{UpdateUsernameRequest, UserVideoDto};
 
 #[derive(Deserialize)]
 pub struct PaginationQuery {
     pub page: Option<u64>,
     pub per_page: Option<u64>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct UsernameUpdateIdempotencyRecord {
+    request_fingerprint: String,
+    response: UserDto,
 }
 
 pub(crate) fn video_model_to_user_dto(
@@ -268,6 +281,170 @@ pub async fn get_my_videos(
     }
 
     Ok(Json(dtos))
+}
+
+pub async fn update_username(
+    State(state): State<AppState>,
+    TypedHeader(auth): TypedHeader<Authorization<Bearer>>,
+    headers: HeaderMap,
+    Json(payload): Json<UpdateUsernameRequest>,
+) -> ApiResult<Json<UserDto>> {
+    let token = auth.token();
+    let claims = AuthService::validate_token(token, &state.config.jwt_secret)
+        .map_err(|_| ApiErrorResponse::unauthorized("Invalid token"))?;
+    if state.token_revocation.is_revoked(claims.jti).await {
+        return Err(ApiErrorResponse::unauthorized("Token revoked"));
+    }
+
+    let user_id = claims.sub;
+    let rate_key = RateLimiter::username_update_user_key(&user_id);
+    match state
+        .rate_limiter
+        .check_and_increment(&rate_key, state.config.username_update_rpm_per_user, 60)
+        .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(_)) => {
+            USERNAME_RATE_LIMIT_EXCEEDED_TOTAL.inc();
+            log_audit_event(AuditEvent::UsernameUpdateRejected {
+                user_id: Some(user_id),
+                reason: "rate_limit_exceeded".to_string(),
+                timestamp: chrono::Utc::now(),
+            });
+            return Err(ApiErrorResponse::too_many_requests(
+                "Too many username update attempts",
+            ));
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Username update rate limit check failed (fail-open): {:?}",
+                e
+            );
+        }
+    }
+
+    let validated = validate_username(&payload.username, &state.config).map_err(|e| {
+        log_audit_event(AuditEvent::UsernameUpdateRejected {
+            user_id: Some(user_id),
+            reason: format!("invalid_username:{}", e.message()),
+            timestamp: chrono::Utc::now(),
+        });
+        ApiErrorResponse::bad_request(e.message())
+    })?;
+
+    let idempotency_key = headers
+        .get("Idempotency-Key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    let idempotency_cache_key = idempotency_key
+        .as_ref()
+        .map(|key| format!("user:{}:username:update:idempotency:{}", user_id, key));
+
+    if let Some(ref cache_key) = idempotency_cache_key {
+        if let Ok(mut conn) = state.queue.get_conn().await {
+            if let Ok(raw) = conn.get::<_, String>(cache_key).await {
+                if let Ok(record) = serde_json::from_str::<UsernameUpdateIdempotencyRecord>(&raw) {
+                    if record.request_fingerprint != validated.normalized {
+                        return Err(ApiErrorResponse::conflict("idempotency_key_reuse_mismatch"));
+                    }
+                    return Ok(Json(record.response));
+                }
+            }
+        }
+    }
+
+    let user = users::Entity::find_by_id(user_id)
+        .one(&state.db)
+        .await
+        .map_err(ApiErrorResponse::db_error)?
+        .ok_or_else(|| ApiErrorResponse::not_found("User not found"))?;
+
+    let current_normalized = user
+        .username_normalized
+        .clone()
+        .unwrap_or_else(|| user.username.to_ascii_lowercase());
+
+    if current_normalized == validated.normalized && user.username == validated.original {
+        let response = UserDto {
+            id: user.id,
+            username: user.username,
+            email: user.email,
+            avatar_url: user.avatar_url,
+        };
+        if let Some(ref cache_key) = idempotency_cache_key {
+            if let Ok(mut conn) = state.queue.get_conn().await {
+                let record = UsernameUpdateIdempotencyRecord {
+                    request_fingerprint: validated.normalized,
+                    response: response.clone(),
+                };
+                if let Ok(json) = serde_json::to_string(&record) {
+                    let _: Result<(), _> = conn.set_ex(cache_key, json, 600).await;
+                }
+            }
+        }
+        return Ok(Json(response));
+    }
+
+    if username_exists_case_insensitive(&state.db, &validated.normalized, Some(user_id))
+        .await
+        .map_err(ApiErrorResponse::db_error)?
+    {
+        USERNAME_UPDATE_CONFLICT_TOTAL.inc();
+        log_audit_event(AuditEvent::UsernameUpdateRejected {
+            user_id: Some(user_id),
+            reason: "username_taken".to_string(),
+            timestamp: chrono::Utc::now(),
+        });
+        return Err(ApiErrorResponse::conflict("Username already taken"));
+    }
+
+    let mut active_model: users::ActiveModel = user.into();
+    active_model.username = Set(validated.original);
+    active_model.username_normalized = Set(Some(validated.normalized.clone()));
+    active_model.username_updated_at = Set(Some(chrono::Utc::now().fixed_offset()));
+
+    let updated = active_model.update(&state.db).await.map_err(|e| {
+        if is_username_unique_violation(&e) {
+            USERNAME_UPDATE_CONFLICT_TOTAL.inc();
+            ApiErrorResponse::conflict("Username already taken")
+        } else {
+            ApiErrorResponse::db_error(e)
+        }
+    })?;
+
+    if let Ok(mut conn) = state.queue.get_conn().await {
+        let _: Result<(), _> = conn.del(&format!("user:{}:profile", user_id)).await;
+    }
+
+    let response = UserDto {
+        id: updated.id,
+        username: updated.username,
+        email: updated.email,
+        avatar_url: updated.avatar_url,
+    };
+
+    if let Some(ref cache_key) = idempotency_cache_key {
+        if let Ok(mut conn) = state.queue.get_conn().await {
+            let record = UsernameUpdateIdempotencyRecord {
+                request_fingerprint: validated.normalized,
+                response: response.clone(),
+            };
+            if let Ok(json) = serde_json::to_string(&record) {
+                let _: Result<(), _> = conn.set_ex(cache_key, json, 600).await;
+            }
+        }
+    }
+
+    USERNAME_UPDATE_TOTAL.inc();
+    log_audit_event(AuditEvent::UsernameUpdated {
+        user_id,
+        timestamp: chrono::Utc::now(),
+    });
+
+    Ok(Json(response))
 }
 
 /// GET /users/me/videos/ws

@@ -15,14 +15,14 @@ pub struct GoogleCallbackQuery {
     pub state: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct AuthResponse {
     pub access_token: String,
     pub refresh_token: String,
     pub user: UserDto,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct UserDto {
     pub id: Uuid,
     pub username: String,
@@ -58,6 +58,27 @@ pub struct ExchangeOtcResponse {
     pub access_token: String,
     pub refresh_token: String,
     pub user: UserDto,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct UsernameRulesDto {
+    pub min_length: usize,
+    pub max_length: usize,
+    pub pattern: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct UsernameRequiredResponse {
+    pub error: String,
+    pub signup_ticket: String,
+    pub suggested_username: String,
+    pub rules: UsernameRulesDto,
+}
+
+#[derive(Deserialize)]
+pub struct SignupCompleteRequest {
+    pub signup_ticket: String,
+    pub username: String,
 }
 
 #[derive(Deserialize)]

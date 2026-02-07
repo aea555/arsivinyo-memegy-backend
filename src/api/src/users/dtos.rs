@@ -16,3 +16,8 @@ pub struct UserVideoDto {
     pub processing_error_code: Option<String>,
     pub processing_error_message: Option<String>,
 }
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateUsernameRequest {
+    pub username: String,
+}

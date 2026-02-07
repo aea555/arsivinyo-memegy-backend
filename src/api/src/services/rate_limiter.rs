@@ -133,6 +133,21 @@ impl RateLimiter {
         format!("ratelimit:ws:connect:user:{}", user_id)
     }
 
+    /// Generate key for username signup completion attempts per IP
+    pub fn username_signup_ip_key(ip: &str) -> String {
+        format!("ratelimit:username:signup:ip:{}", ip)
+    }
+
+    /// Generate key for username signup completion attempts per signup ticket
+    pub fn username_signup_ticket_key(ticket: &str) -> String {
+        format!("ratelimit:username:signup:ticket:{}", ticket)
+    }
+
+    /// Generate key for username update requests per user
+    pub fn username_update_user_key(user_id: &uuid::Uuid) -> String {
+        format!("ratelimit:username:update:user:{}", user_id)
+    }
+
     /// Generate key for keyboard search RPM limit per user
     pub fn keyboard_search_user_rpm_key(user_id: &uuid::Uuid) -> String {
         format!("ratelimit:keyboard:search:user:{}", user_id)

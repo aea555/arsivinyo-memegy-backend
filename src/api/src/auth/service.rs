@@ -1,4 +1,5 @@
 use crate::auth::revocation::TokenRevocationService;
+use crate::users::username::{is_username_unique_violation, username_exists_case_insensitive};
 use anyhow::{Result, anyhow};
 use chrono::{Duration, Utc};
 use sea_orm::*;
@@ -10,7 +11,7 @@ use shared::security::{
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 pub struct GoogleUserResult {
     pub id: String,
     pub email: String,
@@ -20,6 +21,11 @@ pub struct GoogleUserResult {
 }
 
 pub struct AuthService;
+
+pub enum RegisterUserError {
+    UsernameTaken,
+    Other(anyhow::Error),
+}
 
 impl AuthService {
     pub async fn verify_google_code(
@@ -102,13 +108,37 @@ impl AuthService {
         Ok(user_data)
     }
 
-    pub async fn login_or_register(
+    pub async fn issue_tokens_for_user(
+        db: &DatabaseConnection,
+        user: &users::Model,
+        jwt_secret: &str,
+        access_token_ttl_secs: usize,
+        refresh_token_ttl_days: u16,
+    ) -> Result<(String, String)> {
+        let access_token = create_access_token(user.id, jwt_secret, access_token_ttl_secs)?;
+        let refresh_token = generate_refresh_token();
+        let refresh_token_hash = hash_token(&refresh_token)?;
+
+        let expires_at = Utc::now() + Duration::days(refresh_token_ttl_days as i64);
+        let rt_model = refresh_tokens::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            user_id: Set(user.id),
+            token_hash: Set(refresh_token_hash),
+            expires_at: Set(expires_at.into()),
+            ..Default::default()
+        };
+        rt_model.insert(db).await?;
+
+        Ok((access_token, refresh_token))
+    }
+
+    pub async fn login_existing_user(
         db: &DatabaseConnection,
         google_user: GoogleUserResult,
         jwt_secret: &str,
         access_token_ttl_secs: usize,
         refresh_token_ttl_days: u16,
-    ) -> Result<(String, String, users::Model)> {
+    ) -> Result<Option<(String, String, users::Model)>> {
         if !google_user.verified_email {
             return Err(anyhow!("Email not verified by Google"));
         }
@@ -136,35 +166,144 @@ impl AuthService {
 
                 active_model.update(db).await?
             }
+            None => return Ok(None),
+        };
+
+        let (access_token, refresh_token) = Self::issue_tokens_for_user(
+            db,
+            &user,
+            jwt_secret,
+            access_token_ttl_secs,
+            refresh_token_ttl_days,
+        )
+        .await?;
+
+        Ok(Some((access_token, refresh_token, user)))
+    }
+
+    pub async fn register_with_username(
+        db: &DatabaseConnection,
+        google_user: GoogleUserResult,
+        username: String,
+        username_normalized: String,
+        jwt_secret: &str,
+        access_token_ttl_secs: usize,
+        refresh_token_ttl_days: u16,
+    ) -> std::result::Result<(String, String, users::Model), RegisterUserError> {
+        if !google_user.verified_email {
+            return Err(RegisterUserError::Other(anyhow!(
+                "Email not verified by Google"
+            )));
+        }
+
+        if username_exists_case_insensitive(db, &username_normalized, None)
+            .await
+            .map_err(|e| RegisterUserError::Other(anyhow!(e.to_string())))?
+        {
+            return Err(RegisterUserError::UsernameTaken);
+        }
+
+        let existing_user = users::Entity::find()
+            .filter(users::Column::GoogleId.eq(&google_user.id))
+            .one(db)
+            .await
+            .map_err(|e| RegisterUserError::Other(anyhow!(e.to_string())))?;
+
+        let user = match existing_user {
+            Some(u) => {
+                let mut active_model: users::ActiveModel = u.into();
+                if active_model.deleted_at.as_ref().is_some() {
+                    active_model.deleted_at = Set(None);
+                }
+                active_model.avatar_url = Set(Some(google_user.picture));
+                active_model.update(db).await.map_err(|e| {
+                    if is_username_unique_violation(&e) {
+                        RegisterUserError::UsernameTaken
+                    } else {
+                        RegisterUserError::Other(anyhow!(e.to_string()))
+                    }
+                })?
+            }
             None => {
+                let now = Utc::now().fixed_offset();
                 let new_user = users::ActiveModel {
                     id: Set(Uuid::new_v4()),
                     google_id: Set(google_user.id),
-                    username: Set(google_user.name),
+                    username: Set(username),
+                    username_normalized: Set(Some(username_normalized)),
                     email: Set(google_user.email),
                     avatar_url: Set(Some(google_user.picture)),
+                    username_updated_at: Set(Some(now)),
                     ..Default::default()
                 };
-                new_user.insert(db).await?
+                new_user.insert(db).await.map_err(|e| {
+                    if is_username_unique_violation(&e) {
+                        RegisterUserError::UsernameTaken
+                    } else {
+                        RegisterUserError::Other(anyhow!(e.to_string()))
+                    }
+                })?
             }
         };
 
-        let access_token = create_access_token(user.id, jwt_secret, access_token_ttl_secs)?;
-        let refresh_token = generate_refresh_token();
-        let refresh_token_hash = hash_token(&refresh_token)?;
+        let (access_token, refresh_token) = Self::issue_tokens_for_user(
+            db,
+            &user,
+            jwt_secret,
+            access_token_ttl_secs,
+            refresh_token_ttl_days,
+        )
+        .await
+        .map_err(RegisterUserError::Other)?;
 
-        // Store Refresh Token
-        let expires_at = Utc::now() + Duration::days(refresh_token_ttl_days as i64);
+        Ok((access_token, refresh_token, user))
+    }
 
-        let rt_model = refresh_tokens::ActiveModel {
+    pub async fn login_or_register(
+        db: &DatabaseConnection,
+        google_user: GoogleUserResult,
+        jwt_secret: &str,
+        access_token_ttl_secs: usize,
+        refresh_token_ttl_days: u16,
+    ) -> Result<(String, String, users::Model)> {
+        if let Some(tokens) = Self::login_existing_user(
+            db,
+            GoogleUserResult {
+                id: google_user.id.clone(),
+                email: google_user.email.clone(),
+                verified_email: google_user.verified_email,
+                name: google_user.name.clone(),
+                picture: google_user.picture.clone(),
+            },
+            jwt_secret,
+            access_token_ttl_secs,
+            refresh_token_ttl_days,
+        )
+        .await?
+        {
+            return Ok(tokens);
+        }
+
+        let new_user = users::ActiveModel {
             id: Set(Uuid::new_v4()),
-            user_id: Set(user.id),
-            token_hash: Set(refresh_token_hash),
-            expires_at: Set(expires_at.into()),
+            google_id: Set(google_user.id),
+            username: Set(google_user.name),
+            username_normalized: Set(None),
+            email: Set(google_user.email),
+            avatar_url: Set(Some(google_user.picture)),
+            username_updated_at: Set(None),
             ..Default::default()
         };
+        let user = new_user.insert(db).await?;
 
-        rt_model.insert(db).await?;
+        let (access_token, refresh_token) = Self::issue_tokens_for_user(
+            db,
+            &user,
+            jwt_secret,
+            access_token_ttl_secs,
+            refresh_token_ttl_days,
+        )
+        .await?;
 
         Ok((access_token, refresh_token, user))
     }

@@ -79,6 +79,31 @@ lazy_static! {
     pub static ref KEYBOARD_TICKET_EXPIRED_TOTAL: IntCounter = IntCounter::with_opts(
         Opts::new("keyboard_ticket_expired_total", "Expired keyboard send-ticket usage attempts")
     ).expect("metric can be created");
+
+    // Username flow metrics
+    pub static ref USERNAME_SIGNUP_REQUIRED_TOTAL: IntCounter = IntCounter::with_opts(
+        Opts::new("username_signup_required_total", "Username-required responses during OAuth completion")
+    ).expect("metric can be created");
+
+    pub static ref USERNAME_SIGNUP_COMPLETE_TOTAL: IntCounter = IntCounter::with_opts(
+        Opts::new("username_signup_complete_total", "Successful username signup completions")
+    ).expect("metric can be created");
+
+    pub static ref USERNAME_SIGNUP_CONFLICT_TOTAL: IntCounter = IntCounter::with_opts(
+        Opts::new("username_signup_conflict_total", "Username signup conflicts")
+    ).expect("metric can be created");
+
+    pub static ref USERNAME_UPDATE_TOTAL: IntCounter = IntCounter::with_opts(
+        Opts::new("username_update_total", "Successful username updates")
+    ).expect("metric can be created");
+
+    pub static ref USERNAME_UPDATE_CONFLICT_TOTAL: IntCounter = IntCounter::with_opts(
+        Opts::new("username_update_conflict_total", "Username update conflicts")
+    ).expect("metric can be created");
+
+    pub static ref USERNAME_RATE_LIMIT_EXCEEDED_TOTAL: IntCounter = IntCounter::with_opts(
+        Opts::new("username_rate_limit_exceeded_total", "Rate limit rejections on username-related endpoints")
+    ).expect("metric can be created");
 }
 
 pub fn register_metrics() {
@@ -98,6 +123,12 @@ pub fn register_metrics() {
     let _ = REGISTRY.register(Box::new(KEYBOARD_SEND_ATTEMPT_TOTAL.clone()));
     let _ = REGISTRY.register(Box::new(KEYBOARD_RATE_LIMIT_TOTAL.clone()));
     let _ = REGISTRY.register(Box::new(KEYBOARD_TICKET_EXPIRED_TOTAL.clone()));
+    let _ = REGISTRY.register(Box::new(USERNAME_SIGNUP_REQUIRED_TOTAL.clone()));
+    let _ = REGISTRY.register(Box::new(USERNAME_SIGNUP_COMPLETE_TOTAL.clone()));
+    let _ = REGISTRY.register(Box::new(USERNAME_SIGNUP_CONFLICT_TOTAL.clone()));
+    let _ = REGISTRY.register(Box::new(USERNAME_UPDATE_TOTAL.clone()));
+    let _ = REGISTRY.register(Box::new(USERNAME_UPDATE_CONFLICT_TOTAL.clone()));
+    let _ = REGISTRY.register(Box::new(USERNAME_RATE_LIMIT_EXCEEDED_TOTAL.clone()));
 }
 
 pub fn metrics_handler() -> String {
