@@ -38,13 +38,19 @@ impl RateLimiter {
     /// Increment the rate limit counter.
     /// Uses Redis INCR with EXPIRE for sliding window.
     pub async fn increment(&self, key: &str, window_secs: usize) -> Result<u64> {
+        self.increment_by(key, 1, window_secs).await
+    }
+
+    /// Increment the rate limit counter by an arbitrary amount.
+    /// Useful for byte-based limits.
+    pub async fn increment_by(&self, key: &str, amount: u64, window_secs: usize) -> Result<u64> {
         match self.queue.get_conn().await {
             Ok(mut conn) => {
                 // Use INCR + EXPIRE for atomic increment with TTL
-                let new_count: u64 = conn.incr(key, 1).await?;
+                let new_count: u64 = conn.incr(key, amount as i64).await?;
 
-                // Set expiry only on first increment (count == 1)
-                if new_count == 1 {
+                // Set expiry only when key is first created.
+                if new_count == amount {
                     let _: () = conn.expire(key, window_secs as i64).await?;
                 }
 

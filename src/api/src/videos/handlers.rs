@@ -36,6 +36,23 @@ use shared::{
 pub struct FeedQuery {
     pub sort: Option<String>, // "latest", "popular", "random"
     pub page: Option<u64>,
+    pub random_seed: Option<String>,
+}
+
+fn normalize_random_seed(seed: Option<&str>) -> Option<String> {
+    let seed = seed?.trim();
+    if seed.is_empty() || seed.len() > 64 {
+        return None;
+    }
+
+    if seed
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        Some(seed.to_string())
+    } else {
+        None
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -96,10 +113,11 @@ pub async fn get_feed(
         "popular" => "popular",
         _ => "random",
     };
-    // Standardize on 1-based pagination for API
-    let page = query.page.unwrap_or(1);
-    let page = if page > 0 { page - 1 } else { 0 };
+    // API pagination is 0-based
+    let page = query.page.unwrap_or(0);
     let page_size = state.config.feed_page_size;
+    let random_seed =
+        normalize_random_seed(query.random_seed.as_deref()).unwrap_or_else(|| user_id.to_string());
 
     // Try cache first (skip for random to keep it truly random)
     if sort != "random" {
@@ -187,9 +205,13 @@ pub async fn get_feed(
         }
         _ => {
             select = select.order_by(
-                sea_orm::sea_query::Expr::cust("RANDOM()"),
+                sea_orm::sea_query::Expr::cust(&format!(
+                    "md5(videos.id::text || '{}')",
+                    random_seed
+                )),
                 sea_orm::Order::Asc,
             );
+            select = select.order_by_asc(videos::Column::Id);
         }
     }
 
@@ -507,7 +529,7 @@ pub async fn confirm_upload(
     let rate_key = crate::services::rate_limiter::RateLimiter::upload_bytes_key(&user_id);
     let _ = state
         .rate_limiter
-        .increment(&rate_key, state.config.rate_limit_window_secs)
+        .increment_by(&rate_key, actual_size, state.config.rate_limit_window_secs)
         .await;
 
     // 6. Update Status and Actual Size
@@ -859,27 +881,6 @@ pub async fn update_video_metadata(
     Path(video_id): Path<Uuid>,
     Json(payload): Json<UpdateVideoRequest>,
 ) -> ApiResult<StatusCode> {
-    // Rate limiting for updates (30/hour per user)
-    let update_rate_key = format!("update:{}:hourly", user_id);
-    match state
-        .rate_limiter
-        .check_and_increment(&update_rate_key, 30, 3600) // 30 updates per hour
-        .await
-    {
-        Ok(Ok(_)) => {
-            // Within limit, continue
-        }
-        Ok(Err(count)) => {
-            return Err(ApiErrorResponse::too_many_requests(format!(
-                "Update rate limit exceeded: {} updates/hour",
-                count
-            )));
-        }
-        Err(_) => {
-            // Redis error - fail open
-        }
-    }
-
     // 1. Validate payload
     if let Some(ref title) = payload.title {
         if title.len() > 200 {
@@ -908,23 +909,31 @@ pub async fn update_video_metadata(
     // 3. Check if video is published (needs cache invalidation)
     let was_published = video.status == "PUBLISHED";
 
-    // 4. Apply updates
+    // 4. Build changes and short-circuit no-op updates before rate limiting
     let mut active: videos::ActiveModel = video.into();
     let mut has_changes = false;
 
     if let Some(title) = payload.title {
-        active.title = Set(Some(title));
-        has_changes = true;
+        let next = Some(title);
+        if active.title.as_ref() != &next {
+            active.title = Set(next);
+            has_changes = true;
+        }
     }
 
     if let Some(description) = payload.description {
-        active.description = Set(Some(description));
-        has_changes = true;
+        let next = Some(description);
+        if active.description.as_ref() != &next {
+            active.description = Set(next);
+            has_changes = true;
+        }
     }
 
     if let Some(is_anonymous) = payload.is_anonymous {
-        active.is_anonymous = Set(is_anonymous);
-        has_changes = true;
+        if active.is_anonymous.as_ref() != &is_anonymous {
+            active.is_anonymous = Set(is_anonymous);
+            has_changes = true;
+        }
     }
 
     // Early return if no changes
@@ -932,10 +941,29 @@ pub async fn update_video_metadata(
         return Ok(StatusCode::OK);
     }
 
+    // 5. Rate limiting for real updates only (30/hour per user)
+    let update_rate_key = format!("update:{}:hourly", user_id);
+    match state
+        .rate_limiter
+        .check_and_increment(&update_rate_key, 30, 3600)
+        .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(count)) => {
+            return Err(ApiErrorResponse::too_many_requests(format!(
+                "Update rate limit exceeded: {} updates/hour",
+                count
+            )));
+        }
+        Err(_) => {
+            // Redis error - fail open
+        }
+    }
+
     active.updated_at = Set(Utc::now().into());
     active.update(&state.db).await?;
 
-    // 5. Invalidate feed cache ONLY if video was published
+    // 6. Invalidate feed cache ONLY if video was published
     if was_published {
         if let Err(e) = invalidate_feed_cache(&state).await {
             tracing::warn!("Failed to invalidate feed cache after update: {:?}", e);
@@ -943,7 +971,7 @@ pub async fn update_video_metadata(
         }
     }
 
-    // 6. Invalidate User's Video List Cache
+    // 7. Invalidate User's Video List Cache
     if let Ok(mut conn) = state.queue.get_conn().await {
         let pattern = format!("user:{}:videos:*", user_id);
         let keys: Vec<String> = conn.keys(&pattern).await.unwrap_or_default();

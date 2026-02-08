@@ -1314,6 +1314,7 @@ paths:
         - `random`: Random order (default)
         - `latest`: Most recent first
         - `popular`: Most liked first
+        - For `random`, pass a stable `random_seed` while paginating to avoid duplicates across pages.
 
         **Pagination:**
         - Page size: 20 videos per page
@@ -1343,6 +1344,15 @@ paths:
             minimum: 0
             default: 0
             example: 0
+        - name: random_seed
+          in: query
+          required: false
+          description: Stable seed for random pagination. Recommended when `sort=random`.
+          schema:
+            type: string
+            maxLength: 64
+            pattern: "^[A-Za-z0-9_-]+$"
+            example: "session_01J8N4T0V4K8"
       responses:
         "200":
           description: Feed retrieved successfully

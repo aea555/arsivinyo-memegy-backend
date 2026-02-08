@@ -192,11 +192,11 @@ async fn feed_pagination_and_sorting_works() {
 
     let client = reqwest::Client::new();
 
-    // 2. Test Pagination (Page 1)
+    // 2. Test Pagination (Page 0)
     let response: Response = client
         .get(&format!("{}/feed", app.address))
         .header("Authorization", format!("Bearer {}", token))
-        .query(&[("page", "1"), ("sort", "latest")])
+        .query(&[("page", "0"), ("sort", "latest")])
         .send()
         .await
         .expect("Failed to get feed");
@@ -212,11 +212,11 @@ async fn feed_pagination_and_sorting_works() {
     // Should return 20 items (page size limit)
     assert_eq!(items.len(), 20);
 
-    // 3. Test Pagination (Page 2)
+    // 3. Test Pagination (Page 1)
     let response: Response = client
         .get(&format!("{}/feed", app.address))
         .header("Authorization", format!("Bearer {}", token))
-        .query(&[("page", "2"), ("sort", "latest")])
+        .query(&[("page", "1"), ("sort", "latest")])
         .send()
         .await
         .expect("Failed to get feed");
@@ -229,11 +229,11 @@ async fn feed_pagination_and_sorting_works() {
     // Find the anonymous video in the response (it might be in page 1 or 2 depending on sort order/insertion time)
     // Since we sort by 'latest' and inserted anonymous last, it should be the FIRST item of Page 1.
 
-    // Check Page 1 again for the anonymous item check
+    // Check Page 0 again for the anonymous item check
     let response: Response = client
         .get(&format!("{}/feed", app.address))
         .header("Authorization", format!("Bearer {}", token))
-        .query(&[("page", "1"), ("sort", "latest")])
+        .query(&[("page", "0"), ("sort", "latest")])
         .send()
         .await
         .expect("Failed to get feed");
@@ -254,6 +254,94 @@ async fn feed_pagination_and_sorting_works() {
         "Regular video should have uploader info"
     );
     assert_eq!(regular_video["uploader"]["username"], "feed_user");
+}
+
+#[tokio::test]
+async fn random_feed_with_seed_is_stable_and_pages_do_not_overlap() {
+    let app = spawn_app().await;
+    let token = app
+        .login_as_dev("random_feed_user", "random-feed@example.com")
+        .await;
+
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use shared::entities::users;
+    use std::collections::HashSet;
+
+    let user = users::Entity::find()
+        .filter(users::Column::Username.eq("random_feed_user"))
+        .one(&app.db)
+        .await
+        .unwrap()
+        .unwrap();
+
+    for _ in 0..45 {
+        app.create_dummy_video(user.id, false).await;
+    }
+
+    let client = reqwest::Client::new();
+    let seed = "session_seed_001";
+
+    let page0: Vec<serde_json::Value> = client
+        .get(&format!("{}/feed", app.address))
+        .header("Authorization", format!("Bearer {}", token))
+        .query(&[("page", "0"), ("sort", "random"), ("random_seed", seed)])
+        .send()
+        .await
+        .expect("Failed to get random page 0")
+        .json()
+        .await
+        .expect("Failed to parse page 0");
+
+    let page1: Vec<serde_json::Value> = client
+        .get(&format!("{}/feed", app.address))
+        .header("Authorization", format!("Bearer {}", token))
+        .query(&[("page", "1"), ("sort", "random"), ("random_seed", seed)])
+        .send()
+        .await
+        .expect("Failed to get random page 1")
+        .json()
+        .await
+        .expect("Failed to parse page 1");
+
+    let page0_again: Vec<serde_json::Value> = client
+        .get(&format!("{}/feed", app.address))
+        .header("Authorization", format!("Bearer {}", token))
+        .query(&[("page", "0"), ("sort", "random"), ("random_seed", seed)])
+        .send()
+        .await
+        .expect("Failed to get random page 0 again")
+        .json()
+        .await
+        .expect("Failed to parse page 0 again");
+
+    assert_eq!(page0.len(), 20);
+    assert_eq!(page1.len(), 20);
+
+    let ids0: Vec<&str> = page0
+        .iter()
+        .map(|v| v["id"].as_str().expect("page0 id missing"))
+        .collect();
+    let ids1: Vec<&str> = page1
+        .iter()
+        .map(|v| v["id"].as_str().expect("page1 id missing"))
+        .collect();
+    let ids0_again: Vec<&str> = page0_again
+        .iter()
+        .map(|v| v["id"].as_str().expect("page0_again id missing"))
+        .collect();
+
+    let set0: HashSet<&str> = ids0.iter().copied().collect();
+    let set1: HashSet<&str> = ids1.iter().copied().collect();
+    let overlap_count = set0.intersection(&set1).count();
+
+    assert_eq!(
+        overlap_count, 0,
+        "Seeded random pages overlapped unexpectedly"
+    );
+    assert_eq!(
+        ids0, ids0_again,
+        "Seeded random ordering for the same page must be stable"
+    );
 }
 
 #[tokio::test]
@@ -328,6 +416,39 @@ async fn video_lifecycle_works() {
         .iter()
         .any(|item| item["id"].as_str().unwrap() == video_id);
     assert!(!found, "Deleted video should not be in feed");
+}
+
+#[tokio::test]
+async fn noop_video_metadata_updates_do_not_hit_update_rate_limit() {
+    let app = spawn_app().await;
+    let client = Client::new();
+    let token = app
+        .login_as_dev("noop_meta_user", "noop-meta@example.com")
+        .await;
+
+    let (video_id, _) = app.init_upload(&token, "noop_meta.mp4", 1024).await;
+    app.confirm_upload(&token, &video_id).await;
+
+    for attempt in 1..=35 {
+        let response = client
+            .patch(&format!("{}/videos/{}", app.address, video_id))
+            .header("Authorization", format!("Bearer {}", token))
+            .json(&serde_json::json!({
+                "is_anonymous": false
+            }))
+            .send()
+            .await
+            .expect("Failed to issue no-op metadata update");
+
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "no-op update failed on attempt {} with status {} and body {}",
+            attempt,
+            response.status(),
+            response.text().await.unwrap_or_default()
+        );
+    }
 }
 
 #[tokio::test]
