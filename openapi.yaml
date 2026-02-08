@@ -596,6 +596,15 @@ components:
           example:
             error: Unauthorized
 
+    ForbiddenError:
+      description: Authenticated but not authorized
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error: Forbidden
+
     TooManyRequestsError:
       description: Rate limit exceeded
       content:
@@ -2044,3 +2053,246 @@ paths:
   #               $ref: "#/components/schemas/BulkDownloadStatus"
   #       "404":
   #         $ref: "#/components/responses/NotFoundError"
+
+  /admin/db/tables:
+    get:
+      tags:
+        - Admin
+      summary: List allowlisted admin tables
+      operationId: adminListTables
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Table list
+          content:
+            application/json:
+              schema:
+                type: object
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+
+  /admin/db/tables/{table}/rows:
+    get:
+      tags:
+        - Admin
+      summary: List rows from an allowlisted table
+      operationId: adminListTableRows
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: path
+          name: table
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: limit
+          required: false
+          schema:
+            type: integer
+        - in: query
+          name: cursor
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Paginated rows
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+
+  /admin/db/tables/{table}/rows/{id}:
+    get:
+      tags:
+        - Admin
+      summary: Get a single row from an allowlisted table
+      operationId: adminGetTableRow
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: path
+          name: table
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Row payload
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+
+  /admin/users/{id}/hard:
+    delete:
+      tags:
+        - Admin
+      summary: Hard-delete a user
+      operationId: adminHardDeleteUser
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Deletion result
+          content:
+            application/json:
+              schema:
+                type: object
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+
+  /admin/videos/{id}/hard:
+    delete:
+      tags:
+        - Admin
+      summary: Hard-delete a video
+      operationId: adminHardDeleteVideo
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Deletion result
+          content:
+            application/json:
+              schema:
+                type: object
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+
+  /admin/download-jobs/{id}/hard:
+    delete:
+      tags:
+        - Admin
+      summary: Hard-delete a download job
+      operationId: adminHardDeleteDownloadJob
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Deletion result
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /admin/send-tickets/{id}/hard:
+    delete:
+      tags:
+        - Admin
+      summary: Hard-delete a send ticket
+      operationId: adminHardDeleteSendTicket
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Deletion result
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /admin/extension-sessions/{id}/hard:
+    delete:
+      tags:
+        - Admin
+      summary: Hard-delete an extension session
+      operationId: adminHardDeleteExtensionSession
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Deletion result
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /admin/refresh-tokens/{id}/hard:
+    delete:
+      tags:
+        - Admin
+      summary: Hard-delete a refresh token
+      operationId: adminHardDeleteRefreshToken
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Deletion result
+          content:
+            application/json:
+              schema:
+                type: object

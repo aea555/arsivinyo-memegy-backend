@@ -1,5 +1,6 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use dotenvy::dotenv;
+use std::collections::HashMap;
 use std::env;
 
 #[derive(Clone, Debug)]
@@ -25,6 +26,14 @@ pub struct Config {
     pub refresh_token_ttl_days: u16,
     pub auth_require_username_on_google_signup: bool,
     pub username_reserved_values: String,
+    pub admin_api_enabled: bool,
+    pub admin_jwt_issuer: Option<String>,
+    pub admin_jwt_audience: Option<String>,
+    pub admin_jwt_public_keys: HashMap<String, String>,
+    pub admin_jwt_max_ttl_secs: usize,
+    pub admin_jwt_clock_skew_secs: usize,
+    pub admin_replay_protection_enabled: bool,
+    pub admin_allowed_ip_cidrs: String,
 
     // OAuth Provider
     pub google_client_id: String,
@@ -103,6 +112,57 @@ impl Config {
     pub fn from_env() -> Result<Self> {
         dotenv().ok();
 
+        let admin_api_enabled = env::var("ADMIN_API_ENABLED")
+            .unwrap_or_else(|_| "false".to_string())
+            .parse()
+            .unwrap_or(false);
+        let admin_jwt_issuer = env::var("ADMIN_JWT_ISSUER")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let admin_jwt_audience = env::var("ADMIN_JWT_AUDIENCE")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let admin_jwt_public_keys_raw = env::var("ADMIN_JWT_PUBLIC_KEYS_JSON").unwrap_or_default();
+        let admin_jwt_public_keys: HashMap<String, String> =
+            if admin_jwt_public_keys_raw.trim().is_empty() {
+                HashMap::new()
+            } else {
+                serde_json::from_str(&admin_jwt_public_keys_raw).map_err(|e| {
+                    anyhow!("ADMIN_JWT_PUBLIC_KEYS_JSON must be valid JSON map: {}", e)
+                })?
+            };
+        let admin_jwt_max_ttl_secs: usize = env::var("ADMIN_JWT_MAX_TTL_SECS")
+            .unwrap_or_else(|_| "300".to_string())
+            .parse()?;
+        let admin_jwt_clock_skew_secs: usize = env::var("ADMIN_JWT_CLOCK_SKEW_SECS")
+            .unwrap_or_else(|_| "60".to_string())
+            .parse()?;
+        let admin_replay_protection_enabled = env::var("ADMIN_REPLAY_PROTECTION_ENABLED")
+            .unwrap_or_else(|_| "true".to_string())
+            .parse()
+            .unwrap_or(true);
+        let admin_allowed_ip_cidrs = env::var("ADMIN_ALLOWED_IP_CIDRS").unwrap_or_default();
+
+        if admin_api_enabled {
+            if admin_jwt_issuer.is_none() {
+                return Err(anyhow!(
+                    "ADMIN_JWT_ISSUER must be set when ADMIN_API_ENABLED=true"
+                ));
+            }
+            if admin_jwt_audience.is_none() {
+                return Err(anyhow!(
+                    "ADMIN_JWT_AUDIENCE must be set when ADMIN_API_ENABLED=true"
+                ));
+            }
+            if admin_jwt_public_keys.is_empty() {
+                return Err(anyhow!(
+                    "ADMIN_JWT_PUBLIC_KEYS_JSON must define at least one key when ADMIN_API_ENABLED=true"
+                ));
+            }
+        }
+
         Ok(Self {
             // Server
             server_host: env::var("SERVER_HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
@@ -146,6 +206,14 @@ impl Config {
             .parse()
             .unwrap_or(true),
             username_reserved_values: env::var("USERNAME_RESERVED_VALUES").unwrap_or_default(),
+            admin_api_enabled,
+            admin_jwt_issuer,
+            admin_jwt_audience,
+            admin_jwt_public_keys,
+            admin_jwt_max_ttl_secs,
+            admin_jwt_clock_skew_secs,
+            admin_replay_protection_enabled,
+            admin_allowed_ip_cidrs,
 
             // OAuth Provider
             google_client_id: env::var("GOOGLE_CLIENT_ID").expect("GOOGLE_CLIENT_ID must be set"),

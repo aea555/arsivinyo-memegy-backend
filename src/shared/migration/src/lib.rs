@@ -14,6 +14,7 @@ mod m20260207_000001_add_video_processing_failure_fields;
 mod m20260207_010000_create_extension_sessions_and_send_tickets;
 mod m20260207_020000_add_keyboard_duration_and_indexes;
 mod m20260208_000001_add_username_normalization;
+mod m20260208_000002_create_admin_audit_logs;
 
 pub struct Migrator;
 
@@ -35,6 +36,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260207_010000_create_extension_sessions_and_send_tickets::Migration),
             Box::new(m20260207_020000_add_keyboard_duration_and_indexes::Migration),
             Box::new(m20260208_000001_add_username_normalization::Migration),
+            Box::new(m20260208_000002_create_admin_audit_logs::Migration),
         ]
     }
 }

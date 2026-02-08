@@ -60,6 +60,9 @@ The documentation includes:
 - Rate limiting information
 - Error responses
 
+Admin integration and security runbook:
+- `ADMIN_PANEL_SUPERADMIN_GUIDE.txt`
+
 ## Endpoints
 
 ### Auth

@@ -60,6 +60,32 @@ pub enum AuditEvent {
         reason: String,
         timestamp: DateTime<Utc>,
     },
+    AdminAuthFailed {
+        reason: String,
+        timestamp: DateTime<Utc>,
+    },
+    AdminAccessDenied {
+        actor_sub: Option<String>,
+        reason: String,
+        timestamp: DateTime<Utc>,
+    },
+    AdminActionSucceeded {
+        actor_sub: String,
+        action: String,
+        target_table: String,
+        target_id: Option<String>,
+        request_id: String,
+        timestamp: DateTime<Utc>,
+    },
+    AdminActionFailed {
+        actor_sub: Option<String>,
+        action: String,
+        target_table: String,
+        target_id: Option<String>,
+        request_id: String,
+        reason: String,
+        timestamp: DateTime<Utc>,
+    },
 }
 
 pub fn log_audit_event(event: AuditEvent) {
@@ -196,6 +222,67 @@ pub fn log_audit_event(event: AuditEvent) {
                 reason = %reason,
                 timestamp = %timestamp,
                 "Username update rejected"
+            );
+        }
+        AuditEvent::AdminAuthFailed { reason, timestamp } => {
+            tracing::warn!(
+                event = "admin_auth_failed",
+                reason = %reason,
+                timestamp = %timestamp,
+                "Admin authentication failed"
+            );
+        }
+        AuditEvent::AdminAccessDenied {
+            actor_sub,
+            reason,
+            timestamp,
+        } => {
+            tracing::warn!(
+                event = "admin_access_denied",
+                actor_sub = ?actor_sub,
+                reason = %reason,
+                timestamp = %timestamp,
+                "Admin access denied"
+            );
+        }
+        AuditEvent::AdminActionSucceeded {
+            actor_sub,
+            action,
+            target_table,
+            target_id,
+            request_id,
+            timestamp,
+        } => {
+            tracing::info!(
+                event = "admin_action_succeeded",
+                actor_sub = %actor_sub,
+                action = %action,
+                target_table = %target_table,
+                target_id = ?target_id,
+                request_id = %request_id,
+                timestamp = %timestamp,
+                "Admin action succeeded"
+            );
+        }
+        AuditEvent::AdminActionFailed {
+            actor_sub,
+            action,
+            target_table,
+            target_id,
+            request_id,
+            reason,
+            timestamp,
+        } => {
+            tracing::warn!(
+                event = "admin_action_failed",
+                actor_sub = ?actor_sub,
+                action = %action,
+                target_table = %target_table,
+                target_id = ?target_id,
+                request_id = %request_id,
+                reason = %reason,
+                timestamp = %timestamp,
+                "Admin action failed"
             );
         }
     }

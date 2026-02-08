@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod audit;
 pub mod auth;
 pub mod cache;
@@ -87,8 +88,8 @@ pub fn create_router(state: AppState) -> Router {
 
     metrics::register_metrics();
 
-    // Core routes
-    let mut router = Router::new()
+    // Public routes
+    let mut public_router = Router::new()
         .route("/health", get(|| async { "OK" }))
         .route("/docs", get(serve_docs))
         .route("/openapi.yaml", get(serve_openapi))
@@ -117,18 +118,24 @@ pub fn create_router(state: AppState) -> Router {
             "Metrics endpoint enabled at /metrics (environment: {})",
             state.config.environment
         );
-        router = router.route("/metrics", get(|| async { metrics::metrics_handler() }));
+        public_router =
+            public_router.route("/metrics", get(|| async { metrics::metrics_handler() }));
     } else {
         tracing::info!("Metrics endpoint disabled in production mode");
     }
 
-    router
+    public_router = public_router
         .merge(videos::router::videos_router(&state.config))
         .nest("/users", users::router::users_router(&state.config))
-        .layer(cors)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             middleware::ip_rate_limit::ip_rate_limit,
-        ))
-        .with_state(state)
+        ));
+
+    let mut app_router = Router::new().merge(public_router);
+    if state.config.admin_api_enabled {
+        app_router = app_router.nest("/admin", admin::router::admin_router());
+    }
+
+    app_router.layer(cors).with_state(state)
 }

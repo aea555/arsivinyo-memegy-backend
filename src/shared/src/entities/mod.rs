@@ -2,6 +2,7 @@
 
 pub mod prelude;
 
+pub mod admin_audit_logs;
 pub mod download_jobs;
 pub mod extension_sessions;
 pub mod likes;

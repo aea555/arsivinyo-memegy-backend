@@ -6,16 +6,31 @@ use shared::queue::QueueService;
 #[derive(Clone)]
 pub struct RateLimiter {
     queue: QueueService,
+    bypass: bool,
 }
 
 impl RateLimiter {
     pub fn new(queue: QueueService) -> Self {
-        Self { queue }
+        Self {
+            queue,
+            bypass: false,
+        }
+    }
+
+    pub fn with_bypass(&self, bypass: bool) -> Self {
+        Self {
+            queue: self.queue.clone(),
+            bypass,
+        }
     }
 
     /// Check if an action is within the rate limit.
     /// Returns Ok(remaining) if allowed, Err with current count if exceeded.
     pub async fn check_rate(&self, key: &str, max_count: u64) -> Result<Result<u64, u64>> {
+        if self.bypass {
+            return Ok(Ok(u64::MAX));
+        }
+
         match self.queue.get_conn().await {
             Ok(mut conn) => {
                 let current: Option<u64> = conn.get(key).await?;
@@ -44,6 +59,10 @@ impl RateLimiter {
     /// Increment the rate limit counter by an arbitrary amount.
     /// Useful for byte-based limits.
     pub async fn increment_by(&self, key: &str, amount: u64, window_secs: usize) -> Result<u64> {
+        if self.bypass {
+            return Ok(0);
+        }
+
         match self.queue.get_conn().await {
             Ok(mut conn) => {
                 // Use INCR + EXPIRE for atomic increment with TTL
@@ -71,6 +90,10 @@ impl RateLimiter {
         max_count: u64,
         window_secs: usize,
     ) -> Result<Result<u64, u64>> {
+        if self.bypass {
+            return Ok(Ok(u64::MAX));
+        }
+
         match self.queue.get_conn().await {
             Ok(mut conn) => {
                 // First check current count
@@ -98,6 +121,10 @@ impl RateLimiter {
 
     /// Get the current count for a rate limit key.
     pub async fn get_count(&self, key: &str) -> Result<u64> {
+        if self.bypass {
+            return Ok(0);
+        }
+
         match self.queue.get_conn().await {
             Ok(mut conn) => {
                 let count: Option<u64> = conn.get(key).await?;

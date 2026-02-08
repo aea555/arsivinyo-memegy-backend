@@ -12,6 +12,12 @@ use testcontainers::{ContainerAsync, runners::AsyncRunner};
 use testcontainers_modules::{postgres::Postgres, redis::Redis};
 use tokio::net::TcpListener;
 
+pub const TEST_ADMIN_KID: &str = "test-admin-kid";
+pub const TEST_ADMIN_ISSUER: &str = "https://admin.local";
+pub const TEST_ADMIN_AUDIENCE: &str = "arsivinyo-memegy-backend";
+pub const TEST_ADMIN_PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIE/s+QfL/u5ipFUsbb+qCZxerRxZzGgxg6MBSYNa3yOr\n-----END PRIVATE KEY-----";
+pub const TEST_ADMIN_PUBLIC_KEY_PEM: &str = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAqAes6rNUVfyDbVVczOInIIQWMZTXKpacap2D6Y7IQ0w=\n-----END PUBLIC KEY-----";
+
 pub struct TestApp {
     pub address: String,
     pub db: sea_orm::DatabaseConnection, // Exposed for assertions
@@ -85,6 +91,14 @@ impl StorageBackend for MockStorage {
 }
 
 pub async fn spawn_app() -> TestApp {
+    spawn_app_internal(false).await
+}
+
+pub async fn spawn_app_with_admin() -> TestApp {
+    spawn_app_internal(true).await
+}
+
+async fn spawn_app_internal(admin_enabled: bool) -> TestApp {
     // 1. Start Containers
     let pg_container: ContainerAsync<Postgres> = Postgres::default()
         .start()
@@ -109,6 +123,14 @@ pub async fn spawn_app() -> TestApp {
         .await
         .expect("Failed to get Redis port");
     let redis_url = format!("redis://127.0.0.1:{}", redis_host_port);
+    let admin_public_keys = if admin_enabled {
+        std::collections::HashMap::from([(
+            TEST_ADMIN_KID.to_string(),
+            TEST_ADMIN_PUBLIC_KEY_PEM.to_string(),
+        )])
+    } else {
+        std::collections::HashMap::new()
+    };
 
     // 2. Run Migrations
     let db = Database::connect(&db_url)
@@ -134,6 +156,22 @@ pub async fn spawn_app() -> TestApp {
         refresh_token_ttl_days: 14,
         auth_require_username_on_google_signup: true,
         username_reserved_values: "admin,support".to_string(),
+        admin_api_enabled: admin_enabled,
+        admin_jwt_issuer: if admin_enabled {
+            Some(TEST_ADMIN_ISSUER.to_string())
+        } else {
+            None
+        },
+        admin_jwt_audience: if admin_enabled {
+            Some(TEST_ADMIN_AUDIENCE.to_string())
+        } else {
+            None
+        },
+        admin_jwt_public_keys: admin_public_keys,
+        admin_jwt_max_ttl_secs: 300,
+        admin_jwt_clock_skew_secs: 60,
+        admin_replay_protection_enabled: true,
+        admin_allowed_ip_cidrs: String::new(),
         google_client_id: "test_client_id".to_string(),
         google_client_secret: "test_client_secret".to_string(),
         minio_endpoint: "http://mock".to_string(),
@@ -153,7 +191,7 @@ pub async fn spawn_app() -> TestApp {
         feed_cache_ttl_secs: 60,
         limit_feed_rpm: 100,
         rate_limit_window_secs: 3600,
-        ip_rate_limit_rpm: 100,
+        ip_rate_limit_rpm: if admin_enabled { 5 } else { 100 },
         like_actions_rpm_limit: 60,
         like_actions_window_secs: 60,
         username_signup_rpm_per_ip: 20,

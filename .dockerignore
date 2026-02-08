@@ -4,6 +4,7 @@ target/
 # Git
 .git/
 .gitignore
+.txt
 
 # Environment files
 .env
