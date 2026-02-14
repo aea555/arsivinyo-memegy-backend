@@ -103,11 +103,11 @@ services:
   api:
     networks:
       - memegy-network
-    build:
-      context: .
-      target: api
+    image: ${BACKEND_IMAGE}
+    pull_policy: always
     container_name: memegy_prod_api
     restart: always
+    command: ["/app/api"]
     depends_on:
       db:
         condition: service_healthy
@@ -219,11 +219,11 @@ services:
   worker:
     networks:
       - memegy-network
-    build:
-      context: .
-      target: worker
+    image: ${BACKEND_IMAGE}
+    pull_policy: always
     container_name: memegy_prod_worker
     restart: always
+    command: ["/app/worker"]
     depends_on:
       db:
         condition: service_healthy

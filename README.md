@@ -129,7 +129,8 @@ This will:
   - Postgres: `/var/lib/memegy/postgres`
   - Valkey: `/var/lib/memegy/valkey`
   - MinIO: `/var/lib/memegy/minio`
-- Deployment workflow uses `up -d --build --remove-orphans` and does not run `down`, so persistent data is less exposed to accidental reset.
+- Deployment workflow builds/pushes images in CI, then VPS runs `pull` + `up -d --no-build --remove-orphans`, so production no longer compiles on-host.
+- Production requires `BACKEND_IMAGE` in `.env.production` (managed automatically by the deploy workflow).
 - Nightly production DB backups are handled by `.github/workflows/backup-production-db.yml` (plus manual `workflow_dispatch` support).
 
 ## License
