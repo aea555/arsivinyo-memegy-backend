@@ -1,11 +1,11 @@
 use axum::{
+    Json,
     extract::{Path, Query, State},
     http::StatusCode,
-    Json,
 };
 use axum_extra::{
-    headers::{authorization::Bearer, Authorization},
     TypedHeader,
+    headers::{Authorization, authorization::Bearer},
 };
 use chrono::Utc;
 use sea_orm::*;
@@ -16,13 +16,19 @@ use uuid::Uuid;
 use super::dtos::*;
 use crate::auth::service::AuthService;
 use crate::{
-    auth::extractors::AuthUser,
+    auth::extractors::{AuthUser, ExtensionAuth},
     error::{ApiErrorResponse, ApiResult},
+    metrics::{
+        KEYBOARD_RATE_LIMIT_TOTAL, KEYBOARD_SEARCH_TOTAL, KEYBOARD_SEND_ATTEMPT_TOTAL,
+        KEYBOARD_TICKET_EXPIRED_TOTAL, WS_EVENTS_PUBLISHED_TOTAL,
+    },
+    realtime::messages::{EVENT_PROCESSING, RealtimeSignalMessage},
     state::AppState,
+    users::handlers::video_model_to_user_dto,
 };
 use redis::AsyncCommands;
 use shared::{
-    entities::{likes, videos},
+    entities::{likes, send_tickets, videos},
     queue::VideoProcessJob,
 };
 
@@ -30,6 +36,23 @@ use shared::{
 pub struct FeedQuery {
     pub sort: Option<String>, // "latest", "popular", "random"
     pub page: Option<u64>,
+    pub random_seed: Option<String>,
+}
+
+fn normalize_random_seed(seed: Option<&str>) -> Option<String> {
+    let seed = seed?.trim();
+    if seed.is_empty() || seed.len() > 64 {
+        return None;
+    }
+
+    if seed
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        Some(seed.to_string())
+    } else {
+        None
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -41,6 +64,7 @@ pub struct VideoFeedItem {
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uploader: Option<UploaderInfo>, // None if video is anonymous
+    pub is_liked: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -79,11 +103,21 @@ pub async fn get_feed(
         }
     }
 
-    let sort = query.sort.as_deref().unwrap_or("random");
-    // Standardize on 1-based pagination for API
-    let page = query.page.unwrap_or(1);
-    let page = if page > 0 { page - 1 } else { 0 };
+    let requested_sort = query
+        .sort
+        .as_deref()
+        .unwrap_or("random")
+        .to_ascii_lowercase();
+    let sort = match requested_sort.as_str() {
+        "latest" | "newest" => "latest",
+        "popular" => "popular",
+        _ => "random",
+    };
+    // API pagination is 0-based
+    let page = query.page.unwrap_or(0);
     let page_size = state.config.feed_page_size;
+    let random_seed =
+        normalize_random_seed(query.random_seed.as_deref()).unwrap_or_else(|| user_id.to_string());
 
     // Try cache first (skip for random to keep it truly random)
     if sort != "random" {
@@ -101,7 +135,6 @@ pub async fn get_feed(
                     url: format!("{}/{}", base_url, c.url.split('/').last().unwrap_or(&c.url)),
                     like_count: c.like_count,
                     created_at: c.created_at,
-                    // Phase 5: Map uploader from cache (respecting anonymity)
                     uploader: if c.is_anonymous {
                         None
                     } else {
@@ -110,6 +143,32 @@ pub async fn get_feed(
                             username: u.username,
                         })
                     },
+                    is_liked: false, // Will be populated shortly
+                })
+                .collect();
+
+            // Batch check for likes
+            let video_ids: Vec<Uuid> = items.iter().map(|i| i.id).collect();
+            let liked_video_ids: Vec<Uuid> = likes::Entity::find()
+                .select_only()
+                .column(likes::Column::VideoId)
+                .filter(
+                    Condition::all()
+                        .add(likes::Column::UserId.eq(user_id))
+                        .add(likes::Column::VideoId.is_in(video_ids)),
+                )
+                .into_tuple()
+                .all(&state.db)
+                .await
+                .map_err(|e| ApiErrorResponse::internal_error(e.to_string()))?;
+
+            let liked_set: std::collections::HashSet<Uuid> = liked_video_ids.into_iter().collect();
+
+            let items = items
+                .into_iter()
+                .map(|mut item| {
+                    item.is_liked = liked_set.contains(&item.id);
+                    item
                 })
                 .collect();
 
@@ -121,22 +180,38 @@ pub async fn get_feed(
     use shared::entities::users;
 
     let mut select = videos::Entity::find()
-        .filter(videos::Column::Status.eq("PUBLISHED"))
         .filter(videos::Column::DeletedAt.is_null()) // Filter soft-deleted videos
+        .filter(
+            Condition::any()
+                .add(videos::Column::Status.eq("PUBLISHED"))
+                .add(videos::Column::Status.eq("published"))
+                .add(videos::Column::Status.eq("COMPLETED"))
+                .add(videos::Column::Status.eq("completed"))
+                .add(videos::Column::S3Bucket.eq(state.config.minio_bucket_videos.clone())),
+        )
         .find_also_related(users::Entity); // Left join users table
 
     match sort {
         "latest" => {
-            select = select.order_by_desc(videos::Column::CreatedAt);
+            select = select
+                .order_by_desc(videos::Column::CreatedAt)
+                .order_by_desc(videos::Column::Id);
         }
         "popular" => {
-            select = select.order_by_desc(videos::Column::LikeCount);
+            select = select
+                .order_by_desc(videos::Column::LikeCount)
+                .order_by_desc(videos::Column::CreatedAt)
+                .order_by_desc(videos::Column::Id);
         }
         _ => {
             select = select.order_by(
-                sea_orm::sea_query::Expr::cust("RANDOM()"),
+                sea_orm::sea_query::Expr::cust(&format!(
+                    "md5(videos.id::text || '{}')",
+                    random_seed
+                )),
                 sea_orm::Order::Asc,
             );
+            select = select.order_by_asc(videos::Column::Id);
         }
     }
 
@@ -150,7 +225,7 @@ pub async fn get_feed(
         state.config.minio_public_endpoint, state.config.minio_bucket_videos
     );
 
-    let items: Vec<VideoFeedItem> = video_with_users
+    let mut items: Vec<VideoFeedItem> = video_with_users
         .iter()
         .map(|(v, u)| VideoFeedItem {
             id: v.id,
@@ -167,12 +242,32 @@ pub async fn get_feed(
                     username: user.username.clone(),
                 })
             },
+            is_liked: false,
         })
         .collect();
 
-    // Update cache is skipped - will be implemented in Phase 5 with user info support
+    if !items.is_empty() {
+        let video_ids: Vec<Uuid> = items.iter().map(|i| i.id).collect();
+        let liked_video_ids: Vec<Uuid> = likes::Entity::find()
+            .select_only()
+            .column(likes::Column::VideoId)
+            .filter(
+                Condition::all()
+                    .add(likes::Column::UserId.eq(user_id))
+                    .add(likes::Column::VideoId.is_in(video_ids)),
+            )
+            .into_tuple()
+            .all(&state.db)
+            .await
+            .map_err(|e| ApiErrorResponse::internal_error(e.to_string()))?;
 
-    // Phase 5: Populate cache with full metadata
+        let liked_set: std::collections::HashSet<Uuid> = liked_video_ids.into_iter().collect();
+        for item in &mut items {
+            item.is_liked = liked_set.contains(&item.id);
+        }
+    }
+
+    // Populate cache with full metadata
     if sort != "random" && !video_with_users.is_empty() {
         let cached_items: Vec<_> = video_with_users
             .iter()
@@ -248,9 +343,13 @@ pub async fn init_upload(
         s3_key: Set(s3_key.clone()),
         status: Set("DRAFT".to_string()),
         size_bytes: Set(payload.size_bytes),
+        duration_seconds: Set(None),
         like_count: Set(0),
         is_anonymous: Set(false), // Regular upload, not anonymous
-        deleted_at: Set(None),    // Not deleted
+        processing_error_code: Set(None),
+        processing_error_message: Set(None),
+        failed_at: Set(None),
+        deleted_at: Set(None), // Not deleted
         created_at: Set(Utc::now().into()),
         updated_at: Set(Utc::now().into()),
     };
@@ -269,6 +368,9 @@ pub async fn init_upload(
         .map_err(|e| {
             ApiErrorResponse::internal_error(format!("Failed to generate upload URL: {}", e))
         })?;
+
+    // Ensure /users/me/videos reflects new DRAFT immediately.
+    invalidate_user_video_cache(&state, user_id).await;
 
     Ok(Json(InitUploadResponse {
         video_id,
@@ -320,9 +422,13 @@ pub async fn init_anonymous_upload(
         s3_key: Set(s3_key.clone()),
         status: Set("DRAFT".to_string()),
         size_bytes: Set(payload.size_bytes),
+        duration_seconds: Set(None),
         like_count: Set(0),
         is_anonymous: Set(true), // ANONYMOUS upload
-        deleted_at: Set(None),   // Not deleted
+        processing_error_code: Set(None),
+        processing_error_message: Set(None),
+        failed_at: Set(None),
+        deleted_at: Set(None), // Not deleted
         created_at: Set(Utc::now().into()),
         updated_at: Set(Utc::now().into()),
     };
@@ -341,6 +447,9 @@ pub async fn init_anonymous_upload(
         .map_err(|e| {
             ApiErrorResponse::internal_error(format!("Failed to generate upload URL: {}", e))
         })?;
+
+    // Ensure /users/me/videos reflects new DRAFT immediately.
+    invalidate_user_video_cache(&state, user_id).await;
 
     Ok(Json(InitUploadResponse {
         video_id,
@@ -376,14 +485,11 @@ pub async fn confirm_upload(
         .await
         .map_err(|_| ApiErrorResponse::bad_request("File not uploaded or not accessible"))?;
 
-    // SECURITY: Enforce strict size check to prevent quota bypass
-    // If actual size is significantly larger than claimed size (allowing small buffer for differences), reject it.
-    // For strictness, we reject any size larger than claimed.
-    if actual_size > video.size_bytes as u64 {
+    if actual_size < state.config.min_video_size_bytes {
         txn.rollback().await?;
         return Err(ApiErrorResponse::bad_request(format!(
-            "File larger than declared. Declared: {} bytes, Actual: {} bytes",
-            video.size_bytes, actual_size
+            "File too small. Minimum: {} bytes, Actual: {} bytes",
+            state.config.min_video_size_bytes, actual_size
         )));
     }
 
@@ -395,16 +501,44 @@ pub async fn confirm_upload(
         ));
     }
 
-    // 4. Increment rate limit (only after verified upload)
+    let declared_size = video.size_bytes.max(0) as u64;
+    let tolerance = state.config.upload_size_tolerance_bytes;
+    let size_delta = actual_size.abs_diff(declared_size);
+    if size_delta > tolerance {
+        txn.rollback().await?;
+        return Err(ApiErrorResponse::bad_request(format!(
+            "File size mismatch. Declared: {} bytes, Actual: {} bytes, Allowed tolerance: {} bytes",
+            declared_size, actual_size, tolerance
+        )));
+    }
+
+    // 4. Verify object signature (magic bytes) to reject disguised non-video uploads.
+    let prefix = state
+        .storage
+        .read_prefix(&state.config.minio_bucket_raw, &video.s3_key, 4096)
+        .await
+        .map_err(|_| ApiErrorResponse::bad_request("Uploaded file cannot be inspected"))?;
+    if !looks_like_supported_video_container(&prefix) {
+        txn.rollback().await?;
+        return Err(ApiErrorResponse::bad_request(
+            "Unsupported or invalid video file signature. Supported containers: MP4/MOV/M4V/3GP, WebM/MKV, AVI, OGG.",
+        ));
+    }
+
+    // 5. Increment rate limit (only after verified upload)
     let rate_key = crate::services::rate_limiter::RateLimiter::upload_bytes_key(&user_id);
     let _ = state
         .rate_limiter
-        .increment(&rate_key, state.config.rate_limit_window_secs)
+        .increment_by(&rate_key, actual_size, state.config.rate_limit_window_secs)
         .await;
 
-    // 5. Update Status and Actual Size
+    // 6. Update Status and Actual Size
+    let previous_status = video.status.clone();
     let mut active_video: videos::ActiveModel = video.clone().into();
     active_video.status = Set("PROCESSING".to_string());
+    active_video.processing_error_code = Set(None);
+    active_video.processing_error_message = Set(None);
+    active_video.failed_at = Set(None);
 
     // Update DB with actual size if different (e.g. user declared 10MB but uploaded 9MB)
     if actual_size != video.size_bytes as u64 {
@@ -412,9 +546,9 @@ pub async fn confirm_upload(
     }
 
     active_video.updated_at = Set(Utc::now().into());
-    active_video.update(&txn).await?;
+    let processing_video = active_video.update(&txn).await?;
 
-    // 6. Queue Job
+    // 7. Queue Job
     let job = VideoProcessJob {
         video_id,
         user_id,
@@ -430,64 +564,237 @@ pub async fn confirm_upload(
     // Commit transaction
     txn.commit().await?;
 
-    // 7. Invalidate User's Video List Cache
+    // 8. Invalidate User's Video List Cache
     // This ensures the new video immediately appears in their list
-    if let Ok(mut conn) = state.queue.get_conn().await {
-        let pattern = format!("user:{}:videos:*", user_id);
-        let keys: Vec<String> = conn.keys(&pattern).await.unwrap_or_default();
-        if !keys.is_empty() {
-            let _: Result<(), _> = conn.del(&keys).await;
-            tracing::info!(
-                "Invalidated {} video list cache keys for user {}",
-                keys.len(),
-                user_id
-            );
-        }
+    invalidate_user_video_cache(&state, user_id).await;
+
+    // 9. Publish realtime processing signal (non-fatal).
+    if let Err(e) = publish_video_status_signal(
+        &state,
+        user_id,
+        EVENT_PROCESSING,
+        Some(previous_status),
+        processing_video,
+    )
+    .await
+    {
+        tracing::warn!("Failed to publish processing realtime signal: {:?}", e);
     }
 
     Ok(StatusCode::ACCEPTED)
 }
 
-pub async fn like_video(
+fn looks_like_supported_video_container(prefix: &[u8]) -> bool {
+    // ISO BMFF family: MP4/MOV/M4V/3GP usually has "ftyp" at bytes 4..8.
+    if prefix.len() >= 8 && &prefix[4..8] == b"ftyp" {
+        return true;
+    }
+
+    // EBML family: WebM/MKV
+    if prefix.len() >= 4 && prefix.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        return true;
+    }
+
+    // AVI: RIFF....AVI
+    if prefix.len() >= 12 && &prefix[0..4] == b"RIFF" && &prefix[8..12] == b"AVI " {
+        return true;
+    }
+
+    // OGG container
+    if prefix.len() >= 4 && &prefix[0..4] == b"OggS" {
+        return true;
+    }
+
+    false
+}
+
+async fn invalidate_user_video_cache(state: &AppState, user_id: Uuid) {
+    if let Ok(mut conn) = state.queue.get_conn().await {
+        let pattern = format!("user:{}:videos:*", user_id);
+        let keys: Vec<String> = conn.keys(&pattern).await.unwrap_or_default();
+        if !keys.is_empty() {
+            let _: Result<(), _> = conn.del(&keys).await;
+        }
+    }
+}
+
+async fn publish_video_status_signal(
+    state: &AppState,
+    user_id: Uuid,
+    event_type: &str,
+    previous_status: Option<String>,
+    video: videos::Model,
+) -> anyhow::Result<()> {
+    let is_liked = likes::Entity::find_by_id((user_id, video.id))
+        .one(&state.db)
+        .await?
+        .is_some();
+    let dto = video_model_to_user_dto(video, &state.config, is_liked);
+    let signal = RealtimeSignalMessage::status(event_type, previous_status, dto);
+    let payload = serde_json::to_string(&signal)?;
+    state
+        .queue
+        .publish_video_status_event(user_id, &payload)
+        .await?;
+    WS_EVENTS_PUBLISHED_TOTAL.inc();
+    Ok(())
+}
+
+async fn invalidate_like_related_caches(
+    state: &AppState,
+    owner_user_id: Uuid,
+    actor_user_id: Uuid,
+) {
+    let _ = state.feed_cache.invalidate_all().await;
+    if let Ok(mut conn) = state.queue.get_conn().await {
+        let mut keys: Vec<String> = Vec::new();
+
+        let owner_videos_pattern = format!("user:{}:videos:*", owner_user_id);
+        let actor_search_pattern = format!("search:cache:{}:*", actor_user_id);
+
+        keys.extend(
+            conn.keys::<_, Vec<String>>(&owner_videos_pattern)
+                .await
+                .unwrap_or_default(),
+        );
+        keys.extend(
+            conn.keys::<_, Vec<String>>(&actor_search_pattern)
+                .await
+                .unwrap_or_default(),
+        );
+
+        if !keys.is_empty() {
+            let _: Result<(), _> = conn.del(keys).await;
+        }
+    }
+}
+
+async fn get_published_video_or_404(
+    db: &DatabaseConnection,
+    video_id: Uuid,
+) -> ApiResult<videos::Model> {
+    videos::Entity::find_by_id(video_id)
+        .filter(videos::Column::Status.eq("PUBLISHED"))
+        .one(db)
+        .await?
+        .ok_or_else(|| ApiErrorResponse::not_found("Video not found or not published"))
+}
+
+async fn get_video_like_count(txn: &DatabaseTransaction, video_id: Uuid) -> ApiResult<i64> {
+    let video = videos::Entity::find_by_id(video_id)
+        .one(txn)
+        .await?
+        .ok_or_else(|| ApiErrorResponse::not_found("Video not found or not published"))?;
+    Ok(video.like_count)
+}
+
+async fn enforce_like_rate_limit(state: &AppState, user_id: Uuid) -> ApiResult<()> {
+    let rate_key = crate::services::rate_limiter::RateLimiter::like_actions_rpm_key(&user_id);
+    match state
+        .rate_limiter
+        .check_and_increment(
+            &rate_key,
+            state.config.like_actions_rpm_limit,
+            state.config.like_actions_window_secs,
+        )
+        .await
+    {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(count)) => Err(ApiErrorResponse::too_many_requests(format!(
+            "Like rate limit exceeded: {} actions per {} seconds (current: {})",
+            state.config.like_actions_rpm_limit, state.config.like_actions_window_secs, count
+        ))),
+        Err(_) => Ok(()), // Fail open if Redis is unavailable
+    }
+}
+
+async fn insert_like_if_missing(
+    txn: &DatabaseTransaction,
+    user_id: Uuid,
+    video_id: Uuid,
+) -> ApiResult<bool> {
+    let result = txn
+        .execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            r#"
+            INSERT INTO likes (user_id, video_id)
+            VALUES ($1, $2)
+            ON CONFLICT (user_id, video_id) DO NOTHING
+            "#,
+            vec![user_id.into(), video_id.into()],
+        ))
+        .await?;
+
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn set_like_video(
     State(state): State<AppState>,
     AuthUser(user_id): AuthUser,
     Path(video_id): Path<Uuid>,
-) -> ApiResult<StatusCode> {
-    // Check if video exists and is published
-    let _video = videos::Entity::find_by_id(video_id)
-        .filter(videos::Column::Status.eq("PUBLISHED"))
-        .one(&state.db)
-        .await?
-        .ok_or_else(|| ApiErrorResponse::not_found("Video not found or not published"))?;
+) -> ApiResult<Json<LikeVideoResponse>> {
+    enforce_like_rate_limit(&state, user_id).await?;
+    let video = get_published_video_or_404(&state.db, video_id).await?;
 
-    // Try to insert like
-    let like = likes::ActiveModel {
-        user_id: Set(user_id),
-        video_id: Set(video_id),
-        created_at: Set(Utc::now().into()),
-    };
-
-    match like.insert(&state.db).await {
-        Ok(_) => {
-            // Increment like count
-            videos::Entity::update_many()
-                .col_expr(
-                    videos::Column::LikeCount,
-                    sea_orm::sea_query::Expr::col(videos::Column::LikeCount).add(1),
-                )
-                .filter(videos::Column::Id.eq(video_id))
-                .exec(&state.db)
-                .await?;
-
-            Ok(StatusCode::CREATED)
-        }
-        Err(DbErr::RecordNotInserted) | Err(DbErr::Query(sea_orm::RuntimeErr::SqlxError(_))) => {
-            // Already liked (duplicate key violation)
-            // Note: SqlxError is generic, but practically unique constraints trigger this in SeaORM 1.1 sometimes
-            Ok(StatusCode::OK)
-        }
-        Err(e) => Err(e.into()),
+    let txn = state.db.begin().await?;
+    if insert_like_if_missing(&txn, user_id, video_id).await? {
+        videos::Entity::update_many()
+            .col_expr(
+                videos::Column::LikeCount,
+                sea_orm::sea_query::Expr::col(videos::Column::LikeCount).add(1),
+            )
+            .filter(videos::Column::Id.eq(video_id))
+            .exec(&txn)
+            .await?;
     }
+    let like_count = get_video_like_count(&txn, video_id).await?;
+
+    txn.commit().await?;
+
+    invalidate_like_related_caches(&state, video.user_id, user_id).await;
+
+    Ok(Json(LikeVideoResponse {
+        is_liked: true,
+        like_count,
+    }))
+}
+
+pub async fn unset_like_video(
+    State(state): State<AppState>,
+    AuthUser(user_id): AuthUser,
+    Path(video_id): Path<Uuid>,
+) -> ApiResult<Json<LikeVideoResponse>> {
+    enforce_like_rate_limit(&state, user_id).await?;
+    let video = get_published_video_or_404(&state.db, video_id).await?;
+
+    let txn = state.db.begin().await?;
+    let delete_result = likes::Entity::delete_by_id((user_id, video_id))
+        .exec(&txn)
+        .await?;
+
+    if delete_result.rows_affected > 0 {
+        videos::Entity::update_many()
+            .col_expr(
+                videos::Column::LikeCount,
+                sea_orm::sea_query::Expr::cust(
+                    "CASE WHEN like_count > 0 THEN like_count - 1 ELSE 0 END",
+                ),
+            )
+            .filter(videos::Column::Id.eq(video_id))
+            .exec(&txn)
+            .await?;
+    }
+
+    let like_count = get_video_like_count(&txn, video_id).await?;
+
+    txn.commit().await?;
+
+    invalidate_like_related_caches(&state, video.user_id, user_id).await;
+
+    Ok(Json(LikeVideoResponse {
+        is_liked: false,
+        like_count,
+    }))
 }
 
 /// Delete video (soft delete with audit trail)
@@ -574,27 +881,6 @@ pub async fn update_video_metadata(
     Path(video_id): Path<Uuid>,
     Json(payload): Json<UpdateVideoRequest>,
 ) -> ApiResult<StatusCode> {
-    // Rate limiting for updates (30/hour per user)
-    let update_rate_key = format!("update:{}:hourly", user_id);
-    match state
-        .rate_limiter
-        .check_and_increment(&update_rate_key, 30, 3600) // 30 updates per hour
-        .await
-    {
-        Ok(Ok(_)) => {
-            // Within limit, continue
-        }
-        Ok(Err(count)) => {
-            return Err(ApiErrorResponse::too_many_requests(format!(
-                "Update rate limit exceeded: {} updates/hour",
-                count
-            )));
-        }
-        Err(_) => {
-            // Redis error - fail open
-        }
-    }
-
     // 1. Validate payload
     if let Some(ref title) = payload.title {
         if title.len() > 200 {
@@ -623,23 +909,31 @@ pub async fn update_video_metadata(
     // 3. Check if video is published (needs cache invalidation)
     let was_published = video.status == "PUBLISHED";
 
-    // 4. Apply updates
+    // 4. Build changes and short-circuit no-op updates before rate limiting
     let mut active: videos::ActiveModel = video.into();
     let mut has_changes = false;
 
     if let Some(title) = payload.title {
-        active.title = Set(Some(title));
-        has_changes = true;
+        let next = Some(title);
+        if active.title.as_ref() != &next {
+            active.title = Set(next);
+            has_changes = true;
+        }
     }
 
     if let Some(description) = payload.description {
-        active.description = Set(Some(description));
-        has_changes = true;
+        let next = Some(description);
+        if active.description.as_ref() != &next {
+            active.description = Set(next);
+            has_changes = true;
+        }
     }
 
     if let Some(is_anonymous) = payload.is_anonymous {
-        active.is_anonymous = Set(is_anonymous);
-        has_changes = true;
+        if active.is_anonymous.as_ref() != &is_anonymous {
+            active.is_anonymous = Set(is_anonymous);
+            has_changes = true;
+        }
     }
 
     // Early return if no changes
@@ -647,10 +941,29 @@ pub async fn update_video_metadata(
         return Ok(StatusCode::OK);
     }
 
+    // 5. Rate limiting for real updates only (30/hour per user)
+    let update_rate_key = format!("update:{}:hourly", user_id);
+    match state
+        .rate_limiter
+        .check_and_increment(&update_rate_key, 30, 3600)
+        .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(count)) => {
+            return Err(ApiErrorResponse::too_many_requests(format!(
+                "Update rate limit exceeded: {} updates/hour",
+                count
+            )));
+        }
+        Err(_) => {
+            // Redis error - fail open
+        }
+    }
+
     active.updated_at = Set(Utc::now().into());
     active.update(&state.db).await?;
 
-    // 5. Invalidate feed cache ONLY if video was published
+    // 6. Invalidate feed cache ONLY if video was published
     if was_published {
         if let Err(e) = invalidate_feed_cache(&state).await {
             tracing::warn!("Failed to invalidate feed cache after update: {:?}", e);
@@ -658,7 +971,7 @@ pub async fn update_video_metadata(
         }
     }
 
-    // 6. Invalidate User's Video List Cache
+    // 7. Invalidate User's Video List Cache
     if let Ok(mut conn) = state.queue.get_conn().await {
         let pattern = format!("user:{}:videos:*", user_id);
         let keys: Vec<String> = conn.keys(&pattern).await.unwrap_or_default();
@@ -1256,6 +1569,192 @@ async fn track_search_analytics(
     }
 }
 
+async fn enforce_keyboard_rpm(
+    state: &AppState,
+    user_id: Uuid,
+    session_jti: Uuid,
+    limit: u64,
+    user_key: String,
+    session_key: String,
+    action: &str,
+) -> Result<(), ApiErrorResponse> {
+    match state
+        .rate_limiter
+        .check_and_increment(&user_key, limit, 60)
+        .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(current)) => {
+            KEYBOARD_RATE_LIMIT_TOTAL.inc();
+            tracing::warn!(
+                event = "rate_limited",
+                domain = "keyboard",
+                action = action,
+                user_id = %user_id,
+                session_jti = %session_jti,
+                current = current,
+                limit = limit
+            );
+            return Err(ApiErrorResponse::too_many_requests(
+                "Keyboard rate limit exceeded",
+            ));
+        }
+        Err(_) => {}
+    }
+
+    match state
+        .rate_limiter
+        .check_and_increment(&session_key, limit, 60)
+        .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(current)) => {
+            KEYBOARD_RATE_LIMIT_TOTAL.inc();
+            tracing::warn!(
+                event = "rate_limited",
+                domain = "keyboard",
+                action = action,
+                user_id = %user_id,
+                session_jti = %session_jti,
+                current = current,
+                limit = limit
+            );
+            return Err(ApiErrorResponse::too_many_requests(
+                "Keyboard rate limit exceeded",
+            ));
+        }
+        Err(_) => {}
+    }
+
+    Ok(())
+}
+
+pub async fn search_videos_keyboard(
+    State(state): State<AppState>,
+    extension: ExtensionAuth,
+    Query(params): Query<KeyboardSearchQuery>,
+) -> ApiResult<Json<Vec<KeyboardSearchItemDto>>> {
+    if !extension.has_scope("keyboard.search") {
+        return Err(ApiErrorResponse::forbidden(
+            "Missing scope: keyboard.search",
+        ));
+    }
+
+    enforce_keyboard_rpm(
+        &state,
+        extension.user_id,
+        extension.session_jti,
+        state.config.keyboard_search_rpm,
+        crate::services::rate_limiter::RateLimiter::keyboard_search_user_rpm_key(
+            &extension.user_id,
+        ),
+        crate::services::rate_limiter::RateLimiter::keyboard_search_session_rpm_key(
+            &extension.session_jti,
+        ),
+        "search",
+    )
+    .await?;
+
+    let search_config = SearchConfig::from_config(&state.config);
+    let query = validate_search_query(&params.q, &search_config)?;
+    let limit = params
+        .limit
+        .max(1)
+        .min(state.config.keyboard_search_max_limit);
+    let offset = params.offset;
+
+    let sql = match params.sort.as_str() {
+        "recent" => {
+            r#"
+            SELECT id, title, status, s3_bucket, s3_key, size_bytes, duration_seconds
+            FROM videos
+            WHERE search_vector @@ plainto_tsquery('english', $1)
+              AND deleted_at IS NULL
+              AND (UPPER(status) = 'PUBLISHED' OR UPPER(status) = 'COMPLETED' OR s3_bucket = $4)
+            ORDER BY created_at DESC
+            LIMIT $2 OFFSET $3
+            "#
+        }
+        "popular" => {
+            r#"
+            SELECT id, title, status, s3_bucket, s3_key, size_bytes, duration_seconds
+            FROM videos
+            WHERE search_vector @@ plainto_tsquery('english', $1)
+              AND deleted_at IS NULL
+              AND (UPPER(status) = 'PUBLISHED' OR UPPER(status) = 'COMPLETED' OR s3_bucket = $4)
+            ORDER BY like_count DESC, created_at DESC
+            LIMIT $2 OFFSET $3
+            "#
+        }
+        _ => {
+            r#"
+            SELECT id, title, status, s3_bucket, s3_key, size_bytes, duration_seconds,
+                   ts_rank(search_vector, plainto_tsquery('english', $1)) as rank
+            FROM videos
+            WHERE search_vector @@ plainto_tsquery('english', $1)
+              AND deleted_at IS NULL
+              AND (UPPER(status) = 'PUBLISHED' OR UPPER(status) = 'COMPLETED' OR s3_bucket = $4)
+            ORDER BY rank DESC, like_count DESC
+            LIMIT $2 OFFSET $3
+            "#
+        }
+    };
+
+    let rows = tokio::time::timeout(
+        std::time::Duration::from_secs(search_config.timeout_secs),
+        state.db.query_all(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            sql,
+            vec![
+                query.clone().into(),
+                (limit as i64).into(),
+                (offset as i64).into(),
+                state.config.minio_bucket_videos.clone().into(),
+            ],
+        )),
+    )
+    .await
+    .map_err(|_| ApiErrorResponse::internal_error("Keyboard search timed out"))?
+    .map_err(|e| ApiErrorResponse::internal_error(format!("Keyboard search failed: {}", e)))?;
+
+    let mut items = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id: Uuid = row.try_get("", "id")?;
+        let status: String = row.try_get("", "status")?;
+        let s3_bucket: String = row.try_get("", "s3_bucket")?;
+        let _s3_key: String = row.try_get("", "s3_key")?;
+        let published = status.eq_ignore_ascii_case("PUBLISHED")
+            || status.eq_ignore_ascii_case("COMPLETED")
+            || s3_bucket == state.config.minio_bucket_videos;
+
+        let safe_size_bytes: i64 = row.try_get("", "size_bytes")?;
+        let thumbnail_url = Some(format!(
+            "{}/{}/{}_thumb.jpg",
+            state.config.minio_public_endpoint, state.config.minio_bucket_videos, id
+        ));
+
+        items.push(KeyboardSearchItemDto {
+            id,
+            title: row.try_get("", "title")?,
+            thumbnail_url,
+            duration_seconds: row.try_get("", "duration_seconds").unwrap_or(None),
+            safe_size_bytes: safe_size_bytes.max(0) as u64,
+            published,
+        });
+    }
+
+    KEYBOARD_SEARCH_TOTAL.inc();
+    tracing::info!(
+        event = "keyboard_search",
+        user_id = %extension.user_id,
+        session_jti = %extension.session_jti,
+        query_len = query.len(),
+        result_count = items.len()
+    );
+
+    Ok(Json(items))
+}
+
 /// Search videos using PostgreSQL full-text search
 ///
 /// Security features:
@@ -1316,7 +1815,7 @@ pub async fn search_videos(
     let limit = params.limit.min(100);
     let offset = params.offset;
     let cache_key = format!(
-        "search:cache:{}:{}:{}:{}:{}",
+        "search:cache:{}:v2:{}:{}:{}:{}",
         user_id, // CRITICAL: User-scoped cache
         query.to_lowercase(),
         params.sort,
@@ -1355,7 +1854,7 @@ pub async fn search_videos(
             FROM videos
             WHERE search_vector @@ plainto_tsquery('english', $1)
             AND deleted_at IS NULL
-            AND status = 'PUBLISHED'
+            AND (UPPER(status) = 'PUBLISHED' OR UPPER(status) = 'COMPLETED' OR s3_bucket = $4)
             ORDER BY created_at DESC
             LIMIT $2 OFFSET $3
             "#
@@ -1366,7 +1865,7 @@ pub async fn search_videos(
             FROM videos
             WHERE search_vector @@ plainto_tsquery('english', $1)
             AND deleted_at IS NULL
-            AND status = 'PUBLISHED'
+            AND (UPPER(status) = 'PUBLISHED' OR UPPER(status) = 'COMPLETED' OR s3_bucket = $4)
             ORDER BY like_count DESC, created_at DESC
             LIMIT $2 OFFSET $3
             "#
@@ -1378,7 +1877,7 @@ pub async fn search_videos(
             FROM videos
             WHERE search_vector @@ plainto_tsquery('english', $1)
             AND deleted_at IS NULL
-            AND status = 'PUBLISHED'
+            AND (UPPER(status) = 'PUBLISHED' OR UPPER(status) = 'COMPLETED' OR s3_bucket = $4)
             ORDER BY rank DESC, like_count DESC
             LIMIT $2 OFFSET $3
             "#
@@ -1393,6 +1892,7 @@ pub async fn search_videos(
             query.clone().into(),
             (limit as i64).into(),
             (offset as i64).into(),
+            state.config.minio_bucket_videos.clone().into(),
         ],
     ));
 
@@ -1412,6 +1912,7 @@ pub async fn search_videos(
 
     // 7. CONVERT TO RESPONSE
     let mut feed = vec![];
+    let base_url = format!("{}", state.config.minio_public_endpoint);
     for row in results {
         let video_id: Uuid = row.try_get("", "id").map_err(|e| {
             tracing::error!("Failed to parse video ID: {:?}", e);
@@ -1420,6 +1921,16 @@ pub async fn search_videos(
 
         let uploader_id: Uuid = row.try_get("", "user_id")?;
         let is_anonymous: bool = row.try_get("", "is_anonymous")?;
+        let status: String = row.try_get("", "status")?;
+        let s3_bucket: String = row.try_get("", "s3_bucket")?;
+        let s3_key: String = row.try_get("", "s3_key")?;
+        let is_published_like =
+            status.eq_ignore_ascii_case("PUBLISHED") || status.eq_ignore_ascii_case("COMPLETED");
+        let url_bucket = if is_published_like {
+            state.config.minio_bucket_videos.clone()
+        } else {
+            s3_bucket
+        };
 
         // Fetch uploader username if not anonymous
         let uploader = if is_anonymous {
@@ -1439,15 +1950,33 @@ pub async fn search_videos(
         feed.push(VideoFeedItem {
             id: video_id,
             title: row.try_get("", "title")?,
-            url: format!(
-                "http://{}/videos-public/{}",
-                state.config.minio_endpoint,
-                row.try_get::<String>("", "s3_key")?
-            ),
+            url: format!("{}/{}/{}", base_url, url_bucket, s3_key),
             like_count: row.try_get("", "like_count")?,
             created_at: row.try_get("", "created_at")?,
             uploader,
+            is_liked: false,
         });
+    }
+
+    if !feed.is_empty() {
+        let video_ids: Vec<Uuid> = feed.iter().map(|i| i.id).collect();
+        let liked_video_ids: Vec<Uuid> = likes::Entity::find()
+            .select_only()
+            .column(likes::Column::VideoId)
+            .filter(
+                Condition::all()
+                    .add(likes::Column::UserId.eq(user_id))
+                    .add(likes::Column::VideoId.is_in(video_ids)),
+            )
+            .into_tuple()
+            .all(&state.db)
+            .await
+            .map_err(|e| ApiErrorResponse::internal_error(e.to_string()))?;
+
+        let liked_set: std::collections::HashSet<Uuid> = liked_video_ids.into_iter().collect();
+        for item in &mut feed {
+            item.is_liked = liked_set.contains(&item.id);
+        }
     }
 
     // 8. CACHE RESULTS (user-scoped)
@@ -1476,6 +2005,218 @@ pub async fn search_videos(
 
     Ok(Json(feed))
 }
+
+pub async fn create_send_ticket(
+    State(state): State<AppState>,
+    extension: ExtensionAuth,
+    Path(video_id): Path<Uuid>,
+    Json(payload): Json<CreateSendTicketRequest>,
+) -> ApiResult<Json<SendTicketResponse>> {
+    if !extension.has_scope("keyboard.send") {
+        return Err(ApiErrorResponse::forbidden("Missing scope: keyboard.send"));
+    }
+
+    let nonce = payload.nonce.trim();
+    if nonce.is_empty() || nonce.len() > 128 {
+        return Err(ApiErrorResponse::bad_request(
+            "nonce must be between 1 and 128 characters",
+        ));
+    }
+
+    if let Some(host_app_hint) = &payload.host_app_hint
+        && host_app_hint.len() > 128
+    {
+        return Err(ApiErrorResponse::bad_request(
+            "host_app_hint must be <= 128 characters",
+        ));
+    }
+
+    enforce_keyboard_rpm(
+        &state,
+        extension.user_id,
+        extension.session_jti,
+        state.config.keyboard_send_ticket_rpm,
+        crate::services::rate_limiter::RateLimiter::keyboard_send_user_rpm_key(&extension.user_id),
+        crate::services::rate_limiter::RateLimiter::keyboard_send_session_rpm_key(
+            &extension.session_jti,
+        ),
+        "send_ticket",
+    )
+    .await?;
+
+    if let Ok(mut conn) = state.queue.get_conn().await {
+        let nonce_key = crate::services::rate_limiter::RateLimiter::keyboard_nonce_key(
+            &extension.user_id,
+            nonce,
+        );
+        let nonce_set: Option<String> = redis::cmd("SET")
+            .arg(&nonce_key)
+            .arg("1")
+            .arg("EX")
+            .arg(state.config.keyboard_nonce_ttl_secs)
+            .arg("NX")
+            .query_async(&mut conn)
+            .await
+            .unwrap_or(None);
+        if nonce_set.is_none() {
+            return Err(ApiErrorResponse::bad_request("Duplicate send nonce"));
+        }
+    }
+
+    let today_start = Utc::now()
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc()
+        .fixed_offset();
+    let daily_count = send_tickets::Entity::find()
+        .filter(send_tickets::Column::UserId.eq(extension.user_id))
+        .filter(send_tickets::Column::CreatedAt.gte(today_start))
+        .count(&state.db)
+        .await
+        .map_err(ApiErrorResponse::db_error)?;
+    if daily_count >= state.config.keyboard_daily_send_cap {
+        KEYBOARD_RATE_LIMIT_TOTAL.inc();
+        tracing::warn!(
+            event = "rate_limited",
+            domain = "keyboard",
+            action = "send_daily_cap",
+            user_id = %extension.user_id,
+            session_jti = %extension.session_jti,
+            current = daily_count
+        );
+        return Err(ApiErrorResponse::too_many_requests(
+            "Keyboard daily send cap exceeded",
+        ));
+    }
+
+    let video = get_published_video_or_404(&state.db, video_id).await?;
+    let ticket_id = Uuid::new_v4();
+    let expires_at = Utc::now().fixed_offset()
+        + chrono::Duration::seconds(state.config.keyboard_ticket_ttl_secs as i64);
+
+    let ticket = send_tickets::ActiveModel {
+        ticket_id: Set(ticket_id),
+        user_id: Set(extension.user_id),
+        video_id: Set(video.id),
+        device_id_hash: Set(extension.device_id_hash.clone()),
+        host_app_hint: Set(payload.host_app_hint.clone()),
+        created_at: Set(Utc::now().fixed_offset()),
+        expires_at: Set(expires_at),
+        redeemed_at: Set(None),
+        status: Set("active".to_string()),
+    };
+    ticket.insert(&state.db).await?;
+
+    let media_url = format!("/videos/send-ticket/{}/media", ticket_id);
+    let fallback_share_url = format!(
+        "{}/{}/{}",
+        state.config.minio_public_endpoint, state.config.minio_bucket_videos, video.s3_key
+    );
+
+    KEYBOARD_SEND_ATTEMPT_TOTAL.inc();
+    tracing::info!(
+        event = "keyboard_send_attempt",
+        user_id = %extension.user_id,
+        session_jti = %extension.session_jti,
+        video_id = %video.id,
+        ticket_id = %ticket_id
+    );
+
+    Ok(Json(SendTicketResponse {
+        ticket_id,
+        media_url,
+        fallback_share_url,
+        expires_in_seconds: state.config.keyboard_ticket_ttl_secs,
+    }))
+}
+
+pub async fn redeem_send_ticket_media(
+    State(state): State<AppState>,
+    extension: ExtensionAuth,
+    Path(ticket_id): Path<Uuid>,
+) -> ApiResult<axum::response::Response> {
+    use axum::response::{IntoResponse, Redirect};
+
+    if !extension.has_scope("keyboard.send") {
+        return Err(ApiErrorResponse::forbidden("Missing scope: keyboard.send"));
+    }
+
+    let now = Utc::now().fixed_offset();
+    let ticket = send_tickets::Entity::find_by_id(ticket_id)
+        .filter(send_tickets::Column::UserId.eq(extension.user_id))
+        .one(&state.db)
+        .await
+        .map_err(ApiErrorResponse::db_error)?
+        .ok_or_else(|| ApiErrorResponse::not_found("Send ticket not found"))?;
+
+    if ticket.status != "active" || ticket.redeemed_at.is_some() {
+        return Err(ApiErrorResponse::bad_request(
+            "Send ticket already redeemed",
+        ));
+    }
+
+    if ticket.expires_at <= now {
+        KEYBOARD_TICKET_EXPIRED_TOTAL.inc();
+        send_tickets::Entity::update_many()
+            .col_expr(
+                send_tickets::Column::Status,
+                sea_orm::sea_query::Expr::value("expired"),
+            )
+            .filter(send_tickets::Column::TicketId.eq(ticket_id))
+            .filter(send_tickets::Column::Status.eq("active"))
+            .exec(&state.db)
+            .await
+            .ok();
+        tracing::info!(
+            event = "ticket_expired",
+            user_id = %extension.user_id,
+            session_jti = %extension.session_jti,
+            ticket_id = %ticket_id
+        );
+        return Err(ApiErrorResponse::bad_request("Send ticket expired"));
+    }
+
+    let video = get_published_video_or_404(&state.db, ticket.video_id).await?;
+    let result = send_tickets::Entity::update_many()
+        .col_expr(
+            send_tickets::Column::RedeemedAt,
+            sea_orm::sea_query::Expr::value(now),
+        )
+        .col_expr(
+            send_tickets::Column::Status,
+            sea_orm::sea_query::Expr::value("redeemed"),
+        )
+        .filter(send_tickets::Column::TicketId.eq(ticket_id))
+        .filter(send_tickets::Column::UserId.eq(extension.user_id))
+        .filter(send_tickets::Column::Status.eq("active"))
+        .filter(send_tickets::Column::RedeemedAt.is_null())
+        .filter(send_tickets::Column::ExpiresAt.gt(now))
+        .exec(&state.db)
+        .await
+        .map_err(ApiErrorResponse::db_error)?;
+
+    if result.rows_affected != 1 {
+        return Err(ApiErrorResponse::bad_request(
+            "Send ticket is no longer valid",
+        ));
+    }
+
+    let presigned_url = state
+        .storage
+        .generate_presigned_get(
+            &state.config.minio_bucket_videos,
+            &video.s3_key,
+            Duration::from_secs(state.config.keyboard_media_url_ttl_secs),
+        )
+        .await
+        .map_err(|e| {
+            ApiErrorResponse::internal_error(format!("Failed to generate media URL: {}", e))
+        })?;
+
+    Ok(Redirect::temporary(&presigned_url).into_response())
+}
+
 /// POST /videos/bulk-delete
 /// Bulk soft-delete videos owned by the authenticated user.
 pub async fn bulk_delete_videos(

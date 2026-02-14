@@ -4,6 +4,7 @@ target/
 # Git
 .git/
 .gitignore
+.txt
 
 # Environment files
 .env
@@ -30,6 +31,9 @@ docker-compose.yml
 docker-compose.production.yml
 docker-compose.staging.yml
 
+# Runtime data (host bind mounts / volumes)
+data/
+
 # Logs
 *.log
 
@@ -49,3 +53,5 @@ rust-toolchain
 docs/
 
 src/api/tests/
+
+.github

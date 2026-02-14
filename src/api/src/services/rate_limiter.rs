@@ -6,16 +6,31 @@ use shared::queue::QueueService;
 #[derive(Clone)]
 pub struct RateLimiter {
     queue: QueueService,
+    bypass: bool,
 }
 
 impl RateLimiter {
     pub fn new(queue: QueueService) -> Self {
-        Self { queue }
+        Self {
+            queue,
+            bypass: false,
+        }
+    }
+
+    pub fn with_bypass(&self, bypass: bool) -> Self {
+        Self {
+            queue: self.queue.clone(),
+            bypass,
+        }
     }
 
     /// Check if an action is within the rate limit.
     /// Returns Ok(remaining) if allowed, Err with current count if exceeded.
     pub async fn check_rate(&self, key: &str, max_count: u64) -> Result<Result<u64, u64>> {
+        if self.bypass {
+            return Ok(Ok(u64::MAX));
+        }
+
         match self.queue.get_conn().await {
             Ok(mut conn) => {
                 let current: Option<u64> = conn.get(key).await?;
@@ -38,13 +53,23 @@ impl RateLimiter {
     /// Increment the rate limit counter.
     /// Uses Redis INCR with EXPIRE for sliding window.
     pub async fn increment(&self, key: &str, window_secs: usize) -> Result<u64> {
+        self.increment_by(key, 1, window_secs).await
+    }
+
+    /// Increment the rate limit counter by an arbitrary amount.
+    /// Useful for byte-based limits.
+    pub async fn increment_by(&self, key: &str, amount: u64, window_secs: usize) -> Result<u64> {
+        if self.bypass {
+            return Ok(0);
+        }
+
         match self.queue.get_conn().await {
             Ok(mut conn) => {
                 // Use INCR + EXPIRE for atomic increment with TTL
-                let new_count: u64 = conn.incr(key, 1).await?;
+                let new_count: u64 = conn.incr(key, amount as i64).await?;
 
-                // Set expiry only on first increment (count == 1)
-                if new_count == 1 {
+                // Set expiry only when key is first created.
+                if new_count == amount {
                     let _: () = conn.expire(key, window_secs as i64).await?;
                 }
 
@@ -65,6 +90,10 @@ impl RateLimiter {
         max_count: u64,
         window_secs: usize,
     ) -> Result<Result<u64, u64>> {
+        if self.bypass {
+            return Ok(Ok(u64::MAX));
+        }
+
         match self.queue.get_conn().await {
             Ok(mut conn) => {
                 // First check current count
@@ -92,6 +121,10 @@ impl RateLimiter {
 
     /// Get the current count for a rate limit key.
     pub async fn get_count(&self, key: &str) -> Result<u64> {
+        if self.bypass {
+            return Ok(0);
+        }
+
         match self.queue.get_conn().await {
             Ok(mut conn) => {
                 let count: Option<u64> = conn.get(key).await?;
@@ -113,8 +146,63 @@ impl RateLimiter {
         format!("ratelimit:feed:rpm:{}", user_id)
     }
 
+    /// Generate key for per-user like/unlike rate limiting
+    pub fn like_actions_rpm_key(user_id: &uuid::Uuid) -> String {
+        format!("ratelimit:likes:rpm:{}", user_id)
+    }
+
     /// Generate key for per-IP rate limiting
     pub fn ip_rpm_key(ip: &str) -> String {
         format!("ratelimit:ip:rpm:{}", ip)
+    }
+
+    /// Generate key for websocket connection attempts per IP
+    pub fn ws_connect_ip_key(ip: &str) -> String {
+        format!("ratelimit:ws:connect:ip:{}", ip)
+    }
+
+    /// Generate key for websocket connection attempts per user
+    pub fn ws_connect_user_key(user_id: &uuid::Uuid) -> String {
+        format!("ratelimit:ws:connect:user:{}", user_id)
+    }
+
+    /// Generate key for username signup completion attempts per IP
+    pub fn username_signup_ip_key(ip: &str) -> String {
+        format!("ratelimit:username:signup:ip:{}", ip)
+    }
+
+    /// Generate key for username signup completion attempts per signup ticket
+    pub fn username_signup_ticket_key(ticket: &str) -> String {
+        format!("ratelimit:username:signup:ticket:{}", ticket)
+    }
+
+    /// Generate key for username update requests per user
+    pub fn username_update_user_key(user_id: &uuid::Uuid) -> String {
+        format!("ratelimit:username:update:user:{}", user_id)
+    }
+
+    /// Generate key for keyboard search RPM limit per user
+    pub fn keyboard_search_user_rpm_key(user_id: &uuid::Uuid) -> String {
+        format!("ratelimit:keyboard:search:user:{}", user_id)
+    }
+
+    /// Generate key for keyboard search RPM limit per extension session
+    pub fn keyboard_search_session_rpm_key(session_jti: &uuid::Uuid) -> String {
+        format!("ratelimit:keyboard:search:session:{}", session_jti)
+    }
+
+    /// Generate key for keyboard send-ticket RPM limit per user
+    pub fn keyboard_send_user_rpm_key(user_id: &uuid::Uuid) -> String {
+        format!("ratelimit:keyboard:send:user:{}", user_id)
+    }
+
+    /// Generate key for keyboard send-ticket RPM limit per extension session
+    pub fn keyboard_send_session_rpm_key(session_jti: &uuid::Uuid) -> String {
+        format!("ratelimit:keyboard:send:session:{}", session_jti)
+    }
+
+    /// Generate key for keyboard send nonce replay prevention
+    pub fn keyboard_nonce_key(user_id: &uuid::Uuid, nonce: &str) -> String {
+        format!("keyboard:nonce:{}:{}", user_id, nonce)
     }
 }

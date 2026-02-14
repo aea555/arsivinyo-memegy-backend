@@ -1,17 +1,21 @@
+pub mod admin;
+pub mod audit;
 pub mod auth;
 pub mod cache;
 pub mod error;
+pub mod metrics;
 pub mod middleware;
+pub mod realtime;
 pub mod services;
 pub mod state;
 pub mod users;
 pub mod videos;
 
 use axum::{
+    Router,
     http::StatusCode,
     response::{Html, IntoResponse},
     routing::{get, post},
-    Router,
 };
 use state::AppState;
 use tower_http::cors::{Any, CorsLayer};
@@ -38,12 +42,21 @@ async fn serve_openapi() -> impl IntoResponse {
 pub fn create_router(state: AppState) -> Router {
     // CORS Logic
     let cors = if state.config.cors_allowed_origins.is_empty() {
-        // Development mode: allow all origins
-        tracing::warn!("CORS: Allowing all origins (development mode)");
-        CorsLayer::new()
-            .allow_origin(Any)
-            .allow_methods(Any)
-            .allow_headers(Any)
+        if state.config.environment == "development" {
+            // Development mode: allow all origins
+            tracing::warn!("CORS: Allowing all origins (development mode)");
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any)
+        } else {
+            // Production mode (or any non-dev): reject all if not explicitly configured
+            tracing::error!(
+                "CORS: No allowed origins configured in {} mode. Rejecting all cross-origin requests.",
+                state.config.environment
+            );
+            CorsLayer::new()
+        }
     } else {
         // Production mode: restrict to specific origins
         let origins: Vec<_> = state
@@ -73,7 +86,10 @@ pub fn create_router(state: AppState) -> Router {
             .allow_credentials(true)
     };
 
-    Router::new()
+    metrics::register_metrics();
+
+    // Public routes
+    let mut public_router = Router::new()
         .route("/health", get(|| async { "OK" }))
         .route("/docs", get(serve_docs))
         .route("/openapi.yaml", get(serve_openapi))
@@ -84,13 +100,42 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/auth/refresh", post(auth::handlers::refresh_token))
         .route("/auth/logout", post(auth::handlers::logout))
+        .route(
+            "/auth/signup/complete",
+            post(auth::handlers::signup_complete),
+        )
+        .route(
+            "/auth/extension/session",
+            post(auth::handlers::create_extension_session),
+        )
         .route("/auth/dev/login", post(auth::handlers::dev_login))
+        .route("/auth/exchange-otc", post(auth::handlers::exchange_otc));
+
+    // Conditionally expose /metrics only in development/test environments
+    // Production metrics should be scraped via internal monitoring infrastructure
+    if state.config.environment == "development" || state.config.environment == "test" {
+        tracing::info!(
+            "Metrics endpoint enabled at /metrics (environment: {})",
+            state.config.environment
+        );
+        public_router =
+            public_router.route("/metrics", get(|| async { metrics::metrics_handler() }));
+    } else {
+        tracing::info!("Metrics endpoint disabled in production mode");
+    }
+
+    public_router = public_router
         .merge(videos::router::videos_router(&state.config))
         .nest("/users", users::router::users_router(&state.config))
-        .layer(cors)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             middleware::ip_rate_limit::ip_rate_limit,
-        ))
-        .with_state(state)
+        ));
+
+    let mut app_router = Router::new().merge(public_router);
+    if state.config.admin_api_enabled {
+        app_router = app_router.nest("/admin", admin::router::admin_router());
+    }
+
+    app_router.layer(cors).with_state(state)
 }

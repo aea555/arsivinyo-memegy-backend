@@ -60,6 +60,9 @@ The documentation includes:
 - Rate limiting information
 - Error responses
 
+Admin integration and security runbook:
+- `ADMIN_PANEL_SUPERADMIN_GUIDE.txt`
+
 ## Endpoints
 
 ### Auth
@@ -67,12 +70,33 @@ The documentation includes:
 - `GET /auth/google/callback`: Callback from Google. Returns Access/Refresh tokens.
 - `POST /auth/refresh`: Refresh access token.
 - `POST /auth/logout`: Invalidate session.
+- `POST /auth/extension/session`: Mint short-lived keyboard extension token.
 
 ### Videos
 - `POST /videos/init`: Request upload URL. Body: `{ "filename": "meme.mp4", "size_bytes": 123456 }`.
 - `POST /videos/{id}/confirm`: Confirm upload completion.
 - `GET /feed`: Get video feed. Params: `?sort=random|latest|popular&page=0`.
-- `POST /videos/{id}/like`: Like a video.
+- `GET /videos/search/keyboard`: Keyboard-optimized compact search DTO.
+- `POST /videos/{id}/send-ticket`: Create short-lived single-use send ticket.
+- `GET /videos/send-ticket/{ticket_id}/media`: Redeem send ticket to media redirect.
+- `PUT /videos/{id}/like`: Idempotently like a video. Returns current `{ is_liked, like_count }`.
+- `DELETE /videos/{id}/like`: Idempotently unlike a video. Returns current `{ is_liked, like_count }`.
+- `GET /users/me/videos/ws`: WebSocket realtime stream for upload status changes.
+
+### Realtime Video Status (WebSocket)
+- Connect with `Authorization: Bearer <access_token>` to `GET /users/me/videos/ws`.
+- Server sends one snapshot first:
+ Yes, now recreate the plan  - `type = "video.status.snapshot"`
+  - Contains `videos: UserVideoDto[]`
+- Then server sends live status events:
+  - `video.status.processing`
+  - `video.status.published`
+  - `video.status.failed`
+- Each event contains full `video` payload (same shape as `/users/me/videos` item), plus:
+  - `event_id`, `event_at`, `previous_status`, `version`
+- Delivery model:
+  - At-most-once live delivery (Redis Pub/Sub)
+  - Reconnect strategy: reconnect and rely on snapshot to recover missed offline events
 
 ## Testing
 
@@ -94,6 +118,19 @@ This will:
 - Start PostgreSQL, Valkey, and MinIO
 - Launch the API server on port 3000
 - Start the background worker
+
+## Production Durability Notes
+
+- Configure production state paths outside the git checkout via:
+  - `PROD_POSTGRES_DATA_DIR`
+  - `PROD_VALKEY_DATA_DIR`
+  - `PROD_MINIO_DATA_DIR`
+- Recommended values:
+  - Postgres: `/var/lib/memegy/postgres`
+  - Valkey: `/var/lib/memegy/valkey`
+  - MinIO: `/var/lib/memegy/minio`
+- Deployment workflow uses `up -d --build --remove-orphans` and does not run `down`, so persistent data is less exposed to accidental reset.
+- Nightly production DB backups are handled by `.github/workflows/backup-production-db.yml` (plus manual `workflow_dispatch` support).
 
 ## License
 MIT

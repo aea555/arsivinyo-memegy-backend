@@ -8,6 +8,9 @@ server {
     listen 80;
     server_name localhost;
 
+    # specific Docker DNS resolver
+    resolver 127.0.0.11 ipv6=off valid=10s;
+
     # Cloudflare Real IP Configuration
     set_real_ip_from 0.0.0.0/0; # Trust all IPs (for Cloudflare Tunnel / Docker Network)
     real_ip_header CF-Connecting-IP;
@@ -22,7 +25,8 @@ server {
         if ($deny_docs) {
             return 404;
         }
-        proxy_pass http://${API_HOST}:${SERVER_PORT};
+        set $upstream_app http://${API_HOST}:${SERVER_PORT};
+        proxy_pass $upstream_app;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -34,16 +38,40 @@ server {
         if ($deny_docs) {
             return 404;
         }
-        proxy_pass http://${API_HOST}:${SERVER_PORT};
+        set $upstream_app http://${API_HOST}:${SERVER_PORT};
+        proxy_pass $upstream_app;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 
+    # Realtime WebSocket Proxy
+    location /users/me/videos/ws {
+        set $upstream_app http://${API_HOST}:${SERVER_PORT};
+        proxy_pass $upstream_app;
+
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header CF-Connecting-IP $http_cf_connecting_ip;
+        proxy_set_header CF-Ray $http_cf_ray;
+        proxy_set_header CF-IPCountry $http_cf_ipcountry;
+        proxy_set_header CF-Visitor $http_cf_visitor;
+    }
+
     # API Proxy
     location / {
-        proxy_pass http://${API_HOST}:${SERVER_PORT};
+        set $upstream_app http://${API_HOST}:${SERVER_PORT};
+        proxy_pass $upstream_app;
         
         # Proxy Headers
         proxy_set_header Host $host;

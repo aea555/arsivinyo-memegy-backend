@@ -1,7 +1,7 @@
 target/
 docs/
 **/*.rs.bk
-Cargo.lock
+#Cargo.lock
 .env
 .env.*
 .idea/
@@ -14,5 +14,6 @@ docker/minio_data/
 # Ignore all markdown files
 *.md
 
-# Except README.md
+# Except README.md 
 !README.md
+!ADMIN_PANEL_SUPERADMIN_GUIDE.md

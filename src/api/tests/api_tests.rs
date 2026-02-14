@@ -59,6 +59,82 @@ async fn auth_flow_works() {
 }
 
 #[tokio::test]
+async fn refresh_token_works_and_rotates_tokens() {
+    let app = spawn_app().await;
+    let client = Client::new();
+
+    let login_response = client
+        .post(&format!("{}/auth/dev/login", app.address))
+        .json(&serde_json::json!({
+            "username": "refresh_user",
+            "email": "refresh@example.com"
+        }))
+        .send()
+        .await
+        .expect("Failed to login");
+    assert!(login_response.status().is_success());
+    let login_body: serde_json::Value = login_response.json().await.unwrap();
+    let old_access = login_body["access_token"].as_str().unwrap().to_string();
+    let old_refresh = login_body["refresh_token"].as_str().unwrap().to_string();
+
+    let refresh_response = client
+        .post(&format!("{}/auth/refresh", app.address))
+        .json(&serde_json::json!({
+            "access_token": old_access,
+            "refresh_token": old_refresh
+        }))
+        .send()
+        .await
+        .expect("Failed to refresh token");
+
+    let status = refresh_response.status().as_u16();
+    let body_text = refresh_response.text().await.unwrap();
+    assert_eq!(
+        status, 200,
+        "refresh failed with status={}, body={}",
+        status, body_text
+    );
+    let refresh_body: serde_json::Value = serde_json::from_str(&body_text).unwrap();
+    let new_access = refresh_body["access_token"].as_str().unwrap();
+    let new_refresh = refresh_body["refresh_token"].as_str().unwrap();
+    assert!(!new_access.is_empty());
+    assert!(!new_refresh.is_empty());
+    assert_ne!(refresh_body["refresh_token"], login_body["refresh_token"]);
+}
+
+#[tokio::test]
+async fn refresh_token_invalid_input_returns_401_not_500() {
+    let app = spawn_app().await;
+    let client = Client::new();
+
+    let login_response = client
+        .post(&format!("{}/auth/dev/login", app.address))
+        .json(&serde_json::json!({
+            "username": "refresh_invalid_user",
+            "email": "refresh-invalid@example.com"
+        }))
+        .send()
+        .await
+        .expect("Failed to login");
+    assert!(login_response.status().is_success());
+    let login_body: serde_json::Value = login_response.json().await.unwrap();
+
+    let refresh_response = client
+        .post(&format!("{}/auth/refresh", app.address))
+        .json(&serde_json::json!({
+            "access_token": login_body["access_token"],
+            "refresh_token": "not-a-valid-refresh-token"
+        }))
+        .send()
+        .await
+        .expect("Failed to call refresh endpoint");
+
+    let status = refresh_response.status().as_u16();
+    let body = refresh_response.text().await.unwrap();
+    assert_eq!(status, 401, "status={}, body={}", status, body);
+}
+
+#[tokio::test]
 async fn video_upload_flow_works() {
     let app = spawn_app().await;
 
@@ -116,11 +192,11 @@ async fn feed_pagination_and_sorting_works() {
 
     let client = reqwest::Client::new();
 
-    // 2. Test Pagination (Page 1)
+    // 2. Test Pagination (Page 0)
     let response: Response = client
         .get(&format!("{}/feed", app.address))
         .header("Authorization", format!("Bearer {}", token))
-        .query(&[("page", "1"), ("sort", "latest")])
+        .query(&[("page", "0"), ("sort", "latest")])
         .send()
         .await
         .expect("Failed to get feed");
@@ -136,11 +212,11 @@ async fn feed_pagination_and_sorting_works() {
     // Should return 20 items (page size limit)
     assert_eq!(items.len(), 20);
 
-    // 3. Test Pagination (Page 2)
+    // 3. Test Pagination (Page 1)
     let response: Response = client
         .get(&format!("{}/feed", app.address))
         .header("Authorization", format!("Bearer {}", token))
-        .query(&[("page", "2"), ("sort", "latest")])
+        .query(&[("page", "1"), ("sort", "latest")])
         .send()
         .await
         .expect("Failed to get feed");
@@ -153,11 +229,11 @@ async fn feed_pagination_and_sorting_works() {
     // Find the anonymous video in the response (it might be in page 1 or 2 depending on sort order/insertion time)
     // Since we sort by 'latest' and inserted anonymous last, it should be the FIRST item of Page 1.
 
-    // Check Page 1 again for the anonymous item check
+    // Check Page 0 again for the anonymous item check
     let response: Response = client
         .get(&format!("{}/feed", app.address))
         .header("Authorization", format!("Bearer {}", token))
-        .query(&[("page", "1"), ("sort", "latest")])
+        .query(&[("page", "0"), ("sort", "latest")])
         .send()
         .await
         .expect("Failed to get feed");
@@ -178,6 +254,94 @@ async fn feed_pagination_and_sorting_works() {
         "Regular video should have uploader info"
     );
     assert_eq!(regular_video["uploader"]["username"], "feed_user");
+}
+
+#[tokio::test]
+async fn random_feed_with_seed_is_stable_and_pages_do_not_overlap() {
+    let app = spawn_app().await;
+    let token = app
+        .login_as_dev("random_feed_user", "random-feed@example.com")
+        .await;
+
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use shared::entities::users;
+    use std::collections::HashSet;
+
+    let user = users::Entity::find()
+        .filter(users::Column::Username.eq("random_feed_user"))
+        .one(&app.db)
+        .await
+        .unwrap()
+        .unwrap();
+
+    for _ in 0..45 {
+        app.create_dummy_video(user.id, false).await;
+    }
+
+    let client = reqwest::Client::new();
+    let seed = "session_seed_001";
+
+    let page0: Vec<serde_json::Value> = client
+        .get(&format!("{}/feed", app.address))
+        .header("Authorization", format!("Bearer {}", token))
+        .query(&[("page", "0"), ("sort", "random"), ("random_seed", seed)])
+        .send()
+        .await
+        .expect("Failed to get random page 0")
+        .json()
+        .await
+        .expect("Failed to parse page 0");
+
+    let page1: Vec<serde_json::Value> = client
+        .get(&format!("{}/feed", app.address))
+        .header("Authorization", format!("Bearer {}", token))
+        .query(&[("page", "1"), ("sort", "random"), ("random_seed", seed)])
+        .send()
+        .await
+        .expect("Failed to get random page 1")
+        .json()
+        .await
+        .expect("Failed to parse page 1");
+
+    let page0_again: Vec<serde_json::Value> = client
+        .get(&format!("{}/feed", app.address))
+        .header("Authorization", format!("Bearer {}", token))
+        .query(&[("page", "0"), ("sort", "random"), ("random_seed", seed)])
+        .send()
+        .await
+        .expect("Failed to get random page 0 again")
+        .json()
+        .await
+        .expect("Failed to parse page 0 again");
+
+    assert_eq!(page0.len(), 20);
+    assert_eq!(page1.len(), 20);
+
+    let ids0: Vec<&str> = page0
+        .iter()
+        .map(|v| v["id"].as_str().expect("page0 id missing"))
+        .collect();
+    let ids1: Vec<&str> = page1
+        .iter()
+        .map(|v| v["id"].as_str().expect("page1 id missing"))
+        .collect();
+    let ids0_again: Vec<&str> = page0_again
+        .iter()
+        .map(|v| v["id"].as_str().expect("page0_again id missing"))
+        .collect();
+
+    let set0: HashSet<&str> = ids0.iter().copied().collect();
+    let set1: HashSet<&str> = ids1.iter().copied().collect();
+    let overlap_count = set0.intersection(&set1).count();
+
+    assert_eq!(
+        overlap_count, 0,
+        "Seeded random pages overlapped unexpectedly"
+    );
+    assert_eq!(
+        ids0, ids0_again,
+        "Seeded random ordering for the same page must be stable"
+    );
 }
 
 #[tokio::test]
@@ -255,6 +419,39 @@ async fn video_lifecycle_works() {
 }
 
 #[tokio::test]
+async fn noop_video_metadata_updates_do_not_hit_update_rate_limit() {
+    let app = spawn_app().await;
+    let client = Client::new();
+    let token = app
+        .login_as_dev("noop_meta_user", "noop-meta@example.com")
+        .await;
+
+    let (video_id, _) = app.init_upload(&token, "noop_meta.mp4", 1024).await;
+    app.confirm_upload(&token, &video_id).await;
+
+    for attempt in 1..=35 {
+        let response = client
+            .patch(&format!("{}/videos/{}", app.address, video_id))
+            .header("Authorization", format!("Bearer {}", token))
+            .json(&serde_json::json!({
+                "is_anonymous": false
+            }))
+            .send()
+            .await
+            .expect("Failed to issue no-op metadata update");
+
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "no-op update failed on attempt {} with status {} and body {}",
+            attempt,
+            response.status(),
+            response.text().await.unwrap_or_default()
+        );
+    }
+}
+
+#[tokio::test]
 async fn like_video_works() {
     let app = spawn_app().await;
     let client = Client::new();
@@ -282,13 +479,16 @@ async fn like_video_works() {
     let token_b = app.login_as_dev("user_b", "b@example.com").await;
 
     let response: Response = client
-        .post(&format!("{}/videos/{}/like", app.address, video_id))
+        .put(&format!("{}/videos/{}/like", app.address, video_id))
         .header("Authorization", format!("Bearer {}", token_b))
         .send()
         .await
         .expect("Failed to like video");
 
-    assert_eq!(response.status().as_u16(), 201); // CREATED
+    assert_eq!(response.status().as_u16(), 200); // OK
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["is_liked"], true);
+    assert_eq!(body["like_count"], 1);
 
     // Verify count
     let video = videos::Entity::find_by_id(video_uuid)
@@ -298,23 +498,101 @@ async fn like_video_works() {
         .unwrap();
     assert_eq!(video.like_count, 1);
 
-    // Duplicate Like
+    // Unlike
     let response: Response = client
-        .post(&format!("{}/videos/{}/like", app.address, video_id))
+        .delete(&format!("{}/videos/{}/like", app.address, video_id))
         .header("Authorization", format!("Bearer {}", token_b))
         .send()
         .await
-        .expect("Failed to like video again");
+        .expect("Failed to unlike video");
 
-    assert_eq!(response.status().as_u16(), 200); // OK (Idempotent)
+    assert_eq!(response.status().as_u16(), 200); // OK
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["is_liked"], false);
+    assert_eq!(body["like_count"], 0);
 
-    // Verify count remains 1
+    // Verify count decremented
     let video = videos::Entity::find_by_id(video_uuid)
         .one(&app.db)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(video.like_count, 1);
+    assert_eq!(video.like_count, 0);
+}
+
+#[tokio::test]
+async fn like_video_idempotent_put_delete_works() {
+    let app = spawn_app().await;
+    let client = Client::new();
+
+    // User A uploads
+    let token_a = app.login_as_dev("user_a2", "a2@example.com").await;
+    let (video_id, _) = app.init_upload(&token_a, "vid2.mp4", 1024).await;
+    app.confirm_upload(&token_a, &video_id).await;
+
+    // Force update to PUBLISHED manually
+    use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+    use shared::entities::videos;
+
+    let video_uuid = uuid::Uuid::parse_str(&video_id).unwrap();
+    let video = videos::Entity::find_by_id(video_uuid)
+        .one(&app.db)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut active: videos::ActiveModel = video.into();
+    active.status = Set("PUBLISHED".to_string());
+    active.update(&app.db).await.unwrap();
+
+    let token_b = app.login_as_dev("user_b2", "b2@example.com").await;
+
+    // First PUT likes the video.
+    let response: Response = client
+        .put(&format!("{}/videos/{}/like", app.address, video_id))
+        .header("Authorization", format!("Bearer {}", token_b))
+        .send()
+        .await
+        .expect("Failed to like video with PUT");
+    assert_eq!(response.status().as_u16(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["is_liked"], true);
+    assert_eq!(body["like_count"], 1);
+
+    // Second PUT stays liked and does not increment again.
+    let response: Response = client
+        .put(&format!("{}/videos/{}/like", app.address, video_id))
+        .header("Authorization", format!("Bearer {}", token_b))
+        .send()
+        .await
+        .expect("Failed to re-like video with PUT");
+    assert_eq!(response.status().as_u16(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["is_liked"], true);
+    assert_eq!(body["like_count"], 1);
+
+    // First DELETE unlikes the video.
+    let response: Response = client
+        .delete(&format!("{}/videos/{}/like", app.address, video_id))
+        .header("Authorization", format!("Bearer {}", token_b))
+        .send()
+        .await
+        .expect("Failed to unlike video with DELETE");
+    assert_eq!(response.status().as_u16(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["is_liked"], false);
+    assert_eq!(body["like_count"], 0);
+
+    // Second DELETE stays unliked and does not decrement below zero.
+    let response: Response = client
+        .delete(&format!("{}/videos/{}/like", app.address, video_id))
+        .header("Authorization", format!("Bearer {}", token_b))
+        .send()
+        .await
+        .expect("Failed to re-unlike video with DELETE");
+    assert_eq!(response.status().as_u16(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["is_liked"], false);
+    assert_eq!(body["like_count"], 0);
 }
 
 #[tokio::test]
@@ -360,6 +638,103 @@ async fn user_profile_management_works() {
 }
 
 #[tokio::test]
+async fn my_videos_returns_playable_url_for_published_only() {
+    let app = spawn_app().await;
+    let client = Client::new();
+    let email = "myvideos@example.com";
+    let token = app.login_as_dev("myvideos_user", email).await;
+
+    use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+    use shared::entities::{likes, users, videos};
+
+    let user = users::Entity::find()
+        .filter(users::Column::Email.eq(email))
+        .one(&app.db)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let published_id = uuid::Uuid::new_v4();
+    let processing_id = uuid::Uuid::new_v4();
+
+    let published = videos::ActiveModel {
+        id: Set(published_id),
+        user_id: Set(user.id),
+        title: Set(Some("Published video".to_string())),
+        description: Set(None),
+        s3_bucket: Set("videos".to_string()),
+        s3_key: Set("published.mp4".to_string()),
+        status: Set("PUBLISHED".to_string()),
+        size_bytes: Set(1024),
+        duration_seconds: Set(None),
+        like_count: Set(3),
+        is_anonymous: Set(false),
+        processing_error_code: Set(None),
+        processing_error_message: Set(None),
+        failed_at: Set(None),
+        deleted_at: Set(None),
+        created_at: Set(chrono::Utc::now().into()),
+        updated_at: Set(chrono::Utc::now().into()),
+    };
+    published.insert(&app.db).await.unwrap();
+
+    let processing = videos::ActiveModel {
+        id: Set(processing_id),
+        user_id: Set(user.id),
+        title: Set(Some("Processing video".to_string())),
+        description: Set(None),
+        s3_bucket: Set("raw".to_string()),
+        s3_key: Set("processing.mp4".to_string()),
+        status: Set("PROCESSING".to_string()),
+        size_bytes: Set(1024),
+        duration_seconds: Set(None),
+        like_count: Set(0),
+        is_anonymous: Set(false),
+        processing_error_code: Set(None),
+        processing_error_message: Set(None),
+        failed_at: Set(None),
+        deleted_at: Set(None),
+        created_at: Set(chrono::Utc::now().into()),
+        updated_at: Set(chrono::Utc::now().into()),
+    };
+    processing.insert(&app.db).await.unwrap();
+
+    let like = likes::ActiveModel {
+        user_id: Set(user.id),
+        video_id: Set(published_id),
+        ..Default::default()
+    };
+    like.insert(&app.db).await.unwrap();
+
+    let response: Response = client
+        .get(&format!("{}/users/me/videos", app.address))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .expect("Failed to get my videos");
+
+    assert!(response.status().is_success());
+    let body: Vec<serde_json::Value> = response.json().await.unwrap();
+
+    let published_item = body
+        .iter()
+        .find(|item| item["id"] == published_id.to_string())
+        .expect("Published video should exist");
+    assert_eq!(
+        published_item["url"].as_str(),
+        Some("http://mock/videos/published.mp4")
+    );
+    assert_eq!(published_item["is_liked"], true);
+
+    let processing_item = body
+        .iter()
+        .find(|item| item["id"] == processing_id.to_string())
+        .expect("Processing video should exist");
+    assert!(processing_item["url"].is_null());
+    assert_eq!(processing_item["is_liked"], false);
+}
+
+#[tokio::test]
 async fn search_functionality_works() {
     let app = spawn_app().await;
     let client = Client::new();
@@ -391,8 +766,12 @@ async fn search_functionality_works() {
         s3_key: Set("key1".to_string()),
         status: Set("PUBLISHED".to_string()),
         size_bytes: Set(1024),
+        duration_seconds: Set(None),
         like_count: Set(0),
         is_anonymous: Set(false),
+        processing_error_code: Set(None),
+        processing_error_message: Set(None),
+        failed_at: Set(None),
         deleted_at: Set(None),
         created_at: Set(chrono::Utc::now().into()),
         updated_at: Set(chrono::Utc::now().into()),
@@ -409,8 +788,12 @@ async fn search_functionality_works() {
         s3_key: Set("key2".to_string()),
         status: Set("PUBLISHED".to_string()),
         size_bytes: Set(1024),
+        duration_seconds: Set(None),
         like_count: Set(0),
         is_anonymous: Set(false),
+        processing_error_code: Set(None),
+        processing_error_message: Set(None),
+        failed_at: Set(None),
         deleted_at: Set(None),
         created_at: Set(chrono::Utc::now().into()),
         updated_at: Set(chrono::Utc::now().into()),
@@ -430,6 +813,7 @@ async fn search_functionality_works() {
     let items: Vec<serde_json::Value> = response.json().await.unwrap();
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["title"], "Rust Programming Tutorial");
+    assert_eq!(items[0]["url"], "http://mock/videos/key1");
 
     // 2. Search for "Pasta"
     let response: Response = client
@@ -443,6 +827,7 @@ async fn search_functionality_works() {
     let items: Vec<serde_json::Value> = response.json().await.unwrap();
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["title"], "Cooking Pasta");
+    assert_eq!(items[0]["url"], "http://mock/videos/key2");
 }
 
 #[tokio::test]

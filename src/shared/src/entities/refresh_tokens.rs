@@ -11,6 +11,8 @@ pub struct Model {
     pub token_hash: String,
     pub expires_at: DateTimeWithTimeZone,
     pub created_at: DateTimeWithTimeZone,
+    pub replaced_by: Option<Uuid>,
+    pub replaced_at: Option<DateTimeWithTimeZone>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -23,11 +25,30 @@ pub enum Relation {
         on_delete = "Cascade"
     )]
     Users,
+    #[sea_orm(
+        belongs_to = "Entity",
+        from = "Column::ReplacedBy",
+        to = "Column::Id",
+        on_update = "Cascade",
+        on_delete = "SetNull"
+    )]
+    SelfRef,
 }
 
 impl Related<super::users::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Users.def()
+    }
+}
+
+pub struct SelfRefLink;
+
+impl Linked for SelfRefLink {
+    type FromEntity = Entity;
+    type ToEntity = Entity;
+
+    fn link(&self) -> Vec<RelationDef> {
+        vec![Relation::SelfRef.def()]
     }
 }
 

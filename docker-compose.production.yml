@@ -1,5 +1,7 @@
 services:
   db:
+    networks:
+      - memegy-network
     image: postgres:18.1-alpine3.23
     container_name: memegy_prod_db
     restart: always
@@ -7,10 +9,12 @@ services:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
+      PGDATA: /var/lib/postgresql/data
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=scram-sha-256"
     ports:
       - "127.0.0.1:5432:5432"
     volumes:
-      - ./data/prod/postgres:/var/lib/postgresql/data
+      - ${PROD_POSTGRES_DATA_DIR:-./data/prod/postgres}:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
@@ -18,21 +22,31 @@ services:
       retries: 5
 
   cache:
+    networks:
+      - memegy-network
     image: valkey/valkey:9.0.1-alpine
     container_name: memegy_prod_cache
     restart: always
-    command: valkey-server --requirepass "${VALKEY_PASSWORD}"
+    environment:
+      VALKEY_PASSWORD: ${VALKEY_PASSWORD}
+    command: >
+      /bin/sh -ec '
+      test -n "$$VALKEY_PASSWORD";
+      exec valkey-server --requirepass "$$VALKEY_PASSWORD" --protected-mode yes
+      '
     ports:
       - "127.0.0.1:6379:6379"
     volumes:
-      - ./data/prod/valkey:/data
+      - ${PROD_VALKEY_DATA_DIR:-./data/prod/valkey}:/data
     healthcheck:
-      test: ["CMD", "valkey-cli", "-a", "${VALKEY_PASSWORD}", "ping"]
+      test: ["CMD-SHELL", "valkey-cli -a \"$${VALKEY_PASSWORD}\" ping | grep -q PONG"]
       interval: 5s
       timeout: 5s
       retries: 5
 
   minio:
+    networks:
+      - memegy-network
     image: minio/minio:RELEASE.2025-09-07T16-13-09Z
     container_name: memegy_prod_minio
     restart: always
@@ -44,7 +58,7 @@ services:
       - "127.0.0.1:9000:9000"
       - "127.0.0.1:9001:9001"
     volumes:
-      - ./data/prod/minio:/data
+      - ${PROD_MINIO_DATA_DIR:-./data/prod/minio}:/data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 5s
@@ -52,6 +66,8 @@ services:
       retries: 5
 
   minio-setup:
+    networks:
+      - memegy-network
     image: minio/mc:RELEASE.2025-01-17T23-25-50Z
     container_name: memegy_prod_minio_setup
     depends_on:
@@ -67,6 +83,8 @@ services:
       "
 
   nginx:
+    networks:
+      - memegy-network
     image: nginx:1.28.1-alpine
     container_name: memegy_prod_nginx
     restart: always
@@ -83,6 +101,8 @@ services:
       - api
 
   api:
+    networks:
+      - memegy-network
     build:
       context: .
       target: api
@@ -108,10 +128,23 @@ services:
       # Token TTLs
       ACCESS_TOKEN_TTL_SECS: ${ACCESS_TOKEN_TTL_SECS}
       REFRESH_TOKEN_TTL_DAYS: ${REFRESH_TOKEN_TTL_DAYS}
+      AUTH_REQUIRE_USERNAME_ON_GOOGLE_SIGNUP: ${AUTH_REQUIRE_USERNAME_ON_GOOGLE_SIGNUP:-true}
+      USERNAME_RESERVED_VALUES: ${USERNAME_RESERVED_VALUES:-admin,support,api,root,system,me,users,auth,feed,superuser,staff,moderator,manager,editor,superadmin,sysadmin,administrator,operator,dev,developer,qa,test,testing,contact,help,info,security,abuse,postmaster,webmaster,host}
+      ADMIN_API_ENABLED: ${ADMIN_API_ENABLED:-false}
+      ADMIN_JWT_ISSUER: ${ADMIN_JWT_ISSUER}
+      ADMIN_JWT_AUDIENCE: ${ADMIN_JWT_AUDIENCE}
+      ADMIN_JWT_PUBLIC_KEYS_JSON: ${ADMIN_JWT_PUBLIC_KEYS_JSON:-{}}
+      ADMIN_JWT_MAX_TTL_SECS: ${ADMIN_JWT_MAX_TTL_SECS:-300}
+      ADMIN_JWT_CLOCK_SKEW_SECS: ${ADMIN_JWT_CLOCK_SKEW_SECS:-60}
+      ADMIN_REPLAY_PROTECTION_ENABLED: ${ADMIN_REPLAY_PROTECTION_ENABLED:-true}
+      ADMIN_ALLOWED_IP_CIDRS: ${ADMIN_ALLOWED_IP_CIDRS}
 
       # Auth
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+      OAUTH_REDIRECT_BASE_URL: ${OAUTH_REDIRECT_BASE_URL}
+      FRONTEND_APP_URL: ${FRONTEND_APP_URL:-http://localhost:3000}
+      MOBILE_APP_SCHEME: ${MOBILE_APP_SCHEME}
 
       # Database
       DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
@@ -131,9 +164,18 @@ services:
       # Limits
       MAX_FILE_SIZE_BYTES: ${MAX_FILE_SIZE_BYTES}
       LIMIT_UPLOAD_BYTES_HOURLY: ${LIMIT_UPLOAD_BYTES_HOURLY}
+      UPLOAD_SIZE_TOLERANCE_BYTES: ${UPLOAD_SIZE_TOLERANCE_BYTES:-0}
+      MIN_VIDEO_SIZE_BYTES: ${MIN_VIDEO_SIZE_BYTES:-1024}
       LIMIT_FEED_RPM: ${LIMIT_FEED_RPM}
       RATE_LIMIT_WINDOW_SECS: ${RATE_LIMIT_WINDOW_SECS}
       IP_RATE_LIMIT_RPM: ${IP_RATE_LIMIT_RPM}
+      LIKE_ACTIONS_RPM_LIMIT: ${LIKE_ACTIONS_RPM_LIMIT:-60}
+      LIKE_ACTIONS_WINDOW_SECS: ${LIKE_ACTIONS_WINDOW_SECS:-60}
+      OTC_RATE_LIMIT_MAX_ATTEMPTS: ${OTC_RATE_LIMIT_MAX_ATTEMPTS}
+      OTC_RATE_LIMIT_WINDOW_SECONDS: ${OTC_RATE_LIMIT_WINDOW_SECONDS}
+      USERNAME_SIGNUP_RPM_PER_IP: ${USERNAME_SIGNUP_RPM_PER_IP:-20}
+      USERNAME_SIGNUP_ATTEMPTS_PER_TICKET: ${USERNAME_SIGNUP_ATTEMPTS_PER_TICKET:-10}
+      USERNAME_UPDATE_RPM_PER_USER: ${USERNAME_UPDATE_RPM_PER_USER:-5}
 
       # Feed
       FEED_PAGE_SIZE: ${FEED_PAGE_SIZE}
@@ -143,6 +185,8 @@ services:
       DRAFT_VIDEO_CLEANUP_HOURS: ${DRAFT_VIDEO_CLEANUP_HOURS}
       WORKER_RETRY_MAX_ATTEMPTS: ${WORKER_RETRY_MAX_ATTEMPTS}
       WORKER_RETRY_BACKOFF_BASE_SECS: ${WORKER_RETRY_BACKOFF_BASE_SECS}
+      FFMPEG_TRANSCODE_TIMEOUT_SECS: ${FFMPEG_TRANSCODE_TIMEOUT_SECS:-180}
+      FFMPEG_THUMBNAIL_TIMEOUT_SECS: ${FFMPEG_THUMBNAIL_TIMEOUT_SECS:-30}
 
       # Search
       SEARCH_MAX_TOKENS: ${SEARCH_MAX_TOKENS}
@@ -151,6 +195,13 @@ services:
       SEARCH_TIMEOUT_SECS: ${SEARCH_TIMEOUT_SECS}
       SEARCH_CACHE_TTL_SECS: ${SEARCH_CACHE_TTL_SECS}
       SEARCH_RPM_LIMIT: ${SEARCH_RPM_LIMIT}
+      VIDEO_WS_ENABLED: ${VIDEO_WS_ENABLED:-true}
+      VIDEO_WS_MAX_CONN_PER_USER: ${VIDEO_WS_MAX_CONN_PER_USER:-3}
+      VIDEO_WS_MAX_CONN_GLOBAL: ${VIDEO_WS_MAX_CONN_GLOBAL:-5000}
+      VIDEO_WS_CONNECT_RPM_PER_IP: ${VIDEO_WS_CONNECT_RPM_PER_IP:-30}
+      VIDEO_WS_CONNECT_RPM_PER_USER: ${VIDEO_WS_CONNECT_RPM_PER_USER:-60}
+      VIDEO_WS_SEND_BUFFER: ${VIDEO_WS_SEND_BUFFER:-64}
+      VIDEO_WS_HEARTBEAT_SECS: ${VIDEO_WS_HEARTBEAT_SECS:-20}
 
       # Download
       DOWNLOAD_RPM_LIMIT: ${DOWNLOAD_RPM_LIMIT}
@@ -166,6 +217,8 @@ services:
       BULK_DOWNLOAD_ZIP_EXPIRY_DAYS: ${BULK_DOWNLOAD_ZIP_EXPIRY_DAYS}
 
   worker:
+    networks:
+      - memegy-network
     build:
       context: .
       target: worker
@@ -191,6 +244,16 @@ services:
       # Token TTLs
       ACCESS_TOKEN_TTL_SECS: ${ACCESS_TOKEN_TTL_SECS}
       REFRESH_TOKEN_TTL_DAYS: ${REFRESH_TOKEN_TTL_DAYS}
+      AUTH_REQUIRE_USERNAME_ON_GOOGLE_SIGNUP: ${AUTH_REQUIRE_USERNAME_ON_GOOGLE_SIGNUP:-true}
+      USERNAME_RESERVED_VALUES: ${USERNAME_RESERVED_VALUES:-admin,support,api,root,system,me,users,auth,feed}
+      ADMIN_API_ENABLED: ${ADMIN_API_ENABLED:-false}
+      ADMIN_JWT_ISSUER: ${ADMIN_JWT_ISSUER}
+      ADMIN_JWT_AUDIENCE: ${ADMIN_JWT_AUDIENCE}
+      ADMIN_JWT_PUBLIC_KEYS_JSON: ${ADMIN_JWT_PUBLIC_KEYS_JSON:-{}}
+      ADMIN_JWT_MAX_TTL_SECS: ${ADMIN_JWT_MAX_TTL_SECS:-300}
+      ADMIN_JWT_CLOCK_SKEW_SECS: ${ADMIN_JWT_CLOCK_SKEW_SECS:-60}
+      ADMIN_REPLAY_PROTECTION_ENABLED: ${ADMIN_REPLAY_PROTECTION_ENABLED:-true}
+      ADMIN_ALLOWED_IP_CIDRS: ${ADMIN_ALLOWED_IP_CIDRS}
 
       # Auth
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
@@ -214,9 +277,18 @@ services:
       # Limits
       MAX_FILE_SIZE_BYTES: ${MAX_FILE_SIZE_BYTES}
       LIMIT_UPLOAD_BYTES_HOURLY: ${LIMIT_UPLOAD_BYTES_HOURLY}
+      UPLOAD_SIZE_TOLERANCE_BYTES: ${UPLOAD_SIZE_TOLERANCE_BYTES:-0}
+      MIN_VIDEO_SIZE_BYTES: ${MIN_VIDEO_SIZE_BYTES:-1024}
       LIMIT_FEED_RPM: ${LIMIT_FEED_RPM}
       RATE_LIMIT_WINDOW_SECS: ${RATE_LIMIT_WINDOW_SECS}
       IP_RATE_LIMIT_RPM: ${IP_RATE_LIMIT_RPM}
+      LIKE_ACTIONS_RPM_LIMIT: ${LIKE_ACTIONS_RPM_LIMIT:-60}
+      LIKE_ACTIONS_WINDOW_SECS: ${LIKE_ACTIONS_WINDOW_SECS:-60}
+      OTC_RATE_LIMIT_MAX_ATTEMPTS: ${OTC_RATE_LIMIT_MAX_ATTEMPTS}
+      OTC_RATE_LIMIT_WINDOW_SECONDS: ${OTC_RATE_LIMIT_WINDOW_SECONDS}
+      USERNAME_SIGNUP_RPM_PER_IP: ${USERNAME_SIGNUP_RPM_PER_IP:-20}
+      USERNAME_SIGNUP_ATTEMPTS_PER_TICKET: ${USERNAME_SIGNUP_ATTEMPTS_PER_TICKET:-10}
+      USERNAME_UPDATE_RPM_PER_USER: ${USERNAME_UPDATE_RPM_PER_USER:-5}
 
       # Feed
       FEED_PAGE_SIZE: ${FEED_PAGE_SIZE}
@@ -226,6 +298,8 @@ services:
       DRAFT_VIDEO_CLEANUP_HOURS: ${DRAFT_VIDEO_CLEANUP_HOURS}
       WORKER_RETRY_MAX_ATTEMPTS: ${WORKER_RETRY_MAX_ATTEMPTS}
       WORKER_RETRY_BACKOFF_BASE_SECS: ${WORKER_RETRY_BACKOFF_BASE_SECS}
+      FFMPEG_TRANSCODE_TIMEOUT_SECS: ${FFMPEG_TRANSCODE_TIMEOUT_SECS:-180}
+      FFMPEG_THUMBNAIL_TIMEOUT_SECS: ${FFMPEG_THUMBNAIL_TIMEOUT_SECS:-30}
 
       # Search
       SEARCH_MAX_TOKENS: ${SEARCH_MAX_TOKENS}
@@ -234,6 +308,13 @@ services:
       SEARCH_TIMEOUT_SECS: ${SEARCH_TIMEOUT_SECS}
       SEARCH_CACHE_TTL_SECS: ${SEARCH_CACHE_TTL_SECS}
       SEARCH_RPM_LIMIT: ${SEARCH_RPM_LIMIT}
+      VIDEO_WS_ENABLED: ${VIDEO_WS_ENABLED:-true}
+      VIDEO_WS_MAX_CONN_PER_USER: ${VIDEO_WS_MAX_CONN_PER_USER:-3}
+      VIDEO_WS_MAX_CONN_GLOBAL: ${VIDEO_WS_MAX_CONN_GLOBAL:-5000}
+      VIDEO_WS_CONNECT_RPM_PER_IP: ${VIDEO_WS_CONNECT_RPM_PER_IP:-30}
+      VIDEO_WS_CONNECT_RPM_PER_USER: ${VIDEO_WS_CONNECT_RPM_PER_USER:-60}
+      VIDEO_WS_SEND_BUFFER: ${VIDEO_WS_SEND_BUFFER:-64}
+      VIDEO_WS_HEARTBEAT_SECS: ${VIDEO_WS_HEARTBEAT_SECS:-20}
 
       # Download
       DOWNLOAD_RPM_LIMIT: ${DOWNLOAD_RPM_LIMIT}
@@ -247,3 +328,7 @@ services:
       BULK_DOWNLOAD_DAILY_LIMIT: ${BULK_DOWNLOAD_DAILY_LIMIT}
       MINIO_BUCKET_DOWNLOADS: ${MINIO_BUCKET_DOWNLOADS}
       BULK_DOWNLOAD_ZIP_EXPIRY_DAYS: ${BULK_DOWNLOAD_ZIP_EXPIRY_DAYS}
+
+networks:
+  memegy-network:
+    driver: bridge

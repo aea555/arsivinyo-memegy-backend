@@ -10,8 +10,10 @@ pub struct Model {
     #[sea_orm(unique)]
     pub google_id: String,
     pub username: String,
+    pub username_normalized: Option<String>,
     pub email: String,
     pub avatar_url: Option<String>,
+    pub username_updated_at: Option<DateTimeWithTimeZone>,
     pub deleted_at: Option<DateTimeWithTimeZone>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
