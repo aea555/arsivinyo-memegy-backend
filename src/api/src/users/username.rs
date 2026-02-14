@@ -65,6 +65,7 @@ fn default_reserved_usernames() -> HashSet<&'static str> {
         "editor",
         "superadmin",
         "sysadmin",
+        "sys",
         "administrator",
         "operator",
         "dev",
@@ -91,6 +92,29 @@ fn collect_reserved_usernames(config: &Config) -> HashSet<String> {
     names
 }
 
+fn normalize_for_reserved_match(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| c.is_ascii_lowercase())
+        .collect::<String>()
+}
+
+fn is_reserved_username_variant(normalized_username: &str, reserved: &HashSet<String>) -> bool {
+    if reserved.contains(normalized_username) {
+        return true;
+    }
+
+    let folded_username = normalize_for_reserved_match(normalized_username);
+    if folded_username.is_empty() {
+        return false;
+    }
+
+    reserved.iter().any(|value| {
+        let folded_reserved = normalize_for_reserved_match(value);
+        !folded_reserved.is_empty() && folded_username.contains(&folded_reserved)
+    })
+}
+
 pub fn validate_username(
     input: &str,
     config: &Config,
@@ -112,7 +136,7 @@ pub fn validate_username(
 
     let normalized = input.to_ascii_lowercase();
     let reserved = collect_reserved_usernames(config);
-    if reserved.contains(&normalized) {
+    if is_reserved_username_variant(&normalized, &reserved) {
         return Err(UsernameValidationError::Reserved);
     }
 
@@ -291,6 +315,18 @@ mod tests {
         ));
         assert!(matches!(
             validate_username("moderator", &cfg),
+            Err(UsernameValidationError::Reserved)
+        ));
+        assert!(matches!(
+            validate_username("admin1", &cfg),
+            Err(UsernameValidationError::Reserved)
+        ));
+        assert!(matches!(
+            validate_username("1admin", &cfg),
+            Err(UsernameValidationError::Reserved)
+        ));
+        assert!(matches!(
+            validate_username("a_d_m_i_n", &cfg),
             Err(UsernameValidationError::Reserved)
         ));
     }

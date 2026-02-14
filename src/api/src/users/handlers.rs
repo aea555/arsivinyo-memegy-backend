@@ -75,6 +75,14 @@ pub(crate) fn video_model_to_user_dto(
     } else {
         None
     };
+    let thumbnail_url = if has_public_object {
+        Some(format!(
+            "{}/{}/{}_thumb.jpg",
+            config.minio_public_endpoint, config.minio_bucket_videos, v.id
+        ))
+    } else {
+        None
+    };
 
     UserVideoDto {
         id: v.id,
@@ -87,6 +95,7 @@ pub(crate) fn video_model_to_user_dto(
         is_liked,
         like_count: v.like_count,
         url,
+        thumbnail_url,
         processing_error_code: v.processing_error_code,
         processing_error_message: v.processing_error_message,
     }

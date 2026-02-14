@@ -13,6 +13,7 @@ pub struct UserVideoDto {
     pub is_liked: bool,
     pub like_count: i64,
     pub url: Option<String>,
+    pub thumbnail_url: Option<String>,
     pub processing_error_code: Option<String>,
     pub processing_error_message: Option<String>,
 }

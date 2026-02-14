@@ -60,6 +60,8 @@ pub struct VideoFeedItem {
     pub id: Uuid,
     pub title: Option<String>,
     pub url: String, // Public URL
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumbnail_url: Option<String>,
     pub like_count: i64,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -133,6 +135,9 @@ pub async fn get_feed(
                     id: c.id,
                     title: c.title,
                     url: format!("{}/{}", base_url, c.url.split('/').last().unwrap_or(&c.url)),
+                    thumbnail_url: c
+                        .thumbnail_url
+                        .or_else(|| Some(format!("{}/{}_thumb.jpg", base_url, c.id))),
                     like_count: c.like_count,
                     created_at: c.created_at,
                     uploader: if c.is_anonymous {
@@ -231,6 +236,7 @@ pub async fn get_feed(
             id: v.id,
             title: v.title.clone(),
             url: format!("{}/{}", base_url, v.s3_key),
+            thumbnail_url: Some(format!("{}/{}_thumb.jpg", base_url, v.id)),
             like_count: v.like_count,
             created_at: v.created_at,
             // Only include uploader for non-anonymous videos
@@ -275,7 +281,7 @@ pub async fn get_feed(
                 id: v.id,
                 title: v.title.clone(),
                 url: v.s3_key.clone(),
-                thumbnail_url: None,
+                thumbnail_url: Some(format!("{}/{}_thumb.jpg", base_url, v.id)),
                 like_count: v.like_count,
                 created_at: v.created_at,
                 deleted_at: v.deleted_at,
@@ -1484,6 +1490,12 @@ fn validate_search_query(query: &str, config: &SearchConfig) -> Result<String, A
         return Err(ApiErrorResponse::bad_request("Query cannot be empty"));
     }
 
+    if normalized.chars().count() < 3 {
+        return Err(ApiErrorResponse::bad_request(
+            "Query must be at least 3 characters",
+        ));
+    }
+
     // 3. Character count limit (Unicode-aware)
     if normalized.chars().count() > config.max_query_chars {
         return Err(ApiErrorResponse::bad_request(format!(
@@ -1512,6 +1524,30 @@ fn validate_search_query(query: &str, config: &SearchConfig) -> Result<String, A
     }
 
     Ok(normalized)
+}
+
+fn build_search_like_pattern(query: &str) -> String {
+    format!("%{}%", query.to_lowercase())
+}
+
+fn build_relaxed_like_pattern(query: &str) -> Option<String> {
+    let mut tokens = query.split_whitespace();
+    let token = tokens.next()?;
+    if tokens.next().is_some() {
+        return None;
+    }
+
+    let token_len = token.chars().count();
+    if token_len < 5 {
+        return None;
+    }
+
+    let stem: String = token.chars().take(token_len - 1).collect();
+    if stem.chars().count() < 3 {
+        return None;
+    }
+
+    Some(format!("%{}%", stem.to_lowercase()))
 }
 
 /// Logs suspicious search queries for security monitoring
@@ -1657,6 +1693,8 @@ pub async fn search_videos_keyboard(
 
     let search_config = SearchConfig::from_config(&state.config);
     let query = validate_search_query(&params.q, &search_config)?;
+    let like_pattern = build_search_like_pattern(&query);
+    let relaxed_like_pattern = build_relaxed_like_pattern(&query);
     let limit = params
         .limit
         .max(1)
@@ -1668,8 +1706,19 @@ pub async fn search_videos_keyboard(
             r#"
             SELECT id, title, status, s3_bucket, s3_key, size_bytes, duration_seconds
             FROM videos
-            WHERE search_vector @@ plainto_tsquery('english', $1)
-              AND deleted_at IS NULL
+            WHERE deleted_at IS NULL
+              AND (
+                search_vector @@ plainto_tsquery('english', $1)
+                OR LOWER(COALESCE(title, '')) LIKE $5
+                OR LOWER(COALESCE(description, '')) LIKE $5
+                OR (
+                  $6 IS NOT NULL
+                  AND (
+                    LOWER(COALESCE(title, '')) LIKE $6
+                    OR LOWER(COALESCE(description, '')) LIKE $6
+                  )
+                )
+              )
               AND (UPPER(status) = 'PUBLISHED' OR UPPER(status) = 'COMPLETED' OR s3_bucket = $4)
             ORDER BY created_at DESC
             LIMIT $2 OFFSET $3
@@ -1679,8 +1728,19 @@ pub async fn search_videos_keyboard(
             r#"
             SELECT id, title, status, s3_bucket, s3_key, size_bytes, duration_seconds
             FROM videos
-            WHERE search_vector @@ plainto_tsquery('english', $1)
-              AND deleted_at IS NULL
+            WHERE deleted_at IS NULL
+              AND (
+                search_vector @@ plainto_tsquery('english', $1)
+                OR LOWER(COALESCE(title, '')) LIKE $5
+                OR LOWER(COALESCE(description, '')) LIKE $5
+                OR (
+                  $6 IS NOT NULL
+                  AND (
+                    LOWER(COALESCE(title, '')) LIKE $6
+                    OR LOWER(COALESCE(description, '')) LIKE $6
+                  )
+                )
+              )
               AND (UPPER(status) = 'PUBLISHED' OR UPPER(status) = 'COMPLETED' OR s3_bucket = $4)
             ORDER BY like_count DESC, created_at DESC
             LIMIT $2 OFFSET $3
@@ -1691,8 +1751,19 @@ pub async fn search_videos_keyboard(
             SELECT id, title, status, s3_bucket, s3_key, size_bytes, duration_seconds,
                    ts_rank(search_vector, plainto_tsquery('english', $1)) as rank
             FROM videos
-            WHERE search_vector @@ plainto_tsquery('english', $1)
-              AND deleted_at IS NULL
+            WHERE deleted_at IS NULL
+              AND (
+                search_vector @@ plainto_tsquery('english', $1)
+                OR LOWER(COALESCE(title, '')) LIKE $5
+                OR LOWER(COALESCE(description, '')) LIKE $5
+                OR (
+                  $6 IS NOT NULL
+                  AND (
+                    LOWER(COALESCE(title, '')) LIKE $6
+                    OR LOWER(COALESCE(description, '')) LIKE $6
+                  )
+                )
+              )
               AND (UPPER(status) = 'PUBLISHED' OR UPPER(status) = 'COMPLETED' OR s3_bucket = $4)
             ORDER BY rank DESC, like_count DESC
             LIMIT $2 OFFSET $3
@@ -1710,6 +1781,8 @@ pub async fn search_videos_keyboard(
                 (limit as i64).into(),
                 (offset as i64).into(),
                 state.config.minio_bucket_videos.clone().into(),
+                like_pattern.clone().into(),
+                relaxed_like_pattern.clone().into(),
             ],
         )),
     )
@@ -1800,6 +1873,8 @@ pub async fn search_videos(
 
     // 2. VALIDATE & NORMALIZE QUERY (ReDoS protection)
     let query = validate_search_query(&params.q, &search_config)?;
+    let like_pattern = build_search_like_pattern(&query);
+    let relaxed_like_pattern = build_relaxed_like_pattern(&query);
 
     // 3. Security logging for suspicious patterns
     let token_count = query.split_whitespace().count();
@@ -1815,7 +1890,7 @@ pub async fn search_videos(
     let limit = params.limit.min(100);
     let offset = params.offset;
     let cache_key = format!(
-        "search:cache:{}:v2:{}:{}:{}:{}",
+        "search:cache:{}:v3:{}:{}:{}:{}",
         user_id, // CRITICAL: User-scoped cache
         query.to_lowercase(),
         params.sort,
@@ -1852,8 +1927,19 @@ pub async fn search_videos(
             r#"
             SELECT id, user_id, title, description, s3_bucket, s3_key, status, size_bytes, like_count, is_anonymous, created_at, updated_at
             FROM videos
-            WHERE search_vector @@ plainto_tsquery('english', $1)
-            AND deleted_at IS NULL
+            WHERE deleted_at IS NULL
+            AND (
+              search_vector @@ plainto_tsquery('english', $1)
+              OR LOWER(COALESCE(title, '')) LIKE $5
+              OR LOWER(COALESCE(description, '')) LIKE $5
+              OR (
+                $6 IS NOT NULL
+                AND (
+                  LOWER(COALESCE(title, '')) LIKE $6
+                  OR LOWER(COALESCE(description, '')) LIKE $6
+                )
+              )
+            )
             AND (UPPER(status) = 'PUBLISHED' OR UPPER(status) = 'COMPLETED' OR s3_bucket = $4)
             ORDER BY created_at DESC
             LIMIT $2 OFFSET $3
@@ -1863,8 +1949,19 @@ pub async fn search_videos(
             r#"
             SELECT id, user_id, title, description, s3_bucket, s3_key, status, size_bytes, like_count, is_anonymous, created_at, updated_at
             FROM videos
-            WHERE search_vector @@ plainto_tsquery('english', $1)
-            AND deleted_at IS NULL
+            WHERE deleted_at IS NULL
+            AND (
+              search_vector @@ plainto_tsquery('english', $1)
+              OR LOWER(COALESCE(title, '')) LIKE $5
+              OR LOWER(COALESCE(description, '')) LIKE $5
+              OR (
+                $6 IS NOT NULL
+                AND (
+                  LOWER(COALESCE(title, '')) LIKE $6
+                  OR LOWER(COALESCE(description, '')) LIKE $6
+                )
+              )
+            )
             AND (UPPER(status) = 'PUBLISHED' OR UPPER(status) = 'COMPLETED' OR s3_bucket = $4)
             ORDER BY like_count DESC, created_at DESC
             LIMIT $2 OFFSET $3
@@ -1875,8 +1972,19 @@ pub async fn search_videos(
             SELECT id, user_id, title, description, s3_bucket, s3_key, status, size_bytes, like_count, is_anonymous, created_at, updated_at,
                    ts_rank(search_vector, plainto_tsquery('english', $1)) as rank
             FROM videos
-            WHERE search_vector @@ plainto_tsquery('english', $1)
-            AND deleted_at IS NULL
+            WHERE deleted_at IS NULL
+            AND (
+              search_vector @@ plainto_tsquery('english', $1)
+              OR LOWER(COALESCE(title, '')) LIKE $5
+              OR LOWER(COALESCE(description, '')) LIKE $5
+              OR (
+                $6 IS NOT NULL
+                AND (
+                  LOWER(COALESCE(title, '')) LIKE $6
+                  OR LOWER(COALESCE(description, '')) LIKE $6
+                )
+              )
+            )
             AND (UPPER(status) = 'PUBLISHED' OR UPPER(status) = 'COMPLETED' OR s3_bucket = $4)
             ORDER BY rank DESC, like_count DESC
             LIMIT $2 OFFSET $3
@@ -1893,6 +2001,8 @@ pub async fn search_videos(
             (limit as i64).into(),
             (offset as i64).into(),
             state.config.minio_bucket_videos.clone().into(),
+            like_pattern.clone().into(),
+            relaxed_like_pattern.clone().into(),
         ],
     ));
 
@@ -1951,6 +2061,10 @@ pub async fn search_videos(
             id: video_id,
             title: row.try_get("", "title")?,
             url: format!("{}/{}/{}", base_url, url_bucket, s3_key),
+            thumbnail_url: Some(format!(
+                "{}/{}/{}_thumb.jpg",
+                state.config.minio_public_endpoint, state.config.minio_bucket_videos, video_id
+            )),
             like_count: row.try_get("", "like_count")?,
             created_at: row.try_get("", "created_at")?,
             uploader,
