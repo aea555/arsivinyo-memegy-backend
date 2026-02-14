@@ -76,6 +76,15 @@ jobs:
 
             touch .env.production
             PREVIOUS_BACKEND_IMAGE="$(grep -E '^BACKEND_IMAGE=' .env.production | head -n1 | cut -d= -f2- || true)"
+            LAST_SUCCESSFUL_FILE=".last_successful_backend_image"
+            LAST_SUCCESSFUL_IMAGE="$(cat "${LAST_SUCCESSFUL_FILE}" 2>/dev/null || true)"
+            CURRENT_API_IMAGE="$(docker inspect -f '{{.Config.Image}}' memegy_prod_api 2>/dev/null || true)"
+            CURRENT_WORKER_IMAGE="$(docker inspect -f '{{.Config.Image}}' memegy_prod_worker 2>/dev/null || true)"
+            ROLLBACK_IMAGE="${LAST_SUCCESSFUL_IMAGE:-${CURRENT_API_IMAGE:-${CURRENT_WORKER_IMAGE:-${PREVIOUS_BACKEND_IMAGE}}}}"
+
+            if [ "${ROLLBACK_IMAGE:-}" = "${BACKEND_IMAGE}" ]; then
+              ROLLBACK_IMAGE=""
+            fi
 
             if grep -qE '^BACKEND_IMAGE=' .env.production; then
               sed -i "s|^BACKEND_IMAGE=.*|BACKEND_IMAGE=${BACKEND_IMAGE}|" .env.production
@@ -85,14 +94,15 @@ jobs:
 
             rollback() {
               echo "Rolling back to previous image..."
-              if [ -n "${PREVIOUS_BACKEND_IMAGE}" ]; then
+              if [ -n "${ROLLBACK_IMAGE}" ]; then
                 if grep -qE '^BACKEND_IMAGE=' .env.production; then
-                  sed -i "s|^BACKEND_IMAGE=.*|BACKEND_IMAGE=${PREVIOUS_BACKEND_IMAGE}|" .env.production
+                  sed -i "s|^BACKEND_IMAGE=.*|BACKEND_IMAGE=${ROLLBACK_IMAGE}|" .env.production
                 else
-                  printf '\nBACKEND_IMAGE=%s\n' "${PREVIOUS_BACKEND_IMAGE}" >> .env.production
+                  printf '\nBACKEND_IMAGE=%s\n' "${ROLLBACK_IMAGE}" >> .env.production
                 fi
               else
-                sed -i '/^BACKEND_IMAGE=/d' .env.production
+                echo "No rollback image available; skipping rollback."
+                return 0
               fi
 
               docker compose -f docker-compose.production.yml --env-file .env.production pull api worker || true
@@ -123,5 +133,15 @@ jobs:
             [ "${worker_running}" = "true" ] || fail_deploy "worker container is not running"
 
             if command -v curl >/dev/null 2>&1; then
-              curl -fsS http://127.0.0.1:8088/health >/dev/null || fail_deploy "loopback health check failed"
+              health_ok=0
+              for _ in $(seq 1 10); do
+                if curl -fsS http://127.0.0.1:8088/health >/dev/null; then
+                  health_ok=1
+                  break
+                fi
+                sleep 2
+              done
+              [ "${health_ok}" = "1" ] || fail_deploy "loopback health check failed"
             fi
+
+            printf '%s\n' "${BACKEND_IMAGE}" > "${LAST_SUCCESSFUL_FILE}"

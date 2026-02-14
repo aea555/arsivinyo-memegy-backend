@@ -1,5 +1,8 @@
-FROM lukemathwalker/cargo-chef:latest-rust-1.93.0 AS chef
+FROM rust:1.93-slim-bookworm AS chef
 WORKDIR /app
+RUN --mount=type=cache,id=memegy-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=memegy-cargo-git,target=/usr/local/cargo/git \
+    cargo install --locked --version 0.1.73 cargo-chef
 
 # ============================================
 # PLANNER STAGE (Shared - analyzes dependencies)
