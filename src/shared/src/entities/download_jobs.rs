@@ -1,5 +1,6 @@
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, Deserialize)]
 #[sea_orm(table_name = "download_jobs")]
@@ -45,14 +46,18 @@ impl JobStatus {
             JobStatus::Failed => "FAILED",
         }
     }
+}
 
-    pub fn from_str(s: &str) -> Option<Self> {
+impl FromStr for JobStatus {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "PENDING" => Some(JobStatus::Pending),
-            "PROCESSING" => Some(JobStatus::Processing),
-            "COMPLETED" => Some(JobStatus::Completed),
-            "FAILED" => Some(JobStatus::Failed),
-            _ => None,
+            "PENDING" => Ok(JobStatus::Pending),
+            "PROCESSING" => Ok(JobStatus::Processing),
+            "COMPLETED" => Ok(JobStatus::Completed),
+            "FAILED" => Ok(JobStatus::Failed),
+            _ => Err(()),
         }
     }
 }

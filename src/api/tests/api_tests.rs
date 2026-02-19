@@ -8,7 +8,7 @@ async fn health_check_works() {
     let client = Client::new();
 
     let response = client
-        .get(&format!("{}/health", app.address))
+        .get(format!("{}/health", app.address))
         .send()
         .await
         .expect("Failed to execute request");
@@ -28,7 +28,7 @@ async fn auth_flow_works() {
 
     // 2. Get Profile
     let response = client
-        .get(&format!("{}/users/me", app.address))
+        .get(format!("{}/users/me", app.address))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -41,7 +41,7 @@ async fn auth_flow_works() {
 
     // 3. Logout
     let response = client
-        .post(&format!("{}/auth/logout", app.address))
+        .post(format!("{}/auth/logout", app.address))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -50,7 +50,7 @@ async fn auth_flow_works() {
 
     // 4. Verify Token Revoked
     let response = client
-        .get(&format!("{}/users/me", app.address))
+        .get(format!("{}/users/me", app.address))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -64,7 +64,7 @@ async fn refresh_token_works_and_rotates_tokens() {
     let client = Client::new();
 
     let login_response = client
-        .post(&format!("{}/auth/dev/login", app.address))
+        .post(format!("{}/auth/dev/login", app.address))
         .json(&serde_json::json!({
             "username": "refresh_user",
             "email": "refresh@example.com"
@@ -78,7 +78,7 @@ async fn refresh_token_works_and_rotates_tokens() {
     let old_refresh = login_body["refresh_token"].as_str().unwrap().to_string();
 
     let refresh_response = client
-        .post(&format!("{}/auth/refresh", app.address))
+        .post(format!("{}/auth/refresh", app.address))
         .json(&serde_json::json!({
             "access_token": old_access,
             "refresh_token": old_refresh
@@ -108,7 +108,7 @@ async fn refresh_token_invalid_input_returns_401_not_500() {
     let client = Client::new();
 
     let login_response = client
-        .post(&format!("{}/auth/dev/login", app.address))
+        .post(format!("{}/auth/dev/login", app.address))
         .json(&serde_json::json!({
             "username": "refresh_invalid_user",
             "email": "refresh-invalid@example.com"
@@ -120,7 +120,7 @@ async fn refresh_token_invalid_input_returns_401_not_500() {
     let login_body: serde_json::Value = login_response.json().await.unwrap();
 
     let refresh_response = client
-        .post(&format!("{}/auth/refresh", app.address))
+        .post(format!("{}/auth/refresh", app.address))
         .json(&serde_json::json!({
             "access_token": login_body["access_token"],
             "refresh_token": "not-a-valid-refresh-token"
@@ -194,9 +194,9 @@ async fn feed_pagination_and_sorting_works() {
 
     // 2. Test Pagination (Page 0)
     let response: Response = client
-        .get(&format!("{}/feed", app.address))
+        .get(format!("{}/feed", app.address))
         .header("Authorization", format!("Bearer {}", token))
-        .query(&[("page", "0"), ("sort", "latest")])
+        .query(&[("page", "0"), ("sort", "latest"), ("include_nsfw", "true")])
         .send()
         .await
         .expect("Failed to get feed");
@@ -214,9 +214,9 @@ async fn feed_pagination_and_sorting_works() {
 
     // 3. Test Pagination (Page 1)
     let response: Response = client
-        .get(&format!("{}/feed", app.address))
+        .get(format!("{}/feed", app.address))
         .header("Authorization", format!("Bearer {}", token))
-        .query(&[("page", "1"), ("sort", "latest")])
+        .query(&[("page", "1"), ("sort", "latest"), ("include_nsfw", "true")])
         .send()
         .await
         .expect("Failed to get feed");
@@ -231,9 +231,9 @@ async fn feed_pagination_and_sorting_works() {
 
     // Check Page 0 again for the anonymous item check
     let response: Response = client
-        .get(&format!("{}/feed", app.address))
+        .get(format!("{}/feed", app.address))
         .header("Authorization", format!("Bearer {}", token))
-        .query(&[("page", "0"), ("sort", "latest")])
+        .query(&[("page", "0"), ("sort", "latest"), ("include_nsfw", "true")])
         .send()
         .await
         .expect("Failed to get feed");
@@ -282,9 +282,14 @@ async fn random_feed_with_seed_is_stable_and_pages_do_not_overlap() {
     let seed = "session_seed_001";
 
     let page0: Vec<serde_json::Value> = client
-        .get(&format!("{}/feed", app.address))
+        .get(format!("{}/feed", app.address))
         .header("Authorization", format!("Bearer {}", token))
-        .query(&[("page", "0"), ("sort", "random"), ("random_seed", seed)])
+        .query(&[
+            ("page", "0"),
+            ("sort", "random"),
+            ("random_seed", seed),
+            ("include_nsfw", "true"),
+        ])
         .send()
         .await
         .expect("Failed to get random page 0")
@@ -293,9 +298,14 @@ async fn random_feed_with_seed_is_stable_and_pages_do_not_overlap() {
         .expect("Failed to parse page 0");
 
     let page1: Vec<serde_json::Value> = client
-        .get(&format!("{}/feed", app.address))
+        .get(format!("{}/feed", app.address))
         .header("Authorization", format!("Bearer {}", token))
-        .query(&[("page", "1"), ("sort", "random"), ("random_seed", seed)])
+        .query(&[
+            ("page", "1"),
+            ("sort", "random"),
+            ("random_seed", seed),
+            ("include_nsfw", "true"),
+        ])
         .send()
         .await
         .expect("Failed to get random page 1")
@@ -304,9 +314,14 @@ async fn random_feed_with_seed_is_stable_and_pages_do_not_overlap() {
         .expect("Failed to parse page 1");
 
     let page0_again: Vec<serde_json::Value> = client
-        .get(&format!("{}/feed", app.address))
+        .get(format!("{}/feed", app.address))
         .header("Authorization", format!("Bearer {}", token))
-        .query(&[("page", "0"), ("sort", "random"), ("random_seed", seed)])
+        .query(&[
+            ("page", "0"),
+            ("sort", "random"),
+            ("random_seed", seed),
+            ("include_nsfw", "true"),
+        ])
         .send()
         .await
         .expect("Failed to get random page 0 again")
@@ -358,7 +373,7 @@ async fn video_lifecycle_works() {
 
     // 2. Update Metadata
     let response: Response = client
-        .patch(&format!("{}/videos/{}", app.address, video_id))
+        .patch(format!("{}/videos/{}", app.address, video_id))
         .header("Authorization", format!("Bearer {}", token))
         .json(&serde_json::json!({
             "title": "Updated Title",
@@ -385,7 +400,7 @@ async fn video_lifecycle_works() {
 
     // 3. Soft Delete
     let response: Response = client
-        .delete(&format!("{}/videos/{}", app.address, video_id))
+        .delete(format!("{}/videos/{}", app.address, video_id))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -404,8 +419,9 @@ async fn video_lifecycle_works() {
 
     // Verify removed from feed
     let response: Response = client
-        .get(&format!("{}/feed", app.address))
+        .get(format!("{}/feed", app.address))
         .header("Authorization", format!("Bearer {}", token))
+        .query(&[("include_nsfw", "true")])
         .send()
         .await
         .expect("Failed to get feed");
@@ -431,7 +447,7 @@ async fn noop_video_metadata_updates_do_not_hit_update_rate_limit() {
 
     for attempt in 1..=35 {
         let response = client
-            .patch(&format!("{}/videos/{}", app.address, video_id))
+            .patch(format!("{}/videos/{}", app.address, video_id))
             .header("Authorization", format!("Bearer {}", token))
             .json(&serde_json::json!({
                 "is_anonymous": false
@@ -479,7 +495,7 @@ async fn like_video_works() {
     let token_b = app.login_as_dev("user_b", "b@example.com").await;
 
     let response: Response = client
-        .put(&format!("{}/videos/{}/like", app.address, video_id))
+        .put(format!("{}/videos/{}/like", app.address, video_id))
         .header("Authorization", format!("Bearer {}", token_b))
         .send()
         .await
@@ -500,7 +516,7 @@ async fn like_video_works() {
 
     // Unlike
     let response: Response = client
-        .delete(&format!("{}/videos/{}/like", app.address, video_id))
+        .delete(format!("{}/videos/{}/like", app.address, video_id))
         .header("Authorization", format!("Bearer {}", token_b))
         .send()
         .await
@@ -548,7 +564,7 @@ async fn like_video_idempotent_put_delete_works() {
 
     // First PUT likes the video.
     let response: Response = client
-        .put(&format!("{}/videos/{}/like", app.address, video_id))
+        .put(format!("{}/videos/{}/like", app.address, video_id))
         .header("Authorization", format!("Bearer {}", token_b))
         .send()
         .await
@@ -560,7 +576,7 @@ async fn like_video_idempotent_put_delete_works() {
 
     // Second PUT stays liked and does not increment again.
     let response: Response = client
-        .put(&format!("{}/videos/{}/like", app.address, video_id))
+        .put(format!("{}/videos/{}/like", app.address, video_id))
         .header("Authorization", format!("Bearer {}", token_b))
         .send()
         .await
@@ -572,7 +588,7 @@ async fn like_video_idempotent_put_delete_works() {
 
     // First DELETE unlikes the video.
     let response: Response = client
-        .delete(&format!("{}/videos/{}/like", app.address, video_id))
+        .delete(format!("{}/videos/{}/like", app.address, video_id))
         .header("Authorization", format!("Bearer {}", token_b))
         .send()
         .await
@@ -584,7 +600,7 @@ async fn like_video_idempotent_put_delete_works() {
 
     // Second DELETE stays unliked and does not decrement below zero.
     let response: Response = client
-        .delete(&format!("{}/videos/{}/like", app.address, video_id))
+        .delete(format!("{}/videos/{}/like", app.address, video_id))
         .header("Authorization", format!("Bearer {}", token_b))
         .send()
         .await
@@ -605,7 +621,7 @@ async fn user_profile_management_works() {
 
     // 1. Get Me
     let response: Response = client
-        .get(&format!("{}/users/me", app.address))
+        .get(format!("{}/users/me", app.address))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -617,7 +633,7 @@ async fn user_profile_management_works() {
 
     // 2. Delete Account
     let response: Response = client
-        .delete(&format!("{}/users/me", app.address))
+        .delete(format!("{}/users/me", app.address))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -627,7 +643,7 @@ async fn user_profile_management_works() {
 
     // 3. Verify Login Fails (or token revoked) in subsequent request
     let response: Response = client
-        .get(&format!("{}/users/me", app.address))
+        .get(format!("{}/users/me", app.address))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -669,6 +685,7 @@ async fn my_videos_returns_playable_url_for_published_only() {
         duration_seconds: Set(None),
         like_count: Set(3),
         is_anonymous: Set(false),
+        is_nsfw: Set(Some(false)),
         processing_error_code: Set(None),
         processing_error_message: Set(None),
         failed_at: Set(None),
@@ -690,6 +707,7 @@ async fn my_videos_returns_playable_url_for_published_only() {
         duration_seconds: Set(None),
         like_count: Set(0),
         is_anonymous: Set(false),
+        is_nsfw: Set(Some(false)),
         processing_error_code: Set(None),
         processing_error_message: Set(None),
         failed_at: Set(None),
@@ -707,7 +725,7 @@ async fn my_videos_returns_playable_url_for_published_only() {
     like.insert(&app.db).await.unwrap();
 
     let response: Response = client
-        .get(&format!("{}/users/me/videos", app.address))
+        .get(format!("{}/users/me/videos", app.address))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -769,6 +787,7 @@ async fn search_functionality_works() {
         duration_seconds: Set(None),
         like_count: Set(0),
         is_anonymous: Set(false),
+        is_nsfw: Set(Some(false)),
         processing_error_code: Set(None),
         processing_error_message: Set(None),
         failed_at: Set(None),
@@ -791,6 +810,7 @@ async fn search_functionality_works() {
         duration_seconds: Set(None),
         like_count: Set(0),
         is_anonymous: Set(false),
+        is_nsfw: Set(Some(false)),
         processing_error_code: Set(None),
         processing_error_message: Set(None),
         failed_at: Set(None),
@@ -802,9 +822,9 @@ async fn search_functionality_works() {
 
     // 1. Search for "Rust"
     let response: Response = client
-        .get(&format!("{}/videos/search", app.address))
+        .get(format!("{}/videos/search", app.address))
         .header("Authorization", format!("Bearer {}", token))
-        .query(&[("q", "Rust")])
+        .query(&[("q", "Rust"), ("include_nsfw", "true")])
         .send()
         .await
         .expect("Failed to search");
@@ -817,9 +837,9 @@ async fn search_functionality_works() {
 
     // 2. Search for "Pasta"
     let response: Response = client
-        .get(&format!("{}/videos/search", app.address))
+        .get(format!("{}/videos/search", app.address))
         .header("Authorization", format!("Bearer {}", token))
-        .query(&[("q", "Pasta")])
+        .query(&[("q", "Pasta"), ("include_nsfw", "true")])
         .send()
         .await
         .expect("Failed to search");
@@ -845,7 +865,7 @@ async fn security_access_control_works() {
 
     // 1. Try to Delete
     let response: Response = client
-        .delete(&format!("{}/videos/{}", app.address, video_id))
+        .delete(format!("{}/videos/{}", app.address, video_id))
         .header("Authorization", format!("Bearer {}", token_b))
         .send()
         .await
@@ -857,7 +877,7 @@ async fn security_access_control_works() {
 
     // 2. Try to Update
     let response: Response = client
-        .patch(&format!("{}/videos/{}", app.address, video_id))
+        .patch(format!("{}/videos/{}", app.address, video_id))
         .header("Authorization", format!("Bearer {}", token_b))
         .json(&serde_json::json!({"title": "Hacked Title"}))
         .send()
@@ -896,7 +916,7 @@ async fn download_flow_works() {
 
     // 1. Get Download URL
     let response: Response = client
-        .get(&format!("{}/videos/{}/download", app.address, video_id))
+        .get(format!("{}/videos/{}/download", app.address, video_id))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -918,7 +938,7 @@ async fn download_flow_works() {
 
     // 2. Refresh Download URL (This returns JSON, so standard client is fine too, but custom client works)
     let response: Response = client
-        .post(&format!(
+        .post(format!(
             "{}/videos/{}/download/refresh",
             app.address, video_id
         ))
@@ -963,7 +983,7 @@ async fn bulk_operations_works() {
     // 1. Bulk Delete (first 2)
     let ids_to_delete = vec![video_ids[0].clone(), video_ids[1].clone()];
     let response: Response = client
-        .post(&format!("{}/videos/bulk-delete", app.address))
+        .post(format!("{}/videos/bulk-delete", app.address))
         .header("Authorization", format!("Bearer {}", token))
         .json(&serde_json::json!({
             "video_ids": ids_to_delete
@@ -1001,7 +1021,7 @@ async fn bulk_operations_works() {
 
     // 2. Bulk Download (of the remaining one)
     let response: Response = client
-        .post(&format!("{}/videos/download/bulk", app.address))
+        .post(format!("{}/videos/download/bulk", app.address))
         .header("Authorization", format!("Bearer {}", token))
         .json(&serde_json::json!({
             "video_ids": vec![video_ids[2].clone()]
@@ -1017,7 +1037,7 @@ async fn bulk_operations_works() {
 
     // 3. Poll Status
     let response: Response = client
-        .get(&format!("{}/videos/download/bulk/{}", app.address, job_id))
+        .get(format!("{}/videos/download/bulk/{}", app.address, job_id))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await

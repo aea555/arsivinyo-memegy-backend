@@ -17,6 +17,7 @@ pub struct Model {
     pub duration_seconds: Option<i32>,
     pub like_count: i64,
     pub is_anonymous: bool,
+    pub is_nsfw: Option<bool>,
     pub processing_error_code: Option<String>,
     pub processing_error_message: Option<String>,
     pub failed_at: Option<DateTimeWithTimeZone>,

@@ -64,13 +64,14 @@ fn get_client_ip(
     // Production or explicit CF requirement: STRICT mode
     if environment == "production" || require_cf_headers {
         // 1. CF-Connecting-IP (ONLY trusted source in production)
-        if let Some(cf_ip) = req.headers().get("cf-connecting-ip") {
-            if let Ok(ip_str) = cf_ip.to_str() {
-                if let Ok(ip) = ip_str.parse::<IpAddr>() {
-                    return Ok(ip);
-                }
-            }
+        if let Some(cf_ip) = req.headers().get("cf-connecting-ip")
+            && let Ok(ip_str) = cf_ip.to_str()
+            && let Ok(ip) = ip_str.parse::<IpAddr>()
+        {
+            return Ok(ip);
             // CF header exists but malformed - REJECT (security)
+        }
+        if req.headers().contains_key("cf-connecting-ip") {
             tracing::error!("Malformed CF-Connecting-IP header in production");
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -88,32 +89,28 @@ fn get_client_ip(
 
     // Development/Staging: Permissive fallback chain
     // 1. Try CF-Connecting-IP first (if testing with Cloudflare)
-    if let Some(cf_ip) = req.headers().get("cf-connecting-ip") {
-        if let Ok(ip_str) = cf_ip.to_str() {
-            if let Ok(ip) = ip_str.parse::<IpAddr>() {
-                return Ok(ip);
-            }
-        }
+    if let Some(cf_ip) = req.headers().get("cf-connecting-ip")
+        && let Ok(ip_str) = cf_ip.to_str()
+        && let Ok(ip) = ip_str.parse::<IpAddr>()
+    {
+        return Ok(ip);
     }
 
     // 2. X-Real-IP (local reverse proxy)
-    if let Some(real_ip) = req.headers().get("x-real-ip") {
-        if let Ok(ip_str) = real_ip.to_str() {
-            if let Ok(ip) = ip_str.parse::<IpAddr>() {
-                return Ok(ip);
-            }
-        }
+    if let Some(real_ip) = req.headers().get("x-real-ip")
+        && let Ok(ip_str) = real_ip.to_str()
+        && let Ok(ip) = ip_str.parse::<IpAddr>()
+    {
+        return Ok(ip);
     }
 
     // 3. X-Forwarded-For (ONLY in dev - take first IP)
-    if let Some(forwarded) = req.headers().get("x-forwarded-for") {
-        if let Ok(forwarded_str) = forwarded.to_str() {
-            if let Some(first_ip) = forwarded_str.split(',').next() {
-                if let Ok(ip) = first_ip.trim().parse::<IpAddr>() {
-                    return Ok(ip);
-                }
-            }
-        }
+    if let Some(forwarded) = req.headers().get("x-forwarded-for")
+        && let Ok(forwarded_str) = forwarded.to_str()
+        && let Some(first_ip) = forwarded_str.split(',').next()
+        && let Ok(ip) = first_ip.trim().parse::<IpAddr>()
+    {
+        return Ok(ip);
     }
 
     // 4. Fallback to localhost (local development)

@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow};
 use dotenvy::dotenv;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::env;
 
@@ -25,6 +26,13 @@ pub struct Config {
     pub access_token_ttl_secs: usize,
     pub refresh_token_ttl_days: u16,
     pub auth_require_username_on_google_signup: bool,
+    pub terms_current_version: String,
+    pub terms_url: Option<String>,
+    pub terms_content: Option<String>,
+    pub terms_content_type: Option<String>,
+    pub terms_content_sha256: Option<String>,
+    pub read_only_mode_enabled: bool,
+    pub maintenance_mode_enabled: bool,
     pub username_reserved_values: String,
     pub admin_api_enabled: bool,
     pub admin_jwt_issuer: Option<String>,
@@ -68,6 +76,10 @@ pub struct Config {
     pub username_signup_rpm_per_ip: u64,
     pub username_signup_attempts_per_ticket: u64,
     pub username_update_rpm_per_user: u64,
+    pub read_only_status_rpm_per_user: u64,
+    pub maintenance_status_rpm_per_user: u64,
+    pub onboarding_status_rpm_per_user: u64,
+    pub onboarding_complete_rpm_per_user: u64,
 
     // OTC Rate Limiting
     pub otc_rate_limit_max_attempts: u32,
@@ -109,6 +121,12 @@ pub struct Config {
 }
 
 impl Config {
+    pub fn sha256_hex(content: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(content.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
     pub fn from_env() -> Result<Self> {
         dotenv().ok();
 
@@ -116,6 +134,62 @@ impl Config {
             .unwrap_or_else(|_| "false".to_string())
             .parse()
             .unwrap_or(false);
+        let terms_current_version = env::var("TERMS_CURRENT_VERSION")
+            .unwrap_or_else(|_| "v1".to_string())
+            .trim()
+            .to_string();
+        if terms_current_version.is_empty() {
+            return Err(anyhow!("TERMS_CURRENT_VERSION must be non-empty"));
+        }
+        let terms_url = env::var("TERMS_URL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let terms_content_inline = env::var("TERMS_CONTENT")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        let terms_content_file_path = env::var("TERMS_CONTENT_FILE_PATH")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        if terms_content_inline.is_some() && terms_content_file_path.is_some() {
+            return Err(anyhow!(
+                "Set either TERMS_CONTENT or TERMS_CONTENT_FILE_PATH, not both"
+            ));
+        }
+        let terms_content = match (terms_content_inline, terms_content_file_path) {
+            (Some(content), None) => Some(content),
+            (None, Some(path)) => Some(std::fs::read_to_string(&path).map_err(|e| {
+                anyhow!("Failed to read TERMS_CONTENT_FILE_PATH '{}': {}", path, e)
+            })?),
+            (None, None) => None,
+            (Some(_), Some(_)) => unreachable!(),
+        };
+        if terms_url.is_none() && terms_content.is_none() {
+            return Err(anyhow!(
+                "Either TERMS_URL or embedded terms content (TERMS_CONTENT/TERMS_CONTENT_FILE_PATH) must be configured"
+            ));
+        }
+        let terms_content_type = if terms_content.is_some() {
+            Some(
+                env::var("TERMS_CONTENT_TYPE")
+                    .unwrap_or_else(|_| "text/markdown".to_string())
+                    .trim()
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+        if let Some(ref content_type) = terms_content_type
+            && content_type.is_empty()
+        {
+            return Err(anyhow!(
+                "TERMS_CONTENT_TYPE must be non-empty when embedded terms content is configured"
+            ));
+        }
+        let terms_content_sha256 = terms_content
+            .as_ref()
+            .map(|content| Self::sha256_hex(content));
         let admin_jwt_issuer = env::var("ADMIN_JWT_ISSUER")
             .ok()
             .map(|v| v.trim().to_string())
@@ -205,6 +279,19 @@ impl Config {
             .unwrap_or_else(|_| "true".to_string())
             .parse()
             .unwrap_or(true),
+            terms_current_version,
+            terms_url,
+            terms_content,
+            terms_content_type,
+            terms_content_sha256,
+            read_only_mode_enabled: env::var("READ_ONLY_MODE_ENABLED")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse()
+                .unwrap_or(false),
+            maintenance_mode_enabled: env::var("MAINTENANCE_MODE_ENABLED")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse()
+                .unwrap_or(false),
             username_reserved_values: env::var("USERNAME_RESERVED_VALUES").unwrap_or_default(),
             admin_api_enabled,
             admin_jwt_issuer,
@@ -283,6 +370,18 @@ impl Config {
                 .parse()?,
             username_update_rpm_per_user: env::var("USERNAME_UPDATE_RPM_PER_USER")
                 .unwrap_or_else(|_| "5".to_string())
+                .parse()?,
+            read_only_status_rpm_per_user: env::var("READ_ONLY_STATUS_RPM_PER_USER")
+                .unwrap_or_else(|_| "20".to_string())
+                .parse()?,
+            maintenance_status_rpm_per_user: env::var("MAINTENANCE_STATUS_RPM_PER_USER")
+                .unwrap_or_else(|_| "20".to_string())
+                .parse()?,
+            onboarding_status_rpm_per_user: env::var("ONBOARDING_STATUS_RPM_PER_USER")
+                .unwrap_or_else(|_| "30".to_string())
+                .parse()?,
+            onboarding_complete_rpm_per_user: env::var("ONBOARDING_COMPLETE_RPM_PER_USER")
+                .unwrap_or_else(|_| "10".to_string())
                 .parse()?,
 
             // OTC Rate Limiting

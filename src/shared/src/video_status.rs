@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VideoStatus {
@@ -17,14 +18,18 @@ impl VideoStatus {
             VideoStatus::Failed => "FAILED",
         }
     }
+}
 
-    pub fn from_str(s: &str) -> Option<Self> {
+impl FromStr for VideoStatus {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "DRAFT" => Some(VideoStatus::Draft),
-            "PROCESSING" => Some(VideoStatus::Processing),
-            "PUBLISHED" => Some(VideoStatus::Published),
-            "FAILED" => Some(VideoStatus::Failed),
-            _ => None,
+            "DRAFT" => Ok(VideoStatus::Draft),
+            "PROCESSING" => Ok(VideoStatus::Processing),
+            "PUBLISHED" => Ok(VideoStatus::Published),
+            "FAILED" => Ok(VideoStatus::Failed),
+            _ => Err(()),
         }
     }
 }

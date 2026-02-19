@@ -56,27 +56,25 @@ pub fn extract_client_ip(
         ));
     }
 
-    if let Some(cf_ip) = parts.headers.get("cf-connecting-ip") {
-        if let Ok(ip) = cf_ip.to_str().unwrap_or_default().parse::<IpAddr>() {
-            return Ok(ip);
-        }
+    if let Some(cf_ip) = parts.headers.get("cf-connecting-ip")
+        && let Ok(ip) = cf_ip.to_str().unwrap_or_default().parse::<IpAddr>()
+    {
+        return Ok(ip);
     }
-    if let Some(real_ip) = parts.headers.get("x-real-ip") {
-        if let Ok(ip) = real_ip.to_str().unwrap_or_default().parse::<IpAddr>() {
-            return Ok(ip);
-        }
+    if let Some(real_ip) = parts.headers.get("x-real-ip")
+        && let Ok(ip) = real_ip.to_str().unwrap_or_default().parse::<IpAddr>()
+    {
+        return Ok(ip);
     }
-    if let Some(forwarded) = parts.headers.get("x-forwarded-for") {
-        if let Some(first_ip) = forwarded
+    if let Some(forwarded) = parts.headers.get("x-forwarded-for")
+        && let Some(first_ip) = forwarded
             .to_str()
             .ok()
             .and_then(|raw| raw.split(',').next())
             .map(str::trim)
-        {
-            if let Ok(ip) = first_ip.parse::<IpAddr>() {
-                return Ok(ip);
-            }
-        }
+        && let Ok(ip) = first_ip.parse::<IpAddr>()
+    {
+        return Ok(ip);
     }
 
     Ok("127.0.0.1".parse().expect("valid localhost IP"))

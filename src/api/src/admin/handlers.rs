@@ -151,28 +151,52 @@ fn response_meta(request_id: String, principal: &AdminPrincipal) -> AdminRespons
     }
 }
 
+struct AdminAuditEntry<'a> {
+    action: &'a str,
+    target_table: &'a str,
+    target_id: Option<&'a str>,
+    outcome: &'a str,
+    user_agent: Option<&'a str>,
+    metadata: serde_json::Value,
+}
+
+impl<'a> AdminAuditEntry<'a> {
+    fn new(
+        action: &'a str,
+        target_table: &'a str,
+        target_id: Option<&'a str>,
+        outcome: &'a str,
+        user_agent: Option<&'a str>,
+        metadata: serde_json::Value,
+    ) -> Self {
+        Self {
+            action,
+            target_table,
+            target_id,
+            outcome,
+            user_agent,
+            metadata,
+        }
+    }
+}
+
 async fn write_admin_audit(
     state: &AppState,
     principal: &AdminPrincipal,
     request_id: &str,
-    action: &str,
-    target_table: &str,
-    target_id: Option<&str>,
-    outcome: &str,
-    user_agent: Option<&str>,
-    metadata: serde_json::Value,
+    entry: AdminAuditEntry<'_>,
 ) {
     let active = admin_audit_logs::ActiveModel {
         id: Set(Uuid::new_v4()),
         actor_sub: Set(principal.sub.clone()),
-        action: Set(action.to_string()),
-        target_table: Set(target_table.to_string()),
-        target_id: Set(target_id.map(str::to_string)),
+        action: Set(entry.action.to_string()),
+        target_table: Set(entry.target_table.to_string()),
+        target_id: Set(entry.target_id.map(str::to_string)),
         request_id: Set(request_id.to_string()),
         ip: Set(Some(principal.client_ip.to_string())),
-        user_agent: Set(user_agent.map(str::to_string)),
-        outcome: Set(outcome.to_string()),
-        metadata_json: Set(metadata),
+        user_agent: Set(entry.user_agent.map(str::to_string)),
+        outcome: Set(entry.outcome.to_string()),
+        metadata_json: Set(entry.metadata),
         created_at: Set(Utc::now().fixed_offset()),
     };
 
@@ -209,12 +233,14 @@ pub async fn list_tables(
         &state,
         &principal,
         &request_id,
-        "list_tables",
-        "admin_catalog",
-        None,
-        "success",
-        user_agent.as_deref(),
-        json!({ "table_count": tables.len() }),
+        AdminAuditEntry::new(
+            "list_tables",
+            "admin_catalog",
+            None,
+            "success",
+            user_agent.as_deref(),
+            json!({ "table_count": tables.len() }),
+        ),
     )
     .await;
 
@@ -240,12 +266,14 @@ pub async fn list_table_rows(
                 &state,
                 &principal,
                 &request_id,
-                "list_rows",
-                &table,
-                None,
-                "rejected_invalid_table",
-                user_agent.as_deref(),
-                json!({}),
+                AdminAuditEntry::new(
+                    "list_rows",
+                    &table,
+                    None,
+                    "rejected_invalid_table",
+                    user_agent.as_deref(),
+                    json!({}),
+                ),
             )
             .await;
             return Err(ApiErrorResponse::bad_request("Table is not allowed"));
@@ -286,16 +314,18 @@ pub async fn list_table_rows(
         &state,
         &principal,
         &request_id,
-        "list_rows",
-        spec.name,
-        None,
-        "success",
-        user_agent.as_deref(),
-        json!({
-            "limit": limit,
-            "offset": offset,
-            "row_count": serialized_rows.len(),
-        }),
+        AdminAuditEntry::new(
+            "list_rows",
+            spec.name,
+            None,
+            "success",
+            user_agent.as_deref(),
+            json!({
+                "limit": limit,
+                "offset": offset,
+                "row_count": serialized_rows.len(),
+            }),
+        ),
     )
     .await;
 
@@ -324,12 +354,14 @@ pub async fn get_table_row(
                 &state,
                 &principal,
                 &request_id,
-                "get_row",
-                &table,
-                Some(&id),
-                "rejected_invalid_table",
-                user_agent.as_deref(),
-                json!({}),
+                AdminAuditEntry::new(
+                    "get_row",
+                    &table,
+                    Some(&id),
+                    "rejected_invalid_table",
+                    user_agent.as_deref(),
+                    json!({}),
+                ),
             )
             .await;
             return Err(ApiErrorResponse::bad_request("Table is not allowed"));
@@ -387,12 +419,14 @@ pub async fn get_table_row(
                 &state,
                 &principal,
                 &request_id,
-                "get_row",
-                spec.name,
-                Some(&id),
-                "not_found",
-                user_agent.as_deref(),
-                json!({}),
+                AdminAuditEntry::new(
+                    "get_row",
+                    spec.name,
+                    Some(&id),
+                    "not_found",
+                    user_agent.as_deref(),
+                    json!({}),
+                ),
             )
             .await;
             return Err(ApiErrorResponse::not_found("Row not found"));
@@ -406,12 +440,14 @@ pub async fn get_table_row(
         &state,
         &principal,
         &request_id,
-        "get_row",
-        spec.name,
-        Some(&id),
-        "success",
-        user_agent.as_deref(),
-        json!({}),
+        AdminAuditEntry::new(
+            "get_row",
+            spec.name,
+            Some(&id),
+            "success",
+            user_agent.as_deref(),
+            json!({}),
+        ),
     )
     .await;
 
@@ -481,12 +517,14 @@ pub async fn hard_delete_user(
             &state,
             &principal,
             &request_id,
-            "hard_delete_user",
-            "users",
-            Some(&id.to_string()),
-            "not_found",
-            user_agent.as_deref(),
-            json!({}),
+            AdminAuditEntry::new(
+                "hard_delete_user",
+                "users",
+                Some(&id.to_string()),
+                "not_found",
+                user_agent.as_deref(),
+                json!({}),
+            ),
         )
         .await;
         return Err(ApiErrorResponse::not_found("User not found"));
@@ -508,12 +546,14 @@ pub async fn hard_delete_user(
                 &state,
                 &principal,
                 &request_id,
-                "hard_delete_user",
-                "users",
-                Some(&id.to_string()),
-                "storage_cleanup_failed",
-                user_agent.as_deref(),
-                json!({ "error": err.to_string(), "video_id": video.id.to_string() }),
+                AdminAuditEntry::new(
+                    "hard_delete_user",
+                    "users",
+                    Some(&id.to_string()),
+                    "storage_cleanup_failed",
+                    user_agent.as_deref(),
+                    json!({ "error": err.to_string(), "video_id": video.id.to_string() }),
+                ),
             )
             .await;
             return Err(ApiErrorResponse::internal_error(
@@ -538,12 +578,14 @@ pub async fn hard_delete_user(
         &state,
         &principal,
         &request_id,
-        "hard_delete_user",
-        "users",
-        Some(&id.to_string()),
-        "success",
-        user_agent.as_deref(),
-        json!({ "deleted_video_objects": user_videos.len() }),
+        AdminAuditEntry::new(
+            "hard_delete_user",
+            "users",
+            Some(&id.to_string()),
+            "success",
+            user_agent.as_deref(),
+            json!({ "deleted_video_objects": user_videos.len() }),
+        ),
     )
     .await;
 
@@ -580,12 +622,14 @@ pub async fn hard_delete_video(
             &state,
             &principal,
             &request_id,
-            "hard_delete_video",
-            "videos",
-            Some(&id.to_string()),
-            "storage_cleanup_failed",
-            user_agent.as_deref(),
-            json!({ "error": err.to_string() }),
+            AdminAuditEntry::new(
+                "hard_delete_video",
+                "videos",
+                Some(&id.to_string()),
+                "storage_cleanup_failed",
+                user_agent.as_deref(),
+                json!({ "error": err.to_string() }),
+            ),
         )
         .await;
         return Err(ApiErrorResponse::internal_error(
@@ -609,12 +653,14 @@ pub async fn hard_delete_video(
         &state,
         &principal,
         &request_id,
-        "hard_delete_video",
-        "videos",
-        Some(&id.to_string()),
-        "success",
-        user_agent.as_deref(),
-        json!({ "owner_user_id": video.user_id.to_string() }),
+        AdminAuditEntry::new(
+            "hard_delete_video",
+            "videos",
+            Some(&id.to_string()),
+            "success",
+            user_agent.as_deref(),
+            json!({ "owner_user_id": video.user_id.to_string() }),
+        ),
     )
     .await;
 
@@ -646,12 +692,14 @@ async fn hard_delete_simple(
             state,
             principal,
             &request_id,
-            action,
-            table,
-            Some(&id.to_string()),
-            "not_found",
-            user_agent.as_deref(),
-            json!({}),
+            AdminAuditEntry::new(
+                action,
+                table,
+                Some(&id.to_string()),
+                "not_found",
+                user_agent.as_deref(),
+                json!({}),
+            ),
         )
         .await;
         return Err(ApiErrorResponse::not_found("Record not found"));
@@ -661,12 +709,14 @@ async fn hard_delete_simple(
         state,
         principal,
         &request_id,
-        action,
-        table,
-        Some(&id.to_string()),
-        "success",
-        user_agent.as_deref(),
-        json!({}),
+        AdminAuditEntry::new(
+            action,
+            table,
+            Some(&id.to_string()),
+            "success",
+            user_agent.as_deref(),
+            json!({}),
+        ),
     )
     .await;
 
@@ -805,12 +855,14 @@ async fn audit_as_user_action(
         state,
         principal,
         &request_id,
-        action,
-        "as_user",
-        Some(&user_id.to_string()),
-        outcome,
-        user_agent.as_deref(),
-        metadata,
+        AdminAuditEntry::new(
+            action,
+            "as_user",
+            Some(&user_id.to_string()),
+            outcome,
+            user_agent.as_deref(),
+            metadata,
+        ),
     )
     .await;
 }

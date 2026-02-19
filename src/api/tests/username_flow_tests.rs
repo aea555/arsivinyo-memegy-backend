@@ -36,6 +36,9 @@ async fn exchange_otc_returns_username_required_for_pending_signup() {
     let payload = serde_json::to_value(OtcTokenData::SignupRequired(OtcSignupRequiredData {
         signup_ticket: "signup_ticket_1".to_string(),
         suggested_username: "john_doe".to_string(),
+        required_terms_version: "v1".to_string(),
+        terms_url: Some("https://example.com/terms".to_string()),
+        requires_age_confirmation: true,
     }))
     .expect("serialize otc payload");
 
@@ -53,6 +56,8 @@ async fn exchange_otc_returns_username_required_for_pending_signup() {
     let body: serde_json::Value = resp.json().await.expect("json");
     assert_eq!(body["error"], "username_required");
     assert_eq!(body["signup_ticket"], "signup_ticket_1");
+    assert_eq!(body["required_terms_version"], "v1");
+    assert_eq!(body["requires_age_confirmation"], true);
 }
 
 #[tokio::test]
@@ -77,7 +82,9 @@ async fn signup_complete_is_idempotent_for_same_ticket() {
     let client = reqwest::Client::new();
     let req_body = json!({
         "signup_ticket": signup_ticket,
-        "username": "new_user_1"
+        "username": "new_user_1",
+        "age_confirmed": true,
+        "terms_version": "v1"
     });
 
     let first = client
@@ -106,7 +113,7 @@ async fn signup_complete_is_idempotent_for_same_ticket() {
 #[tokio::test]
 async fn signup_complete_returns_conflict_when_username_taken() {
     let app = common::spawn_app().await;
-    let _token = app.login_as_dev("taken_name", "taken@example.com").await;
+    let _token = app.login_as_dev("zzq_777", "taken@example.com").await;
 
     let signup_ticket = "signup_ticket_conflict";
     set_redis_json(
@@ -128,7 +135,9 @@ async fn signup_complete_returns_conflict_when_username_taken() {
         .post(format!("{}/auth/signup/complete", app.address))
         .json(&json!({
             "signup_ticket": signup_ticket,
-            "username": "taken_name"
+            "username": "zzq_777",
+            "age_confirmed": true,
+            "terms_version": "v1"
         }))
         .send()
         .await
@@ -149,19 +158,19 @@ async fn update_username_supports_idempotency_key_and_cache_replay() {
         .put(format!("{}/users/me/username", app.address))
         .header("Authorization", format!("Bearer {}", token))
         .header("Idempotency-Key", "idem-user-1")
-        .json(&json!({ "username": "profile_user_renamed" }))
+        .json(&json!({ "username": "xqz_7788" }))
         .send()
         .await
         .expect("update failed");
     assert_eq!(first.status(), StatusCode::OK);
     let first_body: serde_json::Value = first.json().await.expect("json");
-    assert_eq!(first_body["username"], "profile_user_renamed");
+    assert_eq!(first_body["username"], "xqz_7788");
 
     let replay = client
         .put(format!("{}/users/me/username", app.address))
         .header("Authorization", format!("Bearer {}", token))
         .header("Idempotency-Key", "idem-user-1")
-        .json(&json!({ "username": "profile_user_renamed" }))
+        .json(&json!({ "username": "xqz_7788" }))
         .send()
         .await
         .expect("replay failed");
@@ -171,7 +180,7 @@ async fn update_username_supports_idempotency_key_and_cache_replay() {
         .put(format!("{}/users/me/username", app.address))
         .header("Authorization", format!("Bearer {}", token))
         .header("Idempotency-Key", "idem-user-1")
-        .json(&json!({ "username": "other_name" }))
+        .json(&json!({ "username": "xqz_8899" }))
         .send()
         .await
         .expect("mismatch failed");
@@ -185,7 +194,7 @@ async fn update_username_supports_idempotency_key_and_cache_replay() {
         .expect("me failed");
     assert_eq!(me.status(), StatusCode::OK);
     let me_body: serde_json::Value = me.json().await.expect("json");
-    assert_eq!(me_body["username"], "profile_user_renamed");
+    assert_eq!(me_body["username"], "xqz_7788");
 
     let user = users::Entity::find()
         .filter(users::Column::Email.eq("profile_user@example.com"))
@@ -193,11 +202,8 @@ async fn update_username_supports_idempotency_key_and_cache_replay() {
         .await
         .expect("query user")
         .expect("user exists");
-    assert_eq!(user.username, "profile_user_renamed");
-    assert_eq!(
-        user.username_normalized.as_deref(),
-        Some("profile_user_renamed")
-    );
+    assert_eq!(user.username, "xqz_7788");
+    assert_eq!(user.username_normalized.as_deref(), Some("xqz_7788"));
 }
 
 #[tokio::test]

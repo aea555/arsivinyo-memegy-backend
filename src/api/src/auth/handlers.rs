@@ -41,7 +41,9 @@ use uuid::Uuid;
 
 use super::constants::*;
 use super::dtos::*;
-use super::service::{AuthService, RefreshAccessTokenError, RegisterUserError};
+use super::service::{
+    AuthService, RefreshAccessTokenError, RegisterUserError, RegisterWithUsernameInput,
+};
 
 #[derive(Debug)]
 struct OAuthState {
@@ -390,7 +392,7 @@ pub async fn google_callback(
 
         use shared::security::verify_pkce_challenge;
 
-        if !verify_pkce_challenge(&verifier, &expected_challenge) {
+        if !verify_pkce_challenge(&verifier, expected_challenge) {
             tracing::error!("PKCE validation failed for user flow. Challenge mismatch.");
             log_audit_event(AuditEvent::PkceValidationFailed {
                 source: oauth_state.source.clone(),
@@ -452,7 +454,7 @@ pub async fn google_callback(
             email: user.email,
             avatar_url: user.avatar_url,
         })
-    } else if state.config.auth_require_username_on_google_signup {
+    } else {
         let signup_ticket = generate_otc();
         let suggested_username = suggest_username_from_google_name(&google_user.name);
         let ticket_data = SignupTicketData {
@@ -479,35 +481,13 @@ pub async fn google_callback(
         OtcTokenData::SignupRequired(OtcSignupRequiredData {
             signup_ticket,
             suggested_username,
-        })
-    } else {
-        let (access_token, refresh_token, user) = AuthService::login_or_register(
-            &state.db,
-            google_user,
-            &state.config.jwt_secret,
-            state.config.access_token_ttl_secs,
-            state.config.refresh_token_ttl_days,
-        )
-        .await
-        .map_err(|e| {
-            tracing::error!("Login/register failed: {:?}", e);
-            ApiErrorResponse::internal_error("Failed to complete authentication")
-        })?;
-
-        log_audit_event(AuditEvent::OAuthCallbackSuccess {
-            user_id: user.id,
-            source: oauth_state.source.clone(),
-            pkce_validated,
-            timestamp: Utc::now(),
-        });
-
-        OtcTokenData::AuthSuccess(OtcAuthTokenData {
-            access_token,
-            refresh_token,
-            user_id: user.id,
-            username: user.username,
-            email: user.email,
-            avatar_url: user.avatar_url,
+            required_terms_version: state.config.terms_current_version.clone(),
+            terms_url: state
+                .config
+                .terms_url
+                .clone()
+                .or_else(|| Some("/system/terms".to_string())),
+            requires_age_confirmation: true,
         })
     };
 
@@ -622,6 +602,16 @@ pub async fn signup_complete(
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Json(payload): Json<SignupCompleteRequest>,
 ) -> ApiResult<Json<AuthResponse>> {
+    if !payload.age_confirmed {
+        return Err(ApiErrorResponse::bad_request("age_confirmed must be true"));
+    }
+    if payload.terms_version != state.config.terms_current_version {
+        return Err(ApiErrorResponse::bad_request(format!(
+            "terms_version must match current version: {}",
+            state.config.terms_current_version
+        )));
+    }
+
     let validated = validate_username(&payload.username, &state.config).map_err(|e| {
         log_audit_event(AuditEvent::UsernameSignupFailed {
             reason: format!("invalid_username:{}", e.message()),
@@ -736,12 +726,15 @@ pub async fn signup_complete(
 
         let (access_token, refresh_token, user) = match AuthService::register_with_username(
             &state.db,
-            google_user,
-            validated.original,
-            validated.normalized,
-            &state.config.jwt_secret,
-            state.config.access_token_ttl_secs,
-            state.config.refresh_token_ttl_days,
+            RegisterWithUsernameInput {
+                google_user,
+                username: validated.original,
+                username_normalized: validated.normalized,
+                terms_version: payload.terms_version.clone(),
+                jwt_secret: &state.config.jwt_secret,
+                access_token_ttl_secs: state.config.access_token_ttl_secs,
+                refresh_token_ttl_days: state.config.refresh_token_ttl_days,
+            },
         )
         .await
         {
@@ -792,17 +785,18 @@ pub async fn signup_complete(
     }
     .await;
 
-    if lock_enabled && lock_acquired {
-        if let Ok(mut conn) = state.queue.get_conn().await {
-            let script = redis::Script::new(
-                "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end",
-            );
-            let _: Result<i32, _> = script
-                .key(&lock_key)
-                .arg(&lock_value)
-                .invoke_async(&mut conn)
-                .await;
-        }
+    if lock_enabled
+        && lock_acquired
+        && let Ok(mut conn) = state.queue.get_conn().await
+    {
+        let script = redis::Script::new(
+            "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end",
+        );
+        let _: Result<i32, _> = script
+            .key(&lock_key)
+            .arg(&lock_value)
+            .invoke_async(&mut conn)
+            .await;
     }
 
     result
@@ -911,13 +905,33 @@ pub async fn dev_login(
         .await?;
 
     let user = match user {
-        Some(u) => u,
+        Some(u) => {
+            let needs_onboarding = u.age_confirmed_at.is_none()
+                || u.terms_accepted_at.is_none()
+                || u.terms_accepted_version.as_deref()
+                    != Some(state.config.terms_current_version.as_str());
+            if needs_onboarding {
+                let now = Utc::now().fixed_offset();
+                let mut active: users::ActiveModel = u.into();
+                active.age_confirmed_at = Set(Some(now));
+                active.terms_accepted_at = Set(Some(now));
+                active.terms_accepted_version =
+                    Set(Some(state.config.terms_current_version.clone()));
+                active.update(&state.db).await?
+            } else {
+                u
+            }
+        }
         None => {
+            let now = Utc::now().fixed_offset();
             let new_user = users::ActiveModel {
                 id: Set(Uuid::new_v4()),
                 google_id: Set(google_id),
                 username: Set(payload.username),
                 email: Set(payload.email),
+                age_confirmed_at: Set(Some(now)),
+                terms_accepted_at: Set(Some(now)),
+                terms_accepted_version: Set(Some(state.config.terms_current_version.clone())),
                 ..Default::default()
             };
             new_user.insert(&state.db).await?
@@ -1036,6 +1050,9 @@ pub async fn exchange_otc(
                 error: "username_required".to_string(),
                 signup_ticket: signup_data.signup_ticket,
                 suggested_username: signup_data.suggested_username,
+                requires_age_confirmation: signup_data.requires_age_confirmation,
+                required_terms_version: signup_data.required_terms_version,
+                terms_url: signup_data.terms_url,
                 rules: UsernameRulesDto {
                     min_length: USERNAME_MIN_LEN,
                     max_length: USERNAME_MAX_LEN,

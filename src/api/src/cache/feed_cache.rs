@@ -20,8 +20,13 @@ pub struct CachedVideoFeedItem {
     pub like_count: i64,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
     // Phase 5: New fields for soft-delete and anonymity support
+    #[serde(default)]
     pub deleted_at: Option<chrono::DateTime<chrono::FixedOffset>>,
+    #[serde(default)]
     pub is_anonymous: bool,
+    #[serde(default)]
+    pub is_nsfw: Option<bool>,
+    #[serde(default)]
     pub uploader: Option<CachedUploaderInfo>, // None if anonymous
 }
 
@@ -39,8 +44,8 @@ impl FeedCacheService {
     /// Generate cache key for feed query
     fn cache_key(sort: &str, tag: Option<&str>, page: u64) -> String {
         match tag {
-            Some(t) => format!("feed:v2:{}:tag:{}:page:{}", sort, t, page),
-            None => format!("feed:v2:{}:page:{}", sort, page),
+            Some(t) => format!("feed:v3:{}:tag:{}:page:{}", sort, t, page),
+            None => format!("feed:v3:{}:page:{}", sort, page),
         }
     }
 

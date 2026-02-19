@@ -7,10 +7,6 @@ use axum::{
     http::{HeaderMap, header},
     response::IntoResponse,
 };
-use axum_extra::{
-    TypedHeader,
-    headers::{Authorization, authorization::Bearer},
-};
 use futures_util::{SinkExt, StreamExt};
 use redis::AsyncCommands;
 use sea_orm::*;
@@ -21,7 +17,11 @@ use uuid::Uuid;
 
 use crate::{
     audit::logger::{AuditEvent, log_audit_event},
-    auth::{dtos::UserDto, service::AuthService},
+    auth::{
+        dtos::UserDto,
+        extractors::{AuthUser, SessionUser, ensure_user_onboarding_complete},
+        service::AuthService,
+    },
     error::{ApiErrorResponse, ApiResult},
     metrics::{
         USERNAME_RATE_LIMIT_EXCEEDED_TOTAL, USERNAME_UPDATE_CONFLICT_TOTAL, USERNAME_UPDATE_TOTAL,
@@ -35,7 +35,9 @@ use crate::{
     },
 };
 
-use super::dtos::{UpdateUsernameRequest, UserVideoDto};
+use super::dtos::{
+    CompleteOnboardingRequest, OnboardingStatusResponse, UpdateUsernameRequest, UserVideoDto,
+};
 
 #[derive(Deserialize)]
 pub struct PaginationQuery {
@@ -92,6 +94,7 @@ pub(crate) fn video_model_to_user_dto(
         created_at: v.created_at,
         updated_at: v.updated_at,
         is_anonymous: v.is_anonymous,
+        is_nsfw: v.is_nsfw,
         is_liked,
         like_count: v.like_count,
         url,
@@ -131,26 +134,16 @@ async fn load_liked_video_id_set(
 /// Cached for 24 hours.
 pub async fn get_me(
     State(state): State<AppState>,
-    TypedHeader(auth): TypedHeader<Authorization<Bearer>>,
+    AuthUser(user_id): AuthUser,
 ) -> ApiResult<Json<UserDto>> {
-    let token = auth.token();
-    let claims = AuthService::validate_token(token, &state.config.jwt_secret)
-        .map_err(|_| ApiErrorResponse::unauthorized("Invalid token"))?;
-
-    if state.token_revocation.is_revoked(claims.jti).await {
-        return Err(ApiErrorResponse::unauthorized("Token revoked"));
-    }
-
-    let user_id = claims.sub;
     let cache_key = format!("user:{}:profile", user_id);
 
     // Try cache first
-    if let Ok(mut conn) = state.queue.get_conn().await {
-        if let Ok(json) = conn.get::<_, String>(&cache_key).await {
-            if let Ok(cached) = serde_json::from_str::<UserDto>(&json) {
-                return Ok(Json(cached));
-            }
-        }
+    if let Ok(mut conn) = state.queue.get_conn().await
+        && let Ok(json) = conn.get::<_, String>(&cache_key).await
+        && let Ok(cached) = serde_json::from_str::<UserDto>(&json)
+    {
+        return Ok(Json(cached));
     }
 
     // Fetch from DB
@@ -168,31 +161,141 @@ pub async fn get_me(
     };
 
     // Cache result
-    if let Ok(mut conn) = state.queue.get_conn().await {
-        if let Ok(json) = serde_json::to_string(&dto) {
-            let _: Result<(), _> = conn.set_ex(&cache_key, json, 24 * 3600).await;
-        }
+    if let Ok(mut conn) = state.queue.get_conn().await
+        && let Ok(json) = serde_json::to_string(&dto)
+    {
+        let _: Result<(), _> = conn.set_ex(&cache_key, json, 24 * 3600).await;
     }
 
     Ok(Json(dto))
+}
+
+fn build_onboarding_status(
+    user: &users::Model,
+    config: &shared::config::Config,
+) -> OnboardingStatusResponse {
+    let age_confirmed = user.age_confirmed_at.is_some();
+    let terms_accepted = user.terms_accepted_at.is_some()
+        && user.terms_accepted_version.as_deref() == Some(config.terms_current_version.as_str());
+    OnboardingStatusResponse {
+        completed: age_confirmed && terms_accepted,
+        age_confirmed,
+        terms_accepted,
+        required_terms_version: config.terms_current_version.clone(),
+        accepted_terms_version: user.terms_accepted_version.clone(),
+        terms_url: config
+            .terms_url
+            .clone()
+            .or_else(|| Some("/system/terms".to_string())),
+    }
+}
+
+pub async fn get_onboarding_status(
+    State(state): State<AppState>,
+    SessionUser(user_id): SessionUser,
+) -> ApiResult<Json<OnboardingStatusResponse>> {
+    let key = RateLimiter::onboarding_status_user_key(&user_id);
+    match state
+        .rate_limiter
+        .check_and_increment(&key, state.config.onboarding_status_rpm_per_user, 60)
+        .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(_)) => {
+            return Err(ApiErrorResponse::too_many_requests(
+                "Too many onboarding status requests",
+            ));
+        }
+        Err(_) => {
+            return Err(ApiErrorResponse::new(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "Onboarding status temporarily unavailable",
+            ));
+        }
+    }
+
+    let user = users::Entity::find_by_id(user_id)
+        .one(&state.db)
+        .await
+        .map_err(ApiErrorResponse::db_error)?
+        .ok_or_else(|| ApiErrorResponse::not_found("User not found"))?;
+
+    Ok(Json(build_onboarding_status(&user, &state.config)))
+}
+
+pub async fn complete_onboarding(
+    State(state): State<AppState>,
+    SessionUser(user_id): SessionUser,
+    Json(payload): Json<CompleteOnboardingRequest>,
+) -> ApiResult<Json<OnboardingStatusResponse>> {
+    let key = RateLimiter::onboarding_complete_user_key(&user_id);
+    match state
+        .rate_limiter
+        .check_and_increment(&key, state.config.onboarding_complete_rpm_per_user, 60)
+        .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(_)) => {
+            return Err(ApiErrorResponse::too_many_requests(
+                "Too many onboarding completion attempts",
+            ));
+        }
+        Err(_) => {
+            return Err(ApiErrorResponse::new(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "Onboarding completion temporarily unavailable",
+            ));
+        }
+    }
+
+    if !payload.age_confirmed {
+        return Err(ApiErrorResponse::bad_request("age_confirmed must be true"));
+    }
+    if payload.terms_version != state.config.terms_current_version {
+        return Err(ApiErrorResponse::bad_request(format!(
+            "terms_version must match current version: {}",
+            state.config.terms_current_version
+        )));
+    }
+
+    let user = users::Entity::find_by_id(user_id)
+        .one(&state.db)
+        .await
+        .map_err(ApiErrorResponse::db_error)?
+        .ok_or_else(|| ApiErrorResponse::not_found("User not found"))?;
+
+    let now = chrono::Utc::now().fixed_offset();
+    let already_complete = user.age_confirmed_at.is_some()
+        && user.terms_accepted_at.is_some()
+        && user.terms_accepted_version.as_deref()
+            == Some(state.config.terms_current_version.as_str());
+
+    let updated = if already_complete {
+        user
+    } else {
+        let mut active: users::ActiveModel = user.into();
+        active.age_confirmed_at = Set(Some(now));
+        active.terms_accepted_at = Set(Some(now));
+        active.terms_accepted_version = Set(Some(state.config.terms_current_version.clone()));
+        active
+            .update(&state.db)
+            .await
+            .map_err(ApiErrorResponse::db_error)?
+    };
+
+    if let Ok(mut conn) = state.queue.get_conn().await {
+        let _: Result<(), _> = conn.del(format!("user:{}:profile", user_id)).await;
+    }
+
+    Ok(Json(build_onboarding_status(&updated, &state.config)))
 }
 
 /// DELETE /users/me
 /// Soft-deletes the user account and revokes all tokens.
 pub async fn delete_account(
     State(state): State<AppState>,
-    TypedHeader(auth): TypedHeader<Authorization<Bearer>>,
+    AuthUser(user_id): AuthUser,
 ) -> ApiResult<axum::http::StatusCode> {
-    let token = auth.token();
-    let claims = AuthService::validate_token(token, &state.config.jwt_secret)
-        .map_err(|_| ApiErrorResponse::unauthorized("Invalid token"))?;
-
-    if state.token_revocation.is_revoked(claims.jti).await {
-        return Err(ApiErrorResponse::unauthorized("Token revoked"));
-    }
-
-    let user_id = claims.sub;
-
     // 1. Soft Delete User
     let active_model = users::ActiveModel {
         id: Set(user_id),
@@ -206,21 +309,12 @@ pub async fn delete_account(
         .map_err(ApiErrorResponse::db_error)?;
 
     // 2. Revoke all tokens
-    // Revoke current access token
-    let now_secs = chrono::Utc::now().timestamp() as usize;
-    if claims.exp > now_secs {
-        state
-            .token_revocation
-            .revoke_token(claims.jti, claims.exp - now_secs)
-            .await
-            .ok();
-    }
     AuthService::logout_all(&state.db, user_id).await?;
     AuthService::revoke_extension_sessions(&state.db, user_id).await?;
 
     // 3. Invalidate Cache
     if let Ok(mut conn) = state.queue.get_conn().await {
-        let _: Result<(), _> = conn.del(&format!("user:{}:profile", user_id)).await;
+        let _: Result<(), _> = conn.del(format!("user:{}:profile", user_id)).await;
     }
 
     Ok(axum::http::StatusCode::NO_CONTENT)
@@ -230,18 +324,9 @@ pub async fn delete_account(
 /// Returns a paginated list of videos uploaded by the user (excluding soft-deleted ones).
 pub async fn get_my_videos(
     State(state): State<AppState>,
-    TypedHeader(auth): TypedHeader<Authorization<Bearer>>,
+    AuthUser(user_id): AuthUser,
     Query(pagination): Query<PaginationQuery>,
 ) -> ApiResult<Json<Vec<UserVideoDto>>> {
-    let token = auth.token();
-    let claims = AuthService::validate_token(token, &state.config.jwt_secret)
-        .map_err(|_| ApiErrorResponse::unauthorized("Invalid token"))?;
-
-    if state.token_revocation.is_revoked(claims.jti).await {
-        return Err(ApiErrorResponse::unauthorized("Token revoked"));
-    }
-
-    let user_id = claims.sub;
     let page = pagination.page.unwrap_or(1).max(1);
     let per_page = pagination.per_page.unwrap_or(20).clamp(1, 100);
 
@@ -250,12 +335,11 @@ pub async fn get_my_videos(
     let cache_key = format!("user:{}:videos:v5:{}:{}", user_id, page, per_page);
 
     // Try cache
-    if let Ok(mut conn) = state.queue.get_conn().await {
-        if let Ok(json) = conn.get::<_, String>(&cache_key).await {
-            if let Ok(cached) = serde_json::from_str::<Vec<UserVideoDto>>(&json) {
-                return Ok(Json(cached));
-            }
-        }
+    if let Ok(mut conn) = state.queue.get_conn().await
+        && let Ok(json) = conn.get::<_, String>(&cache_key).await
+        && let Ok(cached) = serde_json::from_str::<Vec<UserVideoDto>>(&json)
+    {
+        return Ok(Json(cached));
     }
 
     // Query DB
@@ -283,10 +367,10 @@ pub async fn get_my_videos(
         .collect();
 
     // Cache result (short TTL, e.g., 5 mins, invalidated on upload/delete)
-    if let Ok(mut conn) = state.queue.get_conn().await {
-        if let Ok(json) = serde_json::to_string(&dtos) {
-            let _: Result<(), _> = conn.set_ex(&cache_key, json, 300).await;
-        }
+    if let Ok(mut conn) = state.queue.get_conn().await
+        && let Ok(json) = serde_json::to_string(&dtos)
+    {
+        let _: Result<(), _> = conn.set_ex(&cache_key, json, 300).await;
     }
 
     Ok(Json(dtos))
@@ -294,18 +378,10 @@ pub async fn get_my_videos(
 
 pub async fn update_username(
     State(state): State<AppState>,
-    TypedHeader(auth): TypedHeader<Authorization<Bearer>>,
+    AuthUser(user_id): AuthUser,
     headers: HeaderMap,
     Json(payload): Json<UpdateUsernameRequest>,
 ) -> ApiResult<Json<UserDto>> {
-    let token = auth.token();
-    let claims = AuthService::validate_token(token, &state.config.jwt_secret)
-        .map_err(|_| ApiErrorResponse::unauthorized("Invalid token"))?;
-    if state.token_revocation.is_revoked(claims.jti).await {
-        return Err(ApiErrorResponse::unauthorized("Token revoked"));
-    }
-
-    let user_id = claims.sub;
     let rate_key = RateLimiter::username_update_user_key(&user_id);
     match state
         .rate_limiter
@@ -352,17 +428,15 @@ pub async fn update_username(
         .as_ref()
         .map(|key| format!("user:{}:username:update:idempotency:{}", user_id, key));
 
-    if let Some(ref cache_key) = idempotency_cache_key {
-        if let Ok(mut conn) = state.queue.get_conn().await {
-            if let Ok(raw) = conn.get::<_, String>(cache_key).await {
-                if let Ok(record) = serde_json::from_str::<UsernameUpdateIdempotencyRecord>(&raw) {
-                    if record.request_fingerprint != validated.normalized {
-                        return Err(ApiErrorResponse::conflict("idempotency_key_reuse_mismatch"));
-                    }
-                    return Ok(Json(record.response));
-                }
-            }
+    if let Some(ref cache_key) = idempotency_cache_key
+        && let Ok(mut conn) = state.queue.get_conn().await
+        && let Ok(raw) = conn.get::<_, String>(cache_key).await
+        && let Ok(record) = serde_json::from_str::<UsernameUpdateIdempotencyRecord>(&raw)
+    {
+        if record.request_fingerprint != validated.normalized {
+            return Err(ApiErrorResponse::conflict("idempotency_key_reuse_mismatch"));
         }
+        return Ok(Json(record.response));
     }
 
     let user = users::Entity::find_by_id(user_id)
@@ -383,15 +457,15 @@ pub async fn update_username(
             email: user.email,
             avatar_url: user.avatar_url,
         };
-        if let Some(ref cache_key) = idempotency_cache_key {
-            if let Ok(mut conn) = state.queue.get_conn().await {
-                let record = UsernameUpdateIdempotencyRecord {
-                    request_fingerprint: validated.normalized,
-                    response: response.clone(),
-                };
-                if let Ok(json) = serde_json::to_string(&record) {
-                    let _: Result<(), _> = conn.set_ex(cache_key, json, 600).await;
-                }
+        if let Some(ref cache_key) = idempotency_cache_key
+            && let Ok(mut conn) = state.queue.get_conn().await
+        {
+            let record = UsernameUpdateIdempotencyRecord {
+                request_fingerprint: validated.normalized,
+                response: response.clone(),
+            };
+            if let Ok(json) = serde_json::to_string(&record) {
+                let _: Result<(), _> = conn.set_ex(cache_key, json, 600).await;
             }
         }
         return Ok(Json(response));
@@ -425,7 +499,7 @@ pub async fn update_username(
     })?;
 
     if let Ok(mut conn) = state.queue.get_conn().await {
-        let _: Result<(), _> = conn.del(&format!("user:{}:profile", user_id)).await;
+        let _: Result<(), _> = conn.del(format!("user:{}:profile", user_id)).await;
     }
 
     let response = UserDto {
@@ -435,15 +509,15 @@ pub async fn update_username(
         avatar_url: updated.avatar_url,
     };
 
-    if let Some(ref cache_key) = idempotency_cache_key {
-        if let Ok(mut conn) = state.queue.get_conn().await {
-            let record = UsernameUpdateIdempotencyRecord {
-                request_fingerprint: validated.normalized,
-                response: response.clone(),
-            };
-            if let Ok(json) = serde_json::to_string(&record) {
-                let _: Result<(), _> = conn.set_ex(cache_key, json, 600).await;
-            }
+    if let Some(ref cache_key) = idempotency_cache_key
+        && let Ok(mut conn) = state.queue.get_conn().await
+    {
+        let record = UsernameUpdateIdempotencyRecord {
+            request_fingerprint: validated.normalized,
+            response: response.clone(),
+        };
+        if let Ok(json) = serde_json::to_string(&record) {
+            let _: Result<(), _> = conn.set_ex(cache_key, json, 600).await;
         }
     }
 
@@ -480,6 +554,14 @@ pub async fn my_videos_ws(
     }
 
     let user_id = claims.sub;
+    ensure_user_onboarding_complete(&state, user_id)
+        .await
+        .map_err(|status| match status {
+            axum::http::StatusCode::FORBIDDEN => ApiErrorResponse::forbidden("onboarding_required"),
+            axum::http::StatusCode::UNAUTHORIZED => ApiErrorResponse::unauthorized("Invalid token"),
+            _ => ApiErrorResponse::internal_error("Failed to authorize websocket session"),
+        })?;
+
     let client_ip = connect_info
         .map(|c| c.0.ip().to_string())
         .or_else(|| {
@@ -635,7 +717,7 @@ async fn handle_ws_connection(
             let snapshot = RealtimeSignalMessage::snapshot(videos);
             match serde_json::to_string(&snapshot) {
                 Ok(text) => {
-                    if ws_sender.send(Message::Text(text.into())).await.is_err() {
+                    if ws_sender.send(Message::Text(text)).await.is_err() {
                         state.realtime_hub.remove_connection(user_id, conn_id).await;
                         return;
                     }
@@ -659,7 +741,7 @@ async fn handle_ws_connection(
         .mark_bootstrapped_and_take_pending(user_id, conn_id)
         .await;
     for msg in pending {
-        if ws_sender.send(Message::Text(msg.into())).await.is_err() {
+        if ws_sender.send(Message::Text(msg)).await.is_err() {
             state.realtime_hub.remove_connection(user_id, conn_id).await;
             return;
         }
@@ -675,7 +757,7 @@ async fn handle_ws_connection(
             maybe_msg = rx.recv() => {
                 match maybe_msg {
                     Some(msg) => {
-                        if ws_sender.send(Message::Text(msg.into())).await.is_err() {
+                        if ws_sender.send(Message::Text(msg)).await.is_err() {
                             break;
                         }
                     }
@@ -710,7 +792,7 @@ async fn handle_ws_connection(
                 if Instant::now().duration_since(last_pong) > timeout {
                     break;
                 }
-                if ws_sender.send(Message::Ping(Vec::new().into())).await.is_err() {
+                if ws_sender.send(Message::Ping(Vec::new())).await.is_err() {
                     break;
                 }
             }

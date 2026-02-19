@@ -205,4 +205,24 @@ impl RateLimiter {
     pub fn keyboard_nonce_key(user_id: &uuid::Uuid, nonce: &str) -> String {
         format!("keyboard:nonce:{}:{}", user_id, nonce)
     }
+
+    /// Generate key for read-only mode status checks per user
+    pub fn read_only_status_user_key(user_id: &uuid::Uuid) -> String {
+        format!("ratelimit:system:read_only_status:user:{}", user_id)
+    }
+
+    /// Generate key for maintenance mode status checks per user
+    pub fn maintenance_status_user_key(user_id: &uuid::Uuid) -> String {
+        format!("ratelimit:system:maintenance_status:user:{}", user_id)
+    }
+
+    /// Generate key for onboarding status checks per user
+    pub fn onboarding_status_user_key(user_id: &uuid::Uuid) -> String {
+        format!("ratelimit:onboarding:status:user:{}", user_id)
+    }
+
+    /// Generate key for onboarding completion attempts per user
+    pub fn onboarding_complete_user_key(user_id: &uuid::Uuid) -> String {
+        format!("ratelimit:onboarding:complete:user:{}", user_id)
+    }
 }
