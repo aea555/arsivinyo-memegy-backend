@@ -5,7 +5,10 @@ use api::{
     create_router, metrics,
     realtime::{hub::RealtimeHub, subscriber::spawn_realtime_subscriber},
     services::rate_limiter::RateLimiter,
-    services::{ban_service::BanService, security_event_service::SecurityEventService},
+    services::{
+        abuse_report_service::AbuseReportService, ban_service::BanService,
+        security_event_service::SecurityEventService,
+    },
     state::AppState,
 };
 use sea_orm::Database;
@@ -47,6 +50,12 @@ async fn main() -> anyhow::Result<()> {
     let otc_cache = OtcCacheService::new(queue.clone());
     let rate_limiter = RateLimiter::new(queue.clone());
     let ban_service = BanService::new(db.clone(), queue.clone(), Arc::new(config.clone()));
+    let abuse_report_service = AbuseReportService::new(
+        db.clone(),
+        queue.clone(),
+        feed_cache.clone(),
+        Arc::new(config.clone()),
+    );
     let security_event_service =
         SecurityEventService::new(db.clone(), queue.clone(), Arc::new(config.clone()));
 
@@ -74,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
         otc_rate_limiter,
         realtime_hub,
         ban_service,
+        abuse_report_service,
         security_event_service,
     };
 
@@ -104,10 +114,24 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // 11. Routes (via library)
+    // 11. Spawn periodic purge for abuse reports retention policy
+    let abuse_report_service = state.abuse_report_service.clone();
+    let abuse_purge_interval_secs = state.config.abuse_report_purge_interval_secs.max(60);
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(abuse_purge_interval_secs));
+        loop {
+            interval.tick().await;
+            if let Err(err) = abuse_report_service.purge_expired_reports().await {
+                tracing::warn!("Failed to purge expired abuse reports: {:?}", err);
+            }
+        }
+    });
+
+    // 12. Routes (via library)
     let app = create_router(state.clone());
 
-    // 12. Server
+    // 13. Server
     let addr = SocketAddr::from(([0, 0, 0, 0], state.config.server_port));
     tracing::info!("Server listening on {}", addr);
 

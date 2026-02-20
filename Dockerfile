@@ -62,6 +62,7 @@ COPY --from=builder /app/bin/api /app/api
 COPY --from=builder /app/bin/worker /app/worker
 COPY openapi.yaml /app/openapi.yaml
 COPY static /app/static
+COPY docs/legal/terms /app/docs/legal/terms
 CMD ["/bin/sh"]
 
 # Backward-compatible targets for non-production compose files.

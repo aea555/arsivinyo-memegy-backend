@@ -44,8 +44,8 @@ impl FeedCacheService {
     /// Generate cache key for feed query
     fn cache_key(sort: &str, tag: Option<&str>, page: u64) -> String {
         match tag {
-            Some(t) => format!("feed:v3:{}:tag:{}:page:{}", sort, t, page),
-            None => format!("feed:v3:{}:page:{}", sort, page),
+            Some(t) => format!("feed:v4:{}:tag:{}:page:{}", sort, t, page),
+            None => format!("feed:v4:{}:page:{}", sort, page),
         }
     }
 

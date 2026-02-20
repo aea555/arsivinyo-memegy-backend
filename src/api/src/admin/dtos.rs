@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::videos::dtos::VideoReportDto;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AdminResponseMeta {
     pub request_id: String,
@@ -122,4 +124,61 @@ pub struct IpUserInvestigationItem {
 pub struct InvestigationResponse<T: Serialize> {
     pub items: Vec<T>,
     pub next_cursor: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AdminAbuseReportListQuery {
+    pub status: Option<String>,
+    pub reason: Option<String>,
+    pub severity_min: Option<i16>,
+    pub video_id: Option<Uuid>,
+    pub limit: Option<u64>,
+    pub cursor: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminAbuseReportItem {
+    pub report: VideoReportDto,
+    pub reporter_username: Option<String>,
+    pub video_title: Option<String>,
+    pub video_status: Option<String>,
+    pub video_moderation_state: Option<String>,
+    pub uploader_user_id: Option<Uuid>,
+    pub uploader_username: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminAbuseReportListResponse {
+    pub items: Vec<AdminAbuseReportItem>,
+    pub next_cursor: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResolveAbuseReportRequest {
+    pub resolution_code: String,
+    #[serde(default)]
+    pub resolution_note: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>, // resolved|rejected
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AdminVideoModerationActionRequest {
+    pub action: String, // quarantine|remove|restore
+    #[serde(default)]
+    pub reason_code: Option<String>,
+    #[serde(default)]
+    pub resolution_note: Option<String>,
+    #[serde(default)]
+    pub source_report_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminVideoModerationActionResponse {
+    pub video_id: Uuid,
+    pub moderation_state: String,
+    pub moderation_reason_code: Option<String>,
+    pub moderation_updated_at: Option<DateTime<Utc>>,
+    pub moderation_updated_by: Option<String>,
+    pub changed: bool,
 }

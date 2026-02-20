@@ -4,7 +4,10 @@ use crate::cache::otc_cache::OtcCacheService;
 use crate::middleware::rate_limit::RateLimiter as OtcRateLimiter;
 use crate::realtime::hub::RealtimeHub;
 use crate::services::rate_limiter::RateLimiter;
-use crate::services::{ban_service::BanService, security_event_service::SecurityEventService};
+use crate::services::{
+    abuse_report_service::AbuseReportService, ban_service::BanService,
+    security_event_service::SecurityEventService,
+};
 use sea_orm::DatabaseConnection;
 use shared::{config::Config, queue::QueueService, storage::StorageBackend as StorageService};
 use std::sync::Arc;
@@ -22,5 +25,6 @@ pub struct AppState {
     pub otc_rate_limiter: OtcRateLimiter,
     pub realtime_hub: RealtimeHub,
     pub ban_service: BanService,
+    pub abuse_report_service: AbuseReportService,
     pub security_event_service: SecurityEventService,
 }

@@ -391,7 +391,10 @@ async fn security_investigation_endpoints_return_user_ip_associations() {
     );
 
     let per_ip = client
-        .get(format!("{}/admin/security/ips/127.0.0.1/users", app.address))
+        .get(format!(
+            "{}/admin/security/ips/127.0.0.1/users",
+            app.address
+        ))
         .bearer_auth(build_admin_token(TEST_ADMIN_AUDIENCE, "superadmin"))
         .query(&[("window_days", "30"), ("limit", "20"), ("cursor", "0")])
         .send()

@@ -537,6 +537,105 @@ components:
         - age_confirmed
         - terms_version
 
+    ReportVideoRequest:
+      type: object
+      properties:
+        reason_codes:
+          type: array
+          items:
+            type: string
+        details:
+          type: string
+          nullable: true
+        timestamp_seconds:
+          type: integer
+          nullable: true
+      required:
+        - reason_codes
+
+    VideoReportDto:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        video_id:
+          type: string
+          format: uuid
+        reporter_user_id:
+          type: string
+          format: uuid
+        reason_codes:
+          type: array
+          items:
+            type: string
+        details:
+          type: string
+          nullable: true
+        timestamp_seconds:
+          type: integer
+          nullable: true
+        severity_score:
+          type: integer
+        status:
+          type: string
+        auto_quarantined:
+          type: boolean
+        auto_rule:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        closed_at:
+          type: string
+          format: date-time
+          nullable: true
+        resolution_code:
+          type: string
+          nullable: true
+        resolution_note:
+          type: string
+          nullable: true
+      required:
+        - id
+        - video_id
+        - reporter_user_id
+        - reason_codes
+        - severity_score
+        - status
+        - auto_quarantined
+        - created_at
+        - updated_at
+
+    ReportVideoResponse:
+      type: object
+      properties:
+        created:
+          type: boolean
+        report:
+          $ref: "#/components/schemas/VideoReportDto"
+      required:
+        - created
+        - report
+
+    MyReportsResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+        next_cursor:
+          type: integer
+          nullable: true
+      required:
+        - items
+        - next_cursor
+
     ModeStatusResponse:
       type: object
       properties:
@@ -562,12 +661,31 @@ components:
         content:
           type: string
           nullable: true
+        effective_at:
+          type: string
+          nullable: true
+          description: RFC3339/ISO-style effective date metadata from terms frontmatter
+        jurisdictions:
+          type: array
+          items:
+            type: string
+          description: Active legal jurisdiction tags for current terms
+        legal_contact_email:
+          type: string
+          nullable: true
+        abuse_contact_email:
+          type: string
+          nullable: true
       required:
         - version
         - url
         - content_type
         - content_sha256
         - content
+        - effective_at
+        - jurisdictions
+        - legal_contact_email
+        - abuse_contact_email
 
     RealtimeVideoSignal:
       type: object
@@ -1194,6 +1312,55 @@ paths:
           $ref: "#/components/responses/TooManyRequestsError"
         "500":
           $ref: "#/components/responses/InternalServerError"
+
+  /videos/{id}/report:
+    post:
+      tags:
+        - Videos
+      summary: Report a video for abuse/policy violations
+      operationId: reportVideo
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReportVideoRequest"
+      responses:
+        "201":
+          description: New report created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReportVideoResponse"
+        "200":
+          description: Existing open report updated idempotently
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReportVideoResponse"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "429":
+          $ref: "#/components/responses/TooManyRequestsError"
+        "503":
+          description: Report submission temporarily unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
   /videos/init/anonymous:
     post:
@@ -2060,6 +2227,38 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+
+  /users/me/reports:
+    get:
+      tags:
+        - Users
+      summary: List authenticated user's abuse reports
+      operationId: getMyReports
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: query
+          name: limit
+          required: false
+          schema:
+            type: integer
+        - in: query
+          name: cursor
+          required: false
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Abuse reports page
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MyReportsResponse"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+
   /users/me/username:
     put:
       tags:
@@ -2320,6 +2519,159 @@ paths:
   #               $ref: "#/components/schemas/BulkDownloadStatus"
   #       "404":
   #         $ref: "#/components/responses/NotFoundError"
+
+  /admin/abuse/reports:
+    get:
+      tags:
+        - Admin
+      summary: List abuse reports
+      operationId: adminListAbuseReports
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: query
+          name: status
+          required: false
+          schema:
+            type: string
+        - in: query
+          name: reason
+          required: false
+          schema:
+            type: string
+        - in: query
+          name: severity_min
+          required: false
+          schema:
+            type: integer
+        - in: query
+          name: video_id
+          required: false
+          schema:
+            type: string
+            format: uuid
+        - in: query
+          name: limit
+          required: false
+          schema:
+            type: integer
+        - in: query
+          name: cursor
+          required: false
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Abuse report list
+          content:
+            application/json:
+              schema:
+                type: object
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+
+  /admin/abuse/reports/{report_id}:
+    get:
+      tags:
+        - Admin
+      summary: Get abuse report details
+      operationId: adminGetAbuseReport
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: path
+          name: report_id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Abuse report details
+          content:
+            application/json:
+              schema:
+                type: object
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+    post:
+      tags:
+        - Admin
+      summary: Resolve an abuse report
+      operationId: adminResolveAbuseReport
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: path
+          name: report_id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: Abuse report resolved
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+
+  /admin/moderation/videos/{video_id}/action:
+    post:
+      tags:
+        - Admin
+      summary: Apply manual moderation action to a video
+      operationId: adminVideoModerationAction
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: path
+          name: video_id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: Video moderation action result
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
 
   /admin/db/tables:
     get:

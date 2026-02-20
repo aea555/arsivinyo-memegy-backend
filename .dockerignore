@@ -51,6 +51,9 @@ rust-toolchain.toml
 rust-toolchain
 
 docs/
+!docs/legal/
+!docs/legal/terms/
+!docs/legal/terms/*.md
 
 src/api/tests/
 

@@ -50,6 +50,15 @@ pub fn admin_router() -> Router<AppState> {
             "/security/ips/:ip/users",
             get(handlers::investigate_ip_users),
         )
+        .route("/abuse/reports", get(handlers::list_abuse_reports))
+        .route(
+            "/abuse/reports/:report_id",
+            get(handlers::get_abuse_report).post(handlers::resolve_abuse_report),
+        )
+        .route(
+            "/moderation/videos/:video_id/action",
+            post(handlers::admin_video_moderation_action),
+        )
         .route("/system/terms", get(handlers::admin_get_terms))
         .route(
             "/system/read-only",
@@ -133,6 +142,10 @@ pub fn admin_router() -> Router<AppState> {
         .route(
             "/users/:user_id/videos/:id",
             delete(handlers::as_user_delete_video).patch(handlers::as_user_update_video_metadata),
+        )
+        .route(
+            "/users/:user_id/videos/:id/report",
+            post(handlers::as_user_report_video),
         )
         .route(
             "/users/:user_id/videos/bulk-delete",

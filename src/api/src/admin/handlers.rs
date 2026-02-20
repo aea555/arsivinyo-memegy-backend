@@ -11,7 +11,7 @@ use sea_orm::{
     QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
 };
 use serde_json::json;
-use shared::entities::{admin_audit_logs, users, videos};
+use shared::entities::{abuse_reports, admin_audit_logs, users, videos};
 use std::{sync::Arc, time::Duration};
 use uuid::Uuid;
 
@@ -25,6 +25,10 @@ use crate::{
         service::{AuthService, RefreshAccessTokenError},
     },
     error::{ApiErrorResponse, ApiResult},
+    services::{
+        abuse_report_service::{self, VideoModerationAction},
+        client_ip::ClientIp,
+    },
     state::AppState,
     system::handlers::{ModeStatusResponse, TermsResponse},
     users::{
@@ -36,12 +40,13 @@ use crate::{
             BulkDeleteRequest, BulkDownloadJobResponse, BulkDownloadStatus,
             CreateBulkDownloadRequest, CreateSendTicketRequest, InitUploadRequest,
             InitUploadResponse, KeyboardSearchItemDto, KeyboardSearchQuery, LikeVideoResponse,
-            RefreshDownloadResponse, SearchVideosQuery, SendTicketResponse, UpdateVideoRequest,
+            RefreshDownloadResponse, ReportVideoRequest, SearchVideosQuery, SendTicketResponse,
+            UpdateVideoRequest,
         },
         handlers::{
             FeedQuery, VideoFeedItem, confirm_upload, create_send_ticket, get_bulk_download_status,
-            get_feed, init_anonymous_upload, init_upload, redeem_send_ticket_media, search_videos,
-            search_videos_keyboard, set_like_video, unset_like_video,
+            get_feed, init_anonymous_upload, init_upload, redeem_send_ticket_media, report_video,
+            search_videos, search_videos_keyboard, set_like_video, unset_like_video,
         },
     },
 };
@@ -49,10 +54,13 @@ use shared::security::create_access_token;
 
 use super::{
     dtos::{
-        AdminEnvelope, AdminResponseMeta, AdminTableInfo, GetRowResponse, HardDeleteResponse,
-        InvestigationQuery, InvestigationResponse, IpBanQuery, IpBanStatusResponse,
-        IpBanUpsertRequest, IpUserInvestigationItem, ListRowsQuery, ListRowsResponse,
-        ListTablesResponse, UpsertBanRequest, UserBanStatusResponse, UserIpInvestigationItem,
+        AdminAbuseReportItem, AdminAbuseReportListQuery, AdminAbuseReportListResponse,
+        AdminEnvelope, AdminResponseMeta, AdminTableInfo, AdminVideoModerationActionRequest,
+        AdminVideoModerationActionResponse, GetRowResponse, HardDeleteResponse, InvestigationQuery,
+        InvestigationResponse, IpBanQuery, IpBanStatusResponse, IpBanUpsertRequest,
+        IpUserInvestigationItem, ListRowsQuery, ListRowsResponse, ListTablesResponse,
+        ResolveAbuseReportRequest, UpsertBanRequest, UserBanStatusResponse,
+        UserIpInvestigationItem,
     },
     extractors::AdminPrincipal,
 };
@@ -129,6 +137,11 @@ const TABLE_SPECS: &[TableSpec] = &[
     },
     TableSpec {
         name: "security_events",
+        pk: TablePrimaryKey::Single("id"),
+        order_by: "created_at DESC, id DESC",
+    },
+    TableSpec {
+        name: "abuse_reports",
         pk: TablePrimaryKey::Single("id"),
         order_by: "created_at DESC, id DESC",
     },
@@ -1500,6 +1513,37 @@ pub async fn as_user_update_video_metadata(
     result
 }
 
+pub async fn as_user_report_video(
+    State(state): State<AppState>,
+    principal: AdminPrincipal,
+    headers: HeaderMap,
+    Path((user_id, video_id)): Path<(Uuid, Uuid)>,
+    Json(payload): Json<ReportVideoRequest>,
+) -> ApiResult<impl IntoResponse> {
+    let admin_state = admin_passthrough_state(&state);
+    let result = report_video(
+        State(admin_state),
+        AuthUser(user_id),
+        ClientIp(principal.client_ip),
+        headers.clone(),
+        Path(video_id),
+        Json(payload),
+    )
+    .await;
+    let outcome = if result.is_ok() { "success" } else { "failed" };
+    audit_as_user_action(
+        &state,
+        &principal,
+        &headers,
+        "as_user_report_video",
+        user_id,
+        outcome,
+        json!({ "video_id": video_id.to_string() }),
+    )
+    .await;
+    result
+}
+
 pub async fn as_user_bulk_delete_videos(
     State(state): State<AppState>,
     principal: AdminPrincipal,
@@ -1964,6 +2008,30 @@ fn map_ip_ban_status(
     }
 }
 
+fn parse_resolution_status(input: Option<&str>) -> ApiResult<String> {
+    let value = input.unwrap_or(abuse_report_service::REPORT_STATUS_RESOLVED);
+    if value == abuse_report_service::REPORT_STATUS_RESOLVED
+        || value == abuse_report_service::REPORT_STATUS_REJECTED
+    {
+        Ok(value.to_string())
+    } else {
+        Err(ApiErrorResponse::bad_request(
+            "status must be either 'resolved' or 'rejected'",
+        ))
+    }
+}
+
+fn parse_video_moderation_action(action: &str) -> ApiResult<VideoModerationAction> {
+    match action.trim().to_ascii_lowercase().as_str() {
+        "quarantine" => Ok(VideoModerationAction::Quarantine),
+        "remove" => Ok(VideoModerationAction::Remove),
+        "restore" => Ok(VideoModerationAction::Restore),
+        _ => Err(ApiErrorResponse::bad_request(
+            "action must be one of: quarantine, remove, restore",
+        )),
+    }
+}
+
 pub async fn get_user_ban(
     State(state): State<AppState>,
     principal: AdminPrincipal,
@@ -2192,6 +2260,294 @@ pub async fn investigate_ip_users(
     }))
 }
 
+pub async fn list_abuse_reports(
+    State(state): State<AppState>,
+    _principal: AdminPrincipal,
+    Query(query): Query<AdminAbuseReportListQuery>,
+) -> ApiResult<Json<AdminAbuseReportListResponse>> {
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let cursor = query.cursor.unwrap_or(0);
+
+    let mut select = abuse_reports::Entity::find();
+    if let Some(status) = query.status {
+        select = select.filter(abuse_reports::Column::Status.eq(status));
+    }
+    if let Some(severity_min) = query.severity_min {
+        select = select.filter(abuse_reports::Column::SeverityScore.gte(severity_min));
+    }
+    if let Some(video_id) = query.video_id {
+        select = select.filter(abuse_reports::Column::VideoId.eq(video_id));
+    }
+    if let Some(reason) = query.reason {
+        select = select.filter(sea_orm::sea_query::Expr::cust_with_values(
+            "? = ANY(reason_codes)",
+            [reason],
+        ));
+    }
+
+    let mut reports = select
+        .order_by_desc(abuse_reports::Column::CreatedAt)
+        .paginate(&state.db, limit + 1)
+        .fetch_page(cursor)
+        .await
+        .map_err(ApiErrorResponse::db_error)?;
+
+    let next_cursor = if reports.len() as u64 > limit {
+        reports.truncate(limit as usize);
+        Some(cursor + 1)
+    } else {
+        None
+    };
+
+    let reporter_ids: Vec<Uuid> = reports.iter().map(|r| r.reporter_user_id).collect();
+    let video_ids: Vec<Uuid> = reports.iter().map(|r| r.video_id).collect();
+
+    let reporters: std::collections::HashMap<Uuid, users::Model> = if reporter_ids.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        users::Entity::find()
+            .filter(users::Column::Id.is_in(reporter_ids))
+            .all(&state.db)
+            .await
+            .map_err(ApiErrorResponse::db_error)?
+            .into_iter()
+            .map(|u| (u.id, u))
+            .collect()
+    };
+
+    let video_map: std::collections::HashMap<Uuid, videos::Model> = if video_ids.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        videos::Entity::find()
+            .filter(videos::Column::Id.is_in(video_ids))
+            .all(&state.db)
+            .await
+            .map_err(ApiErrorResponse::db_error)?
+            .into_iter()
+            .map(|v| (v.id, v))
+            .collect()
+    };
+
+    let uploader_ids: Vec<Uuid> = video_map.values().map(|v| v.user_id).collect();
+    let uploaders: std::collections::HashMap<Uuid, users::Model> = if uploader_ids.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        users::Entity::find()
+            .filter(users::Column::Id.is_in(uploader_ids))
+            .all(&state.db)
+            .await
+            .map_err(ApiErrorResponse::db_error)?
+            .into_iter()
+            .map(|u| (u.id, u))
+            .collect()
+    };
+
+    let items = reports
+        .into_iter()
+        .map(|report| {
+            let reporter = reporters.get(&report.reporter_user_id);
+            let video = video_map.get(&report.video_id);
+            let uploader = video.and_then(|v| uploaders.get(&v.user_id));
+            AdminAbuseReportItem {
+                report: crate::videos::handlers::abuse_report_model_to_dto(report),
+                reporter_username: reporter.map(|u| u.username.clone()),
+                video_title: video.and_then(|v| v.title.clone()),
+                video_status: video.map(|v| v.status.clone()),
+                video_moderation_state: video.map(|v| v.moderation_state.clone()),
+                uploader_user_id: video.map(|v| v.user_id),
+                uploader_username: uploader.map(|u| u.username.clone()),
+            }
+        })
+        .collect();
+
+    Ok(Json(AdminAbuseReportListResponse { items, next_cursor }))
+}
+
+pub async fn get_abuse_report(
+    State(state): State<AppState>,
+    _principal: AdminPrincipal,
+    Path(report_id): Path<Uuid>,
+) -> ApiResult<Json<AdminAbuseReportItem>> {
+    let report = abuse_reports::Entity::find_by_id(report_id)
+        .one(&state.db)
+        .await
+        .map_err(ApiErrorResponse::db_error)?
+        .ok_or_else(|| ApiErrorResponse::not_found("Report not found"))?;
+
+    let reporter = users::Entity::find_by_id(report.reporter_user_id)
+        .one(&state.db)
+        .await
+        .map_err(ApiErrorResponse::db_error)?;
+    let video = videos::Entity::find_by_id(report.video_id)
+        .one(&state.db)
+        .await
+        .map_err(ApiErrorResponse::db_error)?;
+    let uploader = if let Some(ref v) = video {
+        users::Entity::find_by_id(v.user_id)
+            .one(&state.db)
+            .await
+            .map_err(ApiErrorResponse::db_error)?
+    } else {
+        None
+    };
+
+    Ok(Json(AdminAbuseReportItem {
+        report: crate::videos::handlers::abuse_report_model_to_dto(report),
+        reporter_username: reporter.map(|u| u.username),
+        video_title: video.as_ref().and_then(|v| v.title.clone()),
+        video_status: video.as_ref().map(|v| v.status.clone()),
+        video_moderation_state: video.as_ref().map(|v| v.moderation_state.clone()),
+        uploader_user_id: video.as_ref().map(|v| v.user_id),
+        uploader_username: uploader.map(|u| u.username),
+    }))
+}
+
+pub async fn resolve_abuse_report(
+    State(state): State<AppState>,
+    principal: AdminPrincipal,
+    headers: HeaderMap,
+    Path(report_id): Path<Uuid>,
+    Json(payload): Json<ResolveAbuseReportRequest>,
+) -> ApiResult<Json<AdminAbuseReportItem>> {
+    let status = parse_resolution_status(payload.status.as_deref())?;
+    if payload.resolution_code.trim().is_empty() {
+        return Err(ApiErrorResponse::bad_request(
+            "resolution_code must be non-empty",
+        ));
+    }
+
+    let report = abuse_reports::Entity::find_by_id(report_id)
+        .one(&state.db)
+        .await
+        .map_err(ApiErrorResponse::db_error)?
+        .ok_or_else(|| ApiErrorResponse::not_found("Report not found"))?;
+
+    let now = Utc::now().fixed_offset();
+    let updated = if report.closed_at.is_some() {
+        report
+    } else {
+        let mut active: abuse_reports::ActiveModel = report.into();
+        active.status = Set(status.clone());
+        active.closed_at = Set(Some(now));
+        active.closed_by_admin_sub = Set(Some(principal.sub.clone()));
+        active.resolution_code = Set(Some(payload.resolution_code.clone()));
+        active.resolution_note = Set(payload.resolution_note.clone());
+        active.updated_at = Set(now);
+        active
+            .update(&state.db)
+            .await
+            .map_err(ApiErrorResponse::db_error)?
+    };
+
+    write_admin_audit(
+        &state,
+        &principal,
+        &request_id_from_headers(&headers),
+        AdminAuditEntry::new(
+            "resolve_abuse_report",
+            "abuse_reports",
+            Some(&report_id.to_string()),
+            "success",
+            user_agent_from_headers(&headers).as_deref(),
+            json!({
+                "status": status,
+                "resolution_code": payload.resolution_code,
+            }),
+        ),
+    )
+    .await;
+
+    let _ = state
+        .security_event_service
+        .record(
+            "abuse.report_resolved",
+            Some(updated.reporter_user_id),
+            &principal.client_ip.to_string(),
+            None,
+            user_agent_from_headers(&headers).as_deref(),
+            json!({
+                "report_id": updated.id,
+                "video_id": updated.video_id,
+                "status": updated.status,
+                "resolution_code": updated.resolution_code,
+            }),
+        )
+        .await;
+
+    get_abuse_report(State(state), principal, Path(report_id)).await
+}
+
+pub async fn admin_video_moderation_action(
+    State(state): State<AppState>,
+    principal: AdminPrincipal,
+    headers: HeaderMap,
+    Path(video_id): Path<Uuid>,
+    Json(payload): Json<AdminVideoModerationActionRequest>,
+) -> ApiResult<Json<AdminVideoModerationActionResponse>> {
+    let action = parse_video_moderation_action(&payload.action)?;
+    let actor = format!("admin:{}", principal.sub);
+    let outcome = state
+        .abuse_report_service
+        .apply_video_moderation_action(
+            video_id,
+            action,
+            payload.reason_code.as_deref(),
+            &actor,
+            payload.source_report_id,
+        )
+        .await?;
+
+    write_admin_audit(
+        &state,
+        &principal,
+        &request_id_from_headers(&headers),
+        AdminAuditEntry::new(
+            "video_moderation_action",
+            "videos",
+            Some(&video_id.to_string()),
+            "success",
+            user_agent_from_headers(&headers).as_deref(),
+            json!({
+                "action": payload.action,
+                "reason_code": payload.reason_code,
+                "source_report_id": payload.source_report_id,
+                "changed": outcome.changed,
+            }),
+        ),
+    )
+    .await;
+
+    let _ = state
+        .security_event_service
+        .record(
+            "abuse.video_moderation_action",
+            Some(outcome.video.user_id),
+            &principal.client_ip.to_string(),
+            None,
+            user_agent_from_headers(&headers).as_deref(),
+            json!({
+                "video_id": video_id,
+                "action": payload.action,
+                "reason_code": payload.reason_code,
+                "source_report_id": payload.source_report_id,
+                "changed": outcome.changed,
+            }),
+        )
+        .await;
+
+    Ok(Json(AdminVideoModerationActionResponse {
+        video_id: outcome.video.id,
+        moderation_state: outcome.video.moderation_state,
+        moderation_reason_code: outcome.video.moderation_reason_code,
+        moderation_updated_at: outcome
+            .video
+            .moderation_updated_at
+            .map(|dt| dt.with_timezone(&Utc)),
+        moderation_updated_by: outcome.video.moderation_updated_by,
+        changed: outcome.changed,
+    }))
+}
+
 pub async fn admin_get_terms(
     State(state): State<AppState>,
     _principal: AdminPrincipal,
@@ -2202,6 +2558,10 @@ pub async fn admin_get_terms(
         content_type: state.config.terms_content_type.clone(),
         content_sha256: state.config.terms_content_sha256.clone(),
         content: state.config.terms_content.clone(),
+        effective_at: state.config.terms_effective_at.clone(),
+        jurisdictions: state.config.terms_jurisdictions.clone(),
+        legal_contact_email: state.config.terms_legal_contact_email.clone(),
+        abuse_contact_email: state.config.terms_abuse_contact_email.clone(),
     }))
 }
 

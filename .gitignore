@@ -1,5 +1,12 @@
 target/
 docs/
+!docs/
+docs/*
+!docs/legal/
+docs/legal/*
+!docs/legal/terms/
+docs/legal/terms/*
+!docs/legal/terms/memegy_terms_v1.md
 **/*.rs.bk
 #Cargo.lock
 .env
@@ -17,3 +24,4 @@ docker/minio_data/
 # Except README.md 
 !README.md
 !ADMIN_PANEL_SUPERADMIN_GUIDE.md
+!docs/legal/terms/memegy_terms_v1.md

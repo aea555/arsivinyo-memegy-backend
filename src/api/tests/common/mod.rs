@@ -7,8 +7,8 @@ use api::{
     create_router,
     realtime::hub::RealtimeHub,
     services::{
-        ban_service::BanService, rate_limiter::RateLimiter,
-        security_event_service::SecurityEventService,
+        abuse_report_service::AbuseReportService, ban_service::BanService,
+        rate_limiter::RateLimiter, security_event_service::SecurityEventService,
     },
     state::AppState,
 };
@@ -193,6 +193,11 @@ async fn spawn_app_internal(options: TestAppOptions) -> TestApp {
         terms_content_sha256: options
             .terms_content
             .map(shared::config::Config::sha256_hex),
+        terms_effective_at: None,
+        terms_jurisdictions: vec!["US".to_string(), "TR".to_string(), "GLOBAL".to_string()],
+        terms_require_version_match: true,
+        terms_legal_contact_email: Some("legal@example.com".to_string()),
+        terms_abuse_contact_email: Some("abuse@example.com".to_string()),
         read_only_mode_enabled: options.read_only_mode_enabled,
         maintenance_mode_enabled: options.maintenance_mode_enabled,
         username_reserved_values: "admin,support".to_string(),
@@ -241,8 +246,17 @@ async fn spawn_app_internal(options: TestAppOptions) -> TestApp {
         maintenance_status_rpm_per_user: 20,
         onboarding_status_rpm_per_user: 30,
         onboarding_complete_rpm_per_user: 10,
+        report_create_rpm_per_user: 10,
+        report_create_rpm_per_ip: 20,
+        report_details_max_chars: 2000,
+        report_reason_max_count: 5,
+        auto_quarantine_enabled: true,
+        auto_quarantine_window_secs: 1800,
+        auto_quarantine_severe_distinct_reporters: 2,
         security_events_retention_days: 180,
         security_events_purge_interval_secs: 86400,
+        abuse_report_retention_days: 365,
+        abuse_report_purge_interval_secs: 86400,
         ban_user_cache_negative_ttl_secs: 60,
         ban_user_cache_permanent_ttl_secs: 21600,
         ban_ip_cache_negative_ttl_secs: 60,
@@ -287,6 +301,12 @@ async fn spawn_app_internal(options: TestAppOptions) -> TestApp {
     let otc_rate_limiter = api::middleware::rate_limit::RateLimiter::new(5, 60);
     let config_arc = Arc::new(config.clone());
     let ban_service = BanService::new(db.clone(), queue.clone(), config_arc.clone());
+    let abuse_report_service = AbuseReportService::new(
+        db.clone(),
+        queue.clone(),
+        feed_cache.clone(),
+        config_arc.clone(),
+    );
     let security_event_service = SecurityEventService::new(db.clone(), queue.clone(), config_arc);
 
     let state = AppState {
@@ -305,6 +325,7 @@ async fn spawn_app_internal(options: TestAppOptions) -> TestApp {
             config.video_ws_send_buffer,
         ),
         ban_service,
+        abuse_report_service,
         security_event_service,
     };
 
@@ -441,6 +462,11 @@ impl TestApp {
             like_count: Set(0),
             is_anonymous: Set(is_anonymous),
             is_nsfw: Set(Some(false)),
+            moderation_state: Set("VISIBLE".to_string()),
+            moderation_reason_code: Set(None),
+            moderation_updated_at: Set(None),
+            moderation_updated_by: Set(None),
+            moderation_source_report_id: Set(None),
             processing_error_code: Set(None),
             processing_error_message: Set(None),
             failed_at: Set(None),

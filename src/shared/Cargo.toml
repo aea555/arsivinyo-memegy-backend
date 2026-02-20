@@ -7,6 +7,7 @@ edition = "2024"
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde_yaml = "0.9"
 
 # Database (SeaORM + SQLx)
 sea-orm = { version = "1.1", features = [ "sqlx-postgres", "runtime-tokio-rustls", "macros" ] }

@@ -1,7 +1,8 @@
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
 };
 use chrono::Utc;
 use sea_orm::*;
@@ -18,12 +19,16 @@ use crate::{
         KEYBOARD_TICKET_EXPIRED_TOTAL, WS_EVENTS_PUBLISHED_TOTAL,
     },
     realtime::messages::{EVENT_PROCESSING, RealtimeSignalMessage},
+    services::{
+        abuse_report_service::{self, SubmitReportInput},
+        client_ip::ClientIp,
+    },
     state::AppState,
     users::handlers::video_model_to_user_dto,
 };
 use redis::AsyncCommands;
 use shared::{
-    entities::{likes, send_tickets, videos},
+    entities::{abuse_reports, likes, send_tickets, videos},
     queue::VideoProcessJob,
 };
 
@@ -80,6 +85,26 @@ pub struct VideoFeedItem {
 pub struct UploaderInfo {
     pub id: Uuid,
     pub username: String,
+}
+
+pub(crate) fn abuse_report_model_to_dto(report: abuse_reports::Model) -> VideoReportDto {
+    VideoReportDto {
+        id: report.id,
+        video_id: report.video_id,
+        reporter_user_id: report.reporter_user_id,
+        reason_codes: report.reason_codes,
+        details: report.details,
+        timestamp_seconds: report.timestamp_seconds,
+        severity_score: report.severity_score,
+        status: report.status,
+        auto_quarantined: report.auto_quarantined,
+        auto_rule: report.auto_rule,
+        created_at: report.created_at,
+        updated_at: report.updated_at,
+        closed_at: report.closed_at,
+        resolution_code: report.resolution_code,
+        resolution_note: report.resolution_note,
+    }
 }
 
 pub async fn get_feed(
@@ -208,6 +233,7 @@ pub async fn get_feed(
 
     let mut select = videos::Entity::find()
         .filter(videos::Column::DeletedAt.is_null()) // Filter soft-deleted videos
+        .filter(videos::Column::ModerationState.eq(abuse_report_service::MODERATION_VISIBLE))
         .filter(
             Condition::any()
                 .add(videos::Column::Status.eq("PUBLISHED"))
@@ -383,6 +409,11 @@ pub async fn init_upload(
         like_count: Set(0),
         is_anonymous: Set(false), // Regular upload, not anonymous
         is_nsfw: Set(Some(payload.is_nsfw)),
+        moderation_state: Set(abuse_report_service::MODERATION_VISIBLE.to_string()),
+        moderation_reason_code: Set(None),
+        moderation_updated_at: Set(None),
+        moderation_updated_by: Set(None),
+        moderation_source_report_id: Set(None),
         processing_error_code: Set(None),
         processing_error_message: Set(None),
         failed_at: Set(None),
@@ -465,6 +496,11 @@ pub async fn init_anonymous_upload(
         like_count: Set(0),
         is_anonymous: Set(true), // ANONYMOUS upload
         is_nsfw: Set(Some(payload.is_nsfw)),
+        moderation_state: Set(abuse_report_service::MODERATION_VISIBLE.to_string()),
+        moderation_reason_code: Set(None),
+        moderation_updated_at: Set(None),
+        moderation_updated_by: Set(None),
+        moderation_source_report_id: Set(None),
         processing_error_code: Set(None),
         processing_error_message: Set(None),
         failed_at: Set(None),
@@ -626,6 +662,149 @@ pub async fn confirm_upload(
     Ok(StatusCode::ACCEPTED)
 }
 
+pub async fn report_video(
+    State(state): State<AppState>,
+    AuthUser(user_id): AuthUser,
+    ClientIp(client_ip): ClientIp,
+    headers: HeaderMap,
+    Path(video_id): Path<Uuid>,
+    Json(payload): Json<ReportVideoRequest>,
+) -> ApiResult<impl IntoResponse> {
+    let user_rate_key =
+        crate::services::rate_limiter::RateLimiter::report_create_user_key(&user_id);
+    match state
+        .rate_limiter
+        .check_and_increment_strict(&user_rate_key, state.config.report_create_rpm_per_user, 60)
+        .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(_)) => {
+            return Err(ApiErrorResponse::too_many_requests(
+                "Abuse report rate limit exceeded for user",
+            ));
+        }
+        Err(_) => {
+            return Err(ApiErrorResponse::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Abuse report rate limiter unavailable",
+            ));
+        }
+    }
+
+    let ip_rate_key =
+        crate::services::rate_limiter::RateLimiter::report_create_ip_key(&client_ip.to_string());
+    match state
+        .rate_limiter
+        .check_and_increment_strict(&ip_rate_key, state.config.report_create_rpm_per_ip, 60)
+        .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(_)) => {
+            return Err(ApiErrorResponse::too_many_requests(
+                "Abuse report rate limit exceeded for IP",
+            ));
+        }
+        Err(_) => {
+            return Err(ApiErrorResponse::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Abuse report rate limiter unavailable",
+            ));
+        }
+    }
+
+    let normalized_reason_codes = state
+        .abuse_report_service
+        .normalize_reason_codes(&payload.reason_codes)
+        .map_err(ApiErrorResponse::bad_request)?;
+
+    if let Some(ref details) = payload.details
+        && details.chars().count() > state.config.report_details_max_chars
+    {
+        return Err(ApiErrorResponse::bad_request(format!(
+            "details exceeds max length {}",
+            state.config.report_details_max_chars
+        )));
+    }
+
+    if let Some(timestamp_seconds) = payload.timestamp_seconds
+        && timestamp_seconds < 0
+    {
+        return Err(ApiErrorResponse::bad_request(
+            "timestamp_seconds must be >= 0",
+        ));
+    }
+
+    let user_agent = headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
+
+    let outcome = state
+        .abuse_report_service
+        .submit_or_update_report(SubmitReportInput {
+            video_id,
+            reporter_user_id: user_id,
+            reason_codes: normalized_reason_codes.clone(),
+            details: payload.details.clone(),
+            timestamp_seconds: payload.timestamp_seconds,
+            client_ip: client_ip.to_string(),
+            user_agent: user_agent.clone(),
+        })
+        .await?;
+
+    let _ = state
+        .security_event_service
+        .record(
+            if outcome.created {
+                "abuse.report_submitted"
+            } else {
+                "abuse.report_updated"
+            },
+            Some(user_id),
+            &client_ip.to_string(),
+            None,
+            user_agent.as_deref(),
+            serde_json::json!({
+                "video_id": video_id,
+                "reason_codes": normalized_reason_codes,
+                "auto_quarantined": outcome.auto_quarantined,
+                "auto_rule": outcome.auto_rule.clone(),
+            }),
+        )
+        .await;
+    if outcome.auto_quarantined {
+        let _ = state
+            .security_event_service
+            .record(
+                "abuse.auto_quarantined",
+                Some(user_id),
+                &client_ip.to_string(),
+                None,
+                user_agent.as_deref(),
+                serde_json::json!({
+                    "video_id": video_id,
+                    "report_id": outcome.report.id,
+                    "auto_rule": outcome.auto_rule.clone(),
+                }),
+            )
+            .await;
+    }
+
+    let response = ReportVideoResponse {
+        created: outcome.created,
+        report: abuse_report_model_to_dto(outcome.report),
+    };
+
+    let status = if response.created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(response)))
+}
+
 fn looks_like_supported_video_container(prefix: &[u8]) -> bool {
     // ISO BMFF family: MP4/MOV/M4V/3GP usually has "ftyp" at bytes 4..8.
     if prefix.len() >= 8 && &prefix[4..8] == b"ftyp" {
@@ -717,6 +896,7 @@ async fn get_published_video_or_404(
 ) -> ApiResult<videos::Model> {
     videos::Entity::find_by_id(video_id)
         .filter(videos::Column::Status.eq("PUBLISHED"))
+        .filter(videos::Column::ModerationState.eq(abuse_report_service::MODERATION_VISIBLE))
         .one(db)
         .await?
         .ok_or_else(|| ApiErrorResponse::not_found("Video not found or not published"))
@@ -1078,6 +1258,7 @@ pub async fn download_video(
     let video = videos::Entity::find_by_id(video_id)
         .filter(videos::Column::DeletedAt.is_null())
         .filter(videos::Column::Status.eq("PUBLISHED"))
+        .filter(videos::Column::ModerationState.eq(abuse_report_service::MODERATION_VISIBLE))
         .one(&state.db)
         .await
         .map_err(|e| {
@@ -1194,6 +1375,7 @@ pub async fn refresh_download_url(
     let video = videos::Entity::find_by_id(video_id)
         .filter(videos::Column::DeletedAt.is_null())
         .filter(videos::Column::Status.eq("PUBLISHED"))
+        .filter(videos::Column::ModerationState.eq(abuse_report_service::MODERATION_VISIBLE))
         .one(&state.db)
         .await
         .map_err(|e| {
@@ -1349,6 +1531,7 @@ pub async fn create_bulk_download(
         .filter(videos::Column::Id.is_in(req.video_ids.clone()))
         .filter(videos::Column::DeletedAt.is_null())
         .filter(videos::Column::Status.eq("PUBLISHED"))
+        .filter(videos::Column::ModerationState.eq(abuse_report_service::MODERATION_VISIBLE))
         .all(&state.db)
         .await
         .map_err(|e| {
@@ -1744,6 +1927,7 @@ pub async fn search_videos_keyboard(
             SELECT id, title, status, s3_bucket, s3_key, size_bytes, duration_seconds
             FROM videos
             WHERE deleted_at IS NULL
+              AND moderation_state = 'VISIBLE'
               AND (
                 search_vector @@ plainto_tsquery('english', $1)
                 OR LOWER(COALESCE(title, '')) LIKE $5
@@ -1766,6 +1950,7 @@ pub async fn search_videos_keyboard(
             SELECT id, title, status, s3_bucket, s3_key, size_bytes, duration_seconds
             FROM videos
             WHERE deleted_at IS NULL
+              AND moderation_state = 'VISIBLE'
               AND (
                 search_vector @@ plainto_tsquery('english', $1)
                 OR LOWER(COALESCE(title, '')) LIKE $5
@@ -1789,6 +1974,7 @@ pub async fn search_videos_keyboard(
                    ts_rank(search_vector, plainto_tsquery('english', $1)) as rank
             FROM videos
             WHERE deleted_at IS NULL
+              AND moderation_state = 'VISIBLE'
               AND (
                 search_vector @@ plainto_tsquery('english', $1)
                 OR LOWER(COALESCE(title, '')) LIKE $5
@@ -1930,7 +2116,7 @@ pub async fn search_videos(
     let limit = params.limit.min(100);
     let offset = params.offset;
     let cache_key = format!(
-        "search:cache:{}:v4:{}:{}:{}:{}:{}",
+        "search:cache:{}:v5:{}:{}:{}:{}:{}",
         user_id, // CRITICAL: User-scoped cache
         query.to_lowercase(),
         params.sort,
@@ -1969,6 +2155,7 @@ pub async fn search_videos(
             FROM videos v
             LEFT JOIN users u ON u.id = v.user_id
             WHERE v.deleted_at IS NULL
+            AND v.moderation_state = 'VISIBLE'
             AND (
               v.search_vector @@ plainto_tsquery('english', $1)
               OR LOWER(COALESCE(v.title, '')) LIKE $5
@@ -1994,6 +2181,7 @@ pub async fn search_videos(
             FROM videos v
             LEFT JOIN users u ON u.id = v.user_id
             WHERE v.deleted_at IS NULL
+            AND v.moderation_state = 'VISIBLE'
             AND (
               v.search_vector @@ plainto_tsquery('english', $1)
               OR LOWER(COALESCE(v.title, '')) LIKE $5
@@ -2020,6 +2208,7 @@ pub async fn search_videos(
             FROM videos v
             LEFT JOIN users u ON u.id = v.user_id
             WHERE v.deleted_at IS NULL
+            AND v.moderation_state = 'VISIBLE'
             AND (
               v.search_vector @@ plainto_tsquery('english', $1)
               OR LOWER(COALESCE(v.title, '')) LIKE $5

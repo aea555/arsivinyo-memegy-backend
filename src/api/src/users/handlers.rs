@@ -11,7 +11,7 @@ use futures_util::{SinkExt, StreamExt};
 use redis::AsyncCommands;
 use sea_orm::*;
 use serde::Deserialize;
-use shared::entities::{likes, users, videos};
+use shared::entities::{abuse_reports, likes, users, videos};
 use tokio::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -34,10 +34,12 @@ use crate::{
     users::username::{
         is_username_unique_violation, username_exists_case_insensitive, validate_username,
     },
+    videos::handlers::abuse_report_model_to_dto,
 };
 
 use super::dtos::{
-    CompleteOnboardingRequest, OnboardingStatusResponse, UpdateUsernameRequest, UserVideoDto,
+    CompleteOnboardingRequest, MyReportItemDto, MyReportsQuery, MyReportsResponse,
+    OnboardingStatusResponse, UpdateUsernameRequest, UserVideoDto,
 };
 
 #[derive(Deserialize)]
@@ -399,6 +401,60 @@ pub async fn get_my_videos(
     }
 
     Ok(Json(dtos))
+}
+
+pub async fn get_my_reports(
+    State(state): State<AppState>,
+    AuthUser(user_id): AuthUser,
+    Query(query): Query<MyReportsQuery>,
+) -> ApiResult<Json<MyReportsResponse>> {
+    let limit = query.limit.unwrap_or(20).clamp(1, 100);
+    let cursor = query.cursor.unwrap_or(0);
+
+    let reports = abuse_reports::Entity::find()
+        .filter(abuse_reports::Column::ReporterUserId.eq(user_id))
+        .order_by_desc(abuse_reports::Column::CreatedAt)
+        .paginate(&state.db, limit + 1)
+        .fetch_page(cursor)
+        .await
+        .map_err(ApiErrorResponse::db_error)?;
+
+    let mut reports = reports;
+    let next_cursor = if reports.len() as u64 > limit {
+        reports.truncate(limit as usize);
+        Some(cursor + 1)
+    } else {
+        None
+    };
+
+    let video_ids: Vec<Uuid> = reports.iter().map(|r| r.video_id).collect();
+    let video_map: std::collections::HashMap<Uuid, videos::Model> = if video_ids.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        videos::Entity::find()
+            .filter(videos::Column::Id.is_in(video_ids))
+            .all(&state.db)
+            .await
+            .map_err(ApiErrorResponse::db_error)?
+            .into_iter()
+            .map(|v| (v.id, v))
+            .collect()
+    };
+
+    let items = reports
+        .into_iter()
+        .map(|report| {
+            let video = video_map.get(&report.video_id);
+            MyReportItemDto {
+                report: abuse_report_model_to_dto(report),
+                video_title: video.and_then(|v| v.title.clone()),
+                video_status: video.map(|v| v.status.clone()),
+                video_moderation_state: video.map(|v| v.moderation_state.clone()),
+            }
+        })
+        .collect();
+
+    Ok(Json(MyReportsResponse { items, next_cursor }))
 }
 
 pub async fn update_username(

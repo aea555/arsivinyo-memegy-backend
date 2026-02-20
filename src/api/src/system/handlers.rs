@@ -20,6 +20,10 @@ pub struct TermsResponse {
     pub content_type: Option<String>,
     pub content_sha256: Option<String>,
     pub content: Option<String>,
+    pub effective_at: Option<String>,
+    pub jurisdictions: Vec<String>,
+    pub legal_contact_email: Option<String>,
+    pub abuse_contact_email: Option<String>,
 }
 
 pub async fn get_terms(State(state): State<AppState>) -> ApiResult<Json<TermsResponse>> {
@@ -29,6 +33,10 @@ pub async fn get_terms(State(state): State<AppState>) -> ApiResult<Json<TermsRes
         content_type: state.config.terms_content_type.clone(),
         content_sha256: state.config.terms_content_sha256.clone(),
         content: state.config.terms_content.clone(),
+        effective_at: state.config.terms_effective_at.clone(),
+        jurisdictions: state.config.terms_jurisdictions.clone(),
+        legal_contact_email: state.config.terms_legal_contact_email.clone(),
+        abuse_contact_email: state.config.terms_abuse_contact_email.clone(),
     }))
 }
 

@@ -18,6 +18,7 @@ pub fn videos_router(_config: &Config) -> Router<AppState> {
             post(handlers::init_anonymous_upload),
         )
         .route("/videos/:id/confirm", post(handlers::confirm_upload))
+        .route("/videos/:id/report", post(handlers::report_video))
         // Search
         .route("/videos/search", get(handlers::search_videos))
         .route(

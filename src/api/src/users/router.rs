@@ -23,6 +23,7 @@ pub fn users_router(_config: &Config) -> Router<AppState> {
             "/me/username",
             axum::routing::put(handlers::update_username),
         )
+        .route("/me/reports", get(handlers::get_my_reports))
         .route("/me/videos", get(handlers::get_my_videos))
         .route("/me/videos/ws", get(handlers::my_videos_ws))
 }

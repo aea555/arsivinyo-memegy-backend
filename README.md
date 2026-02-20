@@ -78,6 +78,7 @@ Admin integration and security runbook:
 - `POST /videos/init`: Request upload URL. Body: `{ "filename": "meme.mp4", "size_bytes": 123456, "is_nsfw": false }`.
 - `POST /videos/init/anonymous`: Same contract as `/videos/init`, including required `is_nsfw`.
 - `POST /videos/{id}/confirm`: Confirm upload completion.
+- `POST /videos/{id}/report`: Submit or idempotently update an abuse report for a video.
 - `GET /feed`: Get video feed. Required query includes `include_nsfw=true|false`. Example: `?sort=random&page=0&include_nsfw=false`.
 - `GET /videos/search`: Search videos. Required query includes `include_nsfw=true|false`.
 - `GET /videos/search/keyboard`: Keyboard-optimized compact search DTO.
@@ -90,9 +91,10 @@ Admin integration and security runbook:
 ### Users
 - `GET /users/me/onboarding/status`: Returns onboarding state for age confirmation and terms acceptance.
 - `POST /users/me/onboarding/complete`: Idempotently completes onboarding. Body: `{ "age_confirmed": true, "terms_version": "v1" }`.
+- `GET /users/me/reports`: Returns the authenticated user's abuse reports with cursor pagination.
 
 ### System
-- `GET /system/terms`: Public endpoint returning active terms version and optional embedded terms content.
+- `GET /system/terms`: Public endpoint returning active terms metadata and optional embedded terms content.
 - `GET /system/read-only`: Protected status endpoint for read-only mode.
 - `GET /system/maintenance`: Protected status endpoint for maintenance mode.
 
@@ -119,12 +121,24 @@ Key environment flags:
 - `TERMS_CONTENT` (optional inline document text)
 - `TERMS_CONTENT_FILE_PATH` (optional file path for embedded document text)
 - `TERMS_CONTENT_TYPE` (optional, defaults to `text/markdown` when embedded content is set)
+- `TERMS_REQUIRE_VERSION_MATCH` (defaults to `true`; validates frontmatter `version` against `TERMS_CURRENT_VERSION`)
+- `TERMS_LEGAL_CONTACT_EMAIL` / `TERMS_ABUSE_CONTACT_EMAIL` (optional metadata)
+- `TERMS_JURISDICTIONS` (CSV list, e.g. `US,TR,GLOBAL`)
 - `READ_ONLY_MODE_ENABLED` (`true|false`)
 - `MAINTENANCE_MODE_ENABLED` (`true|false`)
 - `READ_ONLY_STATUS_RPM_PER_USER`
 - `MAINTENANCE_STATUS_RPM_PER_USER`
 - `ONBOARDING_STATUS_RPM_PER_USER`
 - `ONBOARDING_COMPLETE_RPM_PER_USER`
+- `REPORT_CREATE_RPM_PER_USER`
+- `REPORT_CREATE_RPM_PER_IP`
+- `REPORT_DETAILS_MAX_CHARS`
+- `REPORT_REASON_MAX_COUNT`
+- `AUTO_QUARANTINE_ENABLED`
+- `AUTO_QUARANTINE_WINDOW_SECS`
+- `AUTO_QUARANTINE_SEVERE_DISTINCT_REPORTERS`
+- `ABUSE_REPORT_RETENTION_DAYS`
+- `ABUSE_REPORT_PURGE_INTERVAL_SECS`
 
 Terms source rules:
 - Configure either `TERMS_CONTENT` or `TERMS_CONTENT_FILE_PATH` (not both) for backend-hosted terms text.

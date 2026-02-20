@@ -20,6 +20,40 @@ pub struct InitUploadResponse {
     pub upload_url: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReportVideoRequest {
+    pub reason_codes: Vec<String>,
+    #[serde(default)]
+    pub details: Option<String>,
+    #[serde(default)]
+    pub timestamp_seconds: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VideoReportDto {
+    pub id: Uuid,
+    pub video_id: Uuid,
+    pub reporter_user_id: Uuid,
+    pub reason_codes: Vec<String>,
+    pub details: Option<String>,
+    pub timestamp_seconds: Option<i32>,
+    pub severity_score: i16,
+    pub status: String,
+    pub auto_quarantined: bool,
+    pub auto_rule: Option<String>,
+    pub created_at: chrono::DateTime<chrono::FixedOffset>,
+    pub updated_at: chrono::DateTime<chrono::FixedOffset>,
+    pub closed_at: Option<chrono::DateTime<chrono::FixedOffset>>,
+    pub resolution_code: Option<String>,
+    pub resolution_note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReportVideoResponse {
+    pub created: bool,
+    pub report: VideoReportDto,
+}
+
 #[derive(Deserialize)]
 pub struct UpdateVideoRequest {
     pub title: Option<String>,       // Max 200 chars
