@@ -1,7 +1,53 @@
 use anyhow::{Result, anyhow};
 use dotenvy::dotenv;
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::env;
+
+#[derive(Debug, Default, Deserialize)]
+struct TermsFrontmatter {
+    version: Option<String>,
+    effective_at: Option<String>,
+    jurisdictions: Option<Vec<String>>,
+    #[allow(dead_code)]
+    last_updated_at: Option<String>,
+}
+
+fn parse_terms_frontmatter(raw: &str) -> Result<(Option<TermsFrontmatter>, String)> {
+    const OPEN: &str = "---\n";
+    const CLOSE: &str = "\n---\n";
+
+    if !raw.starts_with(OPEN) {
+        return Ok((None, raw.to_string()));
+    }
+
+    let Some(close_pos) = raw[OPEN.len()..].find(CLOSE) else {
+        return Err(anyhow!(
+            "TERMS_CONTENT has opening frontmatter marker but missing closing marker"
+        ));
+    };
+
+    let yaml_start = OPEN.len();
+    let yaml_end = OPEN.len() + close_pos;
+    let body_start = yaml_end + CLOSE.len();
+
+    let frontmatter_yaml = &raw[yaml_start..yaml_end];
+    let frontmatter: TermsFrontmatter = serde_yaml::from_str(frontmatter_yaml)
+        .map_err(|e| anyhow!("Failed to parse terms frontmatter YAML: {}", e))?;
+    let body = raw[body_start..].trim_start_matches('\n').to_string();
+
+    Ok((Some(frontmatter), body))
+}
+
+fn parse_csv_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -25,6 +71,18 @@ pub struct Config {
     pub access_token_ttl_secs: usize,
     pub refresh_token_ttl_days: u16,
     pub auth_require_username_on_google_signup: bool,
+    pub terms_current_version: String,
+    pub terms_url: Option<String>,
+    pub terms_content: Option<String>,
+    pub terms_content_type: Option<String>,
+    pub terms_content_sha256: Option<String>,
+    pub terms_effective_at: Option<String>,
+    pub terms_jurisdictions: Vec<String>,
+    pub terms_require_version_match: bool,
+    pub terms_legal_contact_email: Option<String>,
+    pub terms_abuse_contact_email: Option<String>,
+    pub read_only_mode_enabled: bool,
+    pub maintenance_mode_enabled: bool,
     pub username_reserved_values: String,
     pub admin_api_enabled: bool,
     pub admin_jwt_issuer: Option<String>,
@@ -68,6 +126,26 @@ pub struct Config {
     pub username_signup_rpm_per_ip: u64,
     pub username_signup_attempts_per_ticket: u64,
     pub username_update_rpm_per_user: u64,
+    pub read_only_status_rpm_per_user: u64,
+    pub maintenance_status_rpm_per_user: u64,
+    pub onboarding_status_rpm_per_user: u64,
+    pub onboarding_complete_rpm_per_user: u64,
+    pub report_create_rpm_per_user: u64,
+    pub report_create_rpm_per_ip: u64,
+    pub report_details_max_chars: usize,
+    pub report_reason_max_count: usize,
+    pub auto_quarantine_enabled: bool,
+    pub auto_quarantine_window_secs: u64,
+    pub auto_quarantine_severe_distinct_reporters: u64,
+    pub security_events_retention_days: i64,
+    pub security_events_purge_interval_secs: u64,
+    pub abuse_report_retention_days: i64,
+    pub abuse_report_purge_interval_secs: u64,
+    pub ban_user_cache_negative_ttl_secs: usize,
+    pub ban_user_cache_permanent_ttl_secs: usize,
+    pub ban_ip_cache_negative_ttl_secs: usize,
+    pub ban_ip_cache_permanent_ttl_secs: usize,
+    pub ban_ip_verdict_ttl_secs: usize,
 
     // OTC Rate Limiting
     pub otc_rate_limit_max_attempts: u32,
@@ -109,6 +187,12 @@ pub struct Config {
 }
 
 impl Config {
+    pub fn sha256_hex(content: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(content.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
     pub fn from_env() -> Result<Self> {
         dotenv().ok();
 
@@ -116,6 +200,110 @@ impl Config {
             .unwrap_or_else(|_| "false".to_string())
             .parse()
             .unwrap_or(false);
+        let terms_current_version = env::var("TERMS_CURRENT_VERSION")
+            .unwrap_or_else(|_| "v1".to_string())
+            .trim()
+            .to_string();
+        if terms_current_version.is_empty() {
+            return Err(anyhow!("TERMS_CURRENT_VERSION must be non-empty"));
+        }
+        let terms_url = env::var("TERMS_URL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let terms_require_version_match = env::var("TERMS_REQUIRE_VERSION_MATCH")
+            .unwrap_or_else(|_| "true".to_string())
+            .parse()
+            .unwrap_or(true);
+        let terms_legal_contact_email = env::var("TERMS_LEGAL_CONTACT_EMAIL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let terms_abuse_contact_email = env::var("TERMS_ABUSE_CONTACT_EMAIL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let terms_jurisdictions_env = {
+            let parsed = parse_csv_list(
+                &env::var("TERMS_JURISDICTIONS").unwrap_or_else(|_| "US,TR,GLOBAL".to_string()),
+            );
+            if parsed.is_empty() {
+                vec!["US".to_string(), "TR".to_string(), "GLOBAL".to_string()]
+            } else {
+                parsed
+            }
+        };
+        let terms_content_inline = env::var("TERMS_CONTENT")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        let terms_content_file_path = env::var("TERMS_CONTENT_FILE_PATH")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        if terms_content_inline.is_some() && terms_content_file_path.is_some() {
+            return Err(anyhow!(
+                "Set either TERMS_CONTENT or TERMS_CONTENT_FILE_PATH, not both"
+            ));
+        }
+        let terms_content_raw = match (terms_content_inline, terms_content_file_path) {
+            (Some(content), None) => Some(content),
+            (None, Some(path)) => Some(std::fs::read_to_string(&path).map_err(|e| {
+                anyhow!("Failed to read TERMS_CONTENT_FILE_PATH '{}': {}", path, e)
+            })?),
+            (None, None) => None,
+            (Some(_), Some(_)) => unreachable!(),
+        };
+        if terms_url.is_none() && terms_content_raw.is_none() {
+            return Err(anyhow!(
+                "Either TERMS_URL or embedded terms content (TERMS_CONTENT/TERMS_CONTENT_FILE_PATH) must be configured"
+            ));
+        }
+        let (terms_frontmatter, terms_content) = if let Some(content) = terms_content_raw {
+            let (frontmatter, body) = parse_terms_frontmatter(&content)?;
+            (frontmatter, Some(body))
+        } else {
+            (None, None)
+        };
+        if terms_require_version_match
+            && let Some(ref frontmatter) = terms_frontmatter
+            && let Some(ref frontmatter_version) = frontmatter.version
+            && frontmatter_version.trim() != terms_current_version
+        {
+            return Err(anyhow!(
+                "Terms frontmatter version '{}' does not match TERMS_CURRENT_VERSION '{}'",
+                frontmatter_version,
+                terms_current_version
+            ));
+        }
+        let terms_effective_at = terms_frontmatter
+            .as_ref()
+            .and_then(|fm| fm.effective_at.as_ref().map(|v| v.trim().to_string()))
+            .filter(|v| !v.is_empty());
+        let terms_jurisdictions = terms_frontmatter
+            .as_ref()
+            .and_then(|fm| fm.jurisdictions.clone())
+            .filter(|items| !items.is_empty())
+            .unwrap_or(terms_jurisdictions_env);
+        let terms_content_type = if terms_content.is_some() {
+            Some(
+                env::var("TERMS_CONTENT_TYPE")
+                    .unwrap_or_else(|_| "text/markdown".to_string())
+                    .trim()
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+        if let Some(ref content_type) = terms_content_type
+            && content_type.is_empty()
+        {
+            return Err(anyhow!(
+                "TERMS_CONTENT_TYPE must be non-empty when embedded terms content is configured"
+            ));
+        }
+        let terms_content_sha256 = terms_content
+            .as_ref()
+            .map(|content| Self::sha256_hex(content));
         let admin_jwt_issuer = env::var("ADMIN_JWT_ISSUER")
             .ok()
             .map(|v| v.trim().to_string())
@@ -205,6 +393,24 @@ impl Config {
             .unwrap_or_else(|_| "true".to_string())
             .parse()
             .unwrap_or(true),
+            terms_current_version,
+            terms_url,
+            terms_content,
+            terms_content_type,
+            terms_content_sha256,
+            terms_effective_at,
+            terms_jurisdictions,
+            terms_require_version_match,
+            terms_legal_contact_email,
+            terms_abuse_contact_email,
+            read_only_mode_enabled: env::var("READ_ONLY_MODE_ENABLED")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse()
+                .unwrap_or(false),
+            maintenance_mode_enabled: env::var("MAINTENANCE_MODE_ENABLED")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse()
+                .unwrap_or(false),
             username_reserved_values: env::var("USERNAME_RESERVED_VALUES").unwrap_or_default(),
             admin_api_enabled,
             admin_jwt_issuer,
@@ -283,6 +489,69 @@ impl Config {
                 .parse()?,
             username_update_rpm_per_user: env::var("USERNAME_UPDATE_RPM_PER_USER")
                 .unwrap_or_else(|_| "5".to_string())
+                .parse()?,
+            read_only_status_rpm_per_user: env::var("READ_ONLY_STATUS_RPM_PER_USER")
+                .unwrap_or_else(|_| "20".to_string())
+                .parse()?,
+            maintenance_status_rpm_per_user: env::var("MAINTENANCE_STATUS_RPM_PER_USER")
+                .unwrap_or_else(|_| "20".to_string())
+                .parse()?,
+            onboarding_status_rpm_per_user: env::var("ONBOARDING_STATUS_RPM_PER_USER")
+                .unwrap_or_else(|_| "30".to_string())
+                .parse()?,
+            onboarding_complete_rpm_per_user: env::var("ONBOARDING_COMPLETE_RPM_PER_USER")
+                .unwrap_or_else(|_| "10".to_string())
+                .parse()?,
+            report_create_rpm_per_user: env::var("REPORT_CREATE_RPM_PER_USER")
+                .unwrap_or_else(|_| "10".to_string())
+                .parse()?,
+            report_create_rpm_per_ip: env::var("REPORT_CREATE_RPM_PER_IP")
+                .unwrap_or_else(|_| "20".to_string())
+                .parse()?,
+            report_details_max_chars: env::var("REPORT_DETAILS_MAX_CHARS")
+                .unwrap_or_else(|_| "2000".to_string())
+                .parse()?,
+            report_reason_max_count: env::var("REPORT_REASON_MAX_COUNT")
+                .unwrap_or_else(|_| "5".to_string())
+                .parse()?,
+            auto_quarantine_enabled: env::var("AUTO_QUARANTINE_ENABLED")
+                .unwrap_or_else(|_| "true".to_string())
+                .parse()
+                .unwrap_or(true),
+            auto_quarantine_window_secs: env::var("AUTO_QUARANTINE_WINDOW_SECS")
+                .unwrap_or_else(|_| "1800".to_string())
+                .parse()?,
+            auto_quarantine_severe_distinct_reporters: env::var(
+                "AUTO_QUARANTINE_SEVERE_DISTINCT_REPORTERS",
+            )
+            .unwrap_or_else(|_| "2".to_string())
+            .parse()?,
+            security_events_retention_days: env::var("SECURITY_EVENTS_RETENTION_DAYS")
+                .unwrap_or_else(|_| "180".to_string())
+                .parse()?,
+            security_events_purge_interval_secs: env::var("SECURITY_EVENTS_PURGE_INTERVAL_SECS")
+                .unwrap_or_else(|_| "86400".to_string())
+                .parse()?,
+            abuse_report_retention_days: env::var("ABUSE_REPORT_RETENTION_DAYS")
+                .unwrap_or_else(|_| "365".to_string())
+                .parse()?,
+            abuse_report_purge_interval_secs: env::var("ABUSE_REPORT_PURGE_INTERVAL_SECS")
+                .unwrap_or_else(|_| "86400".to_string())
+                .parse()?,
+            ban_user_cache_negative_ttl_secs: env::var("BAN_USER_CACHE_NEGATIVE_TTL_SECS")
+                .unwrap_or_else(|_| "60".to_string())
+                .parse()?,
+            ban_user_cache_permanent_ttl_secs: env::var("BAN_USER_CACHE_PERMANENT_TTL_SECS")
+                .unwrap_or_else(|_| "21600".to_string())
+                .parse()?,
+            ban_ip_cache_negative_ttl_secs: env::var("BAN_IP_CACHE_NEGATIVE_TTL_SECS")
+                .unwrap_or_else(|_| "60".to_string())
+                .parse()?,
+            ban_ip_cache_permanent_ttl_secs: env::var("BAN_IP_CACHE_PERMANENT_TTL_SECS")
+                .unwrap_or_else(|_| "21600".to_string())
+                .parse()?,
+            ban_ip_verdict_ttl_secs: env::var("BAN_IP_VERDICT_TTL_SECS")
+                .unwrap_or_else(|_| "60".to_string())
                 .parse()?,
 
             // OTC Rate Limiting
@@ -380,5 +649,40 @@ impl Config {
                 .unwrap_or_else(|_| "20".to_string())
                 .parse()?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_terms_frontmatter;
+
+    #[test]
+    fn parse_terms_frontmatter_extracts_metadata_and_body() {
+        let raw = r#"---
+version: v7
+effective_at: "2026-02-20"
+jurisdictions:
+  - US
+  - TR
+---
+# Terms
+
+Body
+"#;
+
+        let (frontmatter, body) = parse_terms_frontmatter(raw).expect("frontmatter should parse");
+        let fm = frontmatter.expect("frontmatter should exist");
+        assert_eq!(fm.version.as_deref(), Some("v7"));
+        assert_eq!(fm.effective_at.as_deref(), Some("2026-02-20"));
+        assert_eq!(fm.jurisdictions.unwrap_or_default(), vec!["US", "TR"]);
+        assert_eq!(body.trim(), "# Terms\n\nBody");
+    }
+
+    #[test]
+    fn parse_terms_frontmatter_returns_raw_when_no_frontmatter() {
+        let raw = "# Terms\n\nBody";
+        let (frontmatter, body) = parse_terms_frontmatter(raw).expect("parse should succeed");
+        assert!(frontmatter.is_none());
+        assert_eq!(body, raw);
     }
 }

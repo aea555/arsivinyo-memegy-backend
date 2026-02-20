@@ -2,11 +2,15 @@
 
 pub mod prelude;
 
+pub mod abuse_reports;
 pub mod admin_audit_logs;
 pub mod download_jobs;
 pub mod extension_sessions;
+pub mod ip_bans;
 pub mod likes;
 pub mod refresh_tokens;
+pub mod security_events;
 pub mod send_tickets;
+pub mod user_bans;
 pub mod users;
 pub mod videos;

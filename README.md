@@ -68,14 +68,19 @@ Admin integration and security runbook:
 ### Auth
 - `GET /auth/google/login`: Start Google OAuth flow.
 - `GET /auth/google/callback`: Callback from Google. Returns Access/Refresh tokens.
+- `POST /auth/exchange-otc`: Exchanges OTC. If signup is required, returns required onboarding fields (`requires_age_confirmation`, `required_terms_version`, `terms_url`).
+- `POST /auth/signup/complete`: Completes signup. Body requires `signup_ticket`, `username`, `age_confirmed: true`, `terms_version` (must match current version).
 - `POST /auth/refresh`: Refresh access token.
 - `POST /auth/logout`: Invalidate session.
 - `POST /auth/extension/session`: Mint short-lived keyboard extension token.
 
 ### Videos
-- `POST /videos/init`: Request upload URL. Body: `{ "filename": "meme.mp4", "size_bytes": 123456 }`.
+- `POST /videos/init`: Request upload URL. Body: `{ "filename": "meme.mp4", "size_bytes": 123456, "is_nsfw": false }`.
+- `POST /videos/init/anonymous`: Same contract as `/videos/init`, including required `is_nsfw`.
 - `POST /videos/{id}/confirm`: Confirm upload completion.
-- `GET /feed`: Get video feed. Params: `?sort=random|latest|popular&page=0`.
+- `POST /videos/{id}/report`: Submit or idempotently update an abuse report for a video.
+- `GET /feed`: Get video feed. Required query includes `include_nsfw=true|false`. Example: `?sort=random&page=0&include_nsfw=false`.
+- `GET /videos/search`: Search videos. Required query includes `include_nsfw=true|false`.
 - `GET /videos/search/keyboard`: Keyboard-optimized compact search DTO.
 - `POST /videos/{id}/send-ticket`: Create short-lived single-use send ticket.
 - `GET /videos/send-ticket/{ticket_id}/media`: Redeem send ticket to media redirect.
@@ -83,10 +88,20 @@ Admin integration and security runbook:
 - `DELETE /videos/{id}/like`: Idempotently unlike a video. Returns current `{ is_liked, like_count }`.
 - `GET /users/me/videos/ws`: WebSocket realtime stream for upload status changes.
 
+### Users
+- `GET /users/me/onboarding/status`: Returns onboarding state for age confirmation and terms acceptance.
+- `POST /users/me/onboarding/complete`: Idempotently completes onboarding. Body: `{ "age_confirmed": true, "terms_version": "v1" }`.
+- `GET /users/me/reports`: Returns the authenticated user's abuse reports with cursor pagination.
+
+### System
+- `GET /system/terms`: Public endpoint returning active terms metadata and optional embedded terms content.
+- `GET /system/read-only`: Protected status endpoint for read-only mode.
+- `GET /system/maintenance`: Protected status endpoint for maintenance mode.
+
 ### Realtime Video Status (WebSocket)
 - Connect with `Authorization: Bearer <access_token>` to `GET /users/me/videos/ws`.
 - Server sends one snapshot first:
- Yes, now recreate the plan  - `type = "video.status.snapshot"`
+  - `type = "video.status.snapshot"`
   - Contains `videos: UserVideoDto[]`
 - Then server sends live status events:
   - `video.status.processing`
@@ -97,6 +112,37 @@ Admin integration and security runbook:
 - Delivery model:
   - At-most-once live delivery (Redis Pub/Sub)
   - Reconnect strategy: reconnect and rely on snapshot to recover missed offline events
+
+## Platform Mode & Terms Config
+
+Key environment flags:
+- `TERMS_CURRENT_VERSION` (required, non-empty)
+- `TERMS_URL` (optional)
+- `TERMS_CONTENT` (optional inline document text)
+- `TERMS_CONTENT_FILE_PATH` (optional file path for embedded document text)
+- `TERMS_CONTENT_TYPE` (optional, defaults to `text/markdown` when embedded content is set)
+- `TERMS_REQUIRE_VERSION_MATCH` (defaults to `true`; validates frontmatter `version` against `TERMS_CURRENT_VERSION`)
+- `TERMS_LEGAL_CONTACT_EMAIL` / `TERMS_ABUSE_CONTACT_EMAIL` (optional metadata)
+- `TERMS_JURISDICTIONS` (CSV list, e.g. `US,TR,GLOBAL`)
+- `READ_ONLY_MODE_ENABLED` (`true|false`)
+- `MAINTENANCE_MODE_ENABLED` (`true|false`)
+- `READ_ONLY_STATUS_RPM_PER_USER`
+- `MAINTENANCE_STATUS_RPM_PER_USER`
+- `ONBOARDING_STATUS_RPM_PER_USER`
+- `ONBOARDING_COMPLETE_RPM_PER_USER`
+- `REPORT_CREATE_RPM_PER_USER`
+- `REPORT_CREATE_RPM_PER_IP`
+- `REPORT_DETAILS_MAX_CHARS`
+- `REPORT_REASON_MAX_COUNT`
+- `AUTO_QUARANTINE_ENABLED`
+- `AUTO_QUARANTINE_WINDOW_SECS`
+- `AUTO_QUARANTINE_SEVERE_DISTINCT_REPORTERS`
+- `ABUSE_REPORT_RETENTION_DAYS`
+- `ABUSE_REPORT_PURGE_INTERVAL_SECS`
+
+Terms source rules:
+- Configure either `TERMS_CONTENT` or `TERMS_CONTENT_FILE_PATH` (not both) for backend-hosted terms text.
+- At least one of `TERMS_URL` or embedded terms content must be configured.
 
 ## Testing
 
@@ -129,8 +175,11 @@ This will:
   - Postgres: `/var/lib/memegy/postgres`
   - Valkey: `/var/lib/memegy/valkey`
   - MinIO: `/var/lib/memegy/minio`
-- Deployment workflow uses `up -d --build --remove-orphans` and does not run `down`, so persistent data is less exposed to accidental reset.
+- Deployment workflow builds/pushes images in CI, then VPS runs `pull` + `up -d --no-build --remove-orphans`, so production no longer compiles on-host.
+- Production requires `BACKEND_IMAGE` in `.env.production` (managed automatically by the deploy workflow).
 - Nightly production DB backups are handled by `.github/workflows/backup-production-db.yml` (plus manual `workflow_dispatch` support).
+- MinIO snapshot backups to Google Drive are handled by `.github/workflows/backup-production-minio.yml` on a self-hosted `backup-laptop` runner.
+- Operational setup/restore instructions live in `docs/ops/minio-backup-runbook.md`.
 
 ## License
 MIT

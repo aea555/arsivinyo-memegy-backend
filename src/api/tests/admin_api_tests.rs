@@ -213,7 +213,7 @@ async fn admin_as_user_routes_cover_regular_surface() {
 
     let feed_response = client
         .get(format!("{}/admin/users/{}/feed", app.address, user.id))
-        .query(&[("page", "0"), ("sort", "latest")])
+        .query(&[("page", "0"), ("sort", "latest"), ("include_nsfw", "true")])
         .bearer_auth(build_admin_token(TEST_ADMIN_AUDIENCE, "superadmin"))
         .send()
         .await

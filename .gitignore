@@ -1,9 +1,19 @@
 target/
 docs/
+!docs/
+docs/*
+!docs/legal/
+docs/legal/*
+!docs/legal/terms/
+docs/legal/terms/*
+!docs/legal/terms/memegy_terms_v1.md
+!docs/ops/
+!docs/ops/minio-backup-runbook.md
 **/*.rs.bk
 #Cargo.lock
 .env
 .env.*
+!scripts/backup/.env.minio-backup.example
 .idea/
 .vscode/
 .DS_Store
@@ -17,3 +27,5 @@ docker/minio_data/
 # Except README.md 
 !README.md
 !ADMIN_PANEL_SUPERADMIN_GUIDE.md
+!docs/legal/terms/memegy_terms_v1.md
+!docs/ops/minio-backup-runbook.md

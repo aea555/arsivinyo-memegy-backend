@@ -65,6 +65,7 @@ fn default_reserved_usernames() -> HashSet<&'static str> {
         "editor",
         "superadmin",
         "sysadmin",
+        "sys",
         "administrator",
         "operator",
         "dev",
@@ -91,6 +92,29 @@ fn collect_reserved_usernames(config: &Config) -> HashSet<String> {
     names
 }
 
+fn normalize_for_reserved_match(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| c.is_ascii_lowercase())
+        .collect::<String>()
+}
+
+fn is_reserved_username_variant(normalized_username: &str, reserved: &HashSet<String>) -> bool {
+    if reserved.contains(normalized_username) {
+        return true;
+    }
+
+    let folded_username = normalize_for_reserved_match(normalized_username);
+    if folded_username.is_empty() {
+        return false;
+    }
+
+    reserved.iter().any(|value| {
+        let folded_reserved = normalize_for_reserved_match(value);
+        !folded_reserved.is_empty() && folded_username.contains(&folded_reserved)
+    })
+}
+
 pub fn validate_username(
     input: &str,
     config: &Config,
@@ -112,7 +136,7 @@ pub fn validate_username(
 
     let normalized = input.to_ascii_lowercase();
     let reserved = collect_reserved_usernames(config);
-    if reserved.contains(&normalized) {
+    if is_reserved_username_variant(&normalized, &reserved) {
         return Err(UsernameValidationError::Reserved);
     }
 
@@ -200,6 +224,18 @@ mod tests {
             access_token_ttl_secs: 900,
             refresh_token_ttl_days: 14,
             auth_require_username_on_google_signup: true,
+            terms_current_version: "v1".to_string(),
+            terms_url: Some("https://example.com/terms".to_string()),
+            terms_content: None,
+            terms_content_type: None,
+            terms_content_sha256: None,
+            terms_effective_at: None,
+            terms_jurisdictions: vec!["US".to_string(), "TR".to_string(), "GLOBAL".to_string()],
+            terms_require_version_match: true,
+            terms_legal_contact_email: Some("legal@example.com".to_string()),
+            terms_abuse_contact_email: Some("abuse@example.com".to_string()),
+            read_only_mode_enabled: false,
+            maintenance_mode_enabled: false,
             username_reserved_values: "owner,moderator".to_string(),
             admin_api_enabled: false,
             admin_jwt_issuer: None,
@@ -233,6 +269,26 @@ mod tests {
             username_signup_rpm_per_ip: 20,
             username_signup_attempts_per_ticket: 10,
             username_update_rpm_per_user: 5,
+            read_only_status_rpm_per_user: 20,
+            maintenance_status_rpm_per_user: 20,
+            onboarding_status_rpm_per_user: 30,
+            onboarding_complete_rpm_per_user: 10,
+            report_create_rpm_per_user: 10,
+            report_create_rpm_per_ip: 20,
+            report_details_max_chars: 2000,
+            report_reason_max_count: 5,
+            auto_quarantine_enabled: true,
+            auto_quarantine_window_secs: 1800,
+            auto_quarantine_severe_distinct_reporters: 2,
+            security_events_retention_days: 180,
+            security_events_purge_interval_secs: 86400,
+            abuse_report_retention_days: 365,
+            abuse_report_purge_interval_secs: 86400,
+            ban_user_cache_negative_ttl_secs: 60,
+            ban_user_cache_permanent_ttl_secs: 21600,
+            ban_ip_cache_negative_ttl_secs: 60,
+            ban_ip_cache_permanent_ttl_secs: 21600,
+            ban_ip_verdict_ttl_secs: 60,
             otc_rate_limit_max_attempts: 5,
             otc_rate_limit_window_seconds: 60,
             search_max_tokens: 50,
@@ -291,6 +347,18 @@ mod tests {
         ));
         assert!(matches!(
             validate_username("moderator", &cfg),
+            Err(UsernameValidationError::Reserved)
+        ));
+        assert!(matches!(
+            validate_username("admin1", &cfg),
+            Err(UsernameValidationError::Reserved)
+        ));
+        assert!(matches!(
+            validate_username("1admin", &cfg),
+            Err(UsernameValidationError::Reserved)
+        ));
+        assert!(matches!(
+            validate_username("a_d_m_i_n", &cfg),
             Err(UsernameValidationError::Reserved)
         ));
     }

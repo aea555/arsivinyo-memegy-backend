@@ -38,6 +38,8 @@ tags:
     description: Video discovery and social features
   - name: Users
     description: User profile and account management
+  - name: System
+    description: Platform mode and system status
 
 components:
   securitySchemes:
@@ -158,12 +160,25 @@ components:
         suggested_username:
           type: string
           example: john_doe
+        requires_age_confirmation:
+          type: boolean
+          example: true
+        required_terms_version:
+          type: string
+          example: v1
+        terms_url:
+          type: string
+          nullable: true
+          example: https://example.com/terms
         rules:
           $ref: "#/components/schemas/UsernameRules"
       required:
         - error
         - signup_ticket
         - suggested_username
+        - requires_age_confirmation
+        - required_terms_version
+        - terms_url
         - rules
 
     SignupCompleteRequest:
@@ -178,9 +193,19 @@ components:
           maxLength: 20
           pattern: "^[a-z0-9_]{3,20}$"
           example: john_doe
+        age_confirmed:
+          type: boolean
+          description: Must be true
+          example: true
+        terms_version:
+          type: string
+          description: Must match the current server terms version
+          example: v1
       required:
         - signup_ticket
         - username
+        - age_confirmed
+        - terms_version
 
     UpdateUsernameRequest:
       type: object
@@ -246,9 +271,14 @@ components:
           description: File size in bytes
           example: 5242880
           minimum: 1
+        is_nsfw:
+          type: boolean
+          description: Whether the uploaded content is NSFW
+          example: false
       required:
         - filename
         - size_bytes
+        - is_nsfw
 
     InitUploadResponse:
       type: object
@@ -303,6 +333,11 @@ components:
           nullable: true
           description: Toggle anonymity (hides uploader info in feed)
           example: false
+        is_nsfw:
+          type: boolean
+          nullable: true
+          description: Update NSFW flag
+          example: false
 
     VideoFeedItem:
       type: object
@@ -333,11 +368,21 @@ components:
             - $ref: "#/components/schemas/UploaderInfo"
           nullable: true
           description: Uploader information (null if video is anonymous)
+        is_nsfw:
+          type: boolean
+          description: Effective NSFW flag (`null` legacy values are treated as `true`)
+          example: false
+        is_liked:
+          type: boolean
+          description: Whether the authenticated user liked this video
+          example: false
       required:
         - id
         - url
         - like_count
         - created_at
+        - is_nsfw
+        - is_liked
 
     KeyboardSearchItem:
       type: object
@@ -418,6 +463,9 @@ components:
           format: date-time
         is_anonymous:
           type: boolean
+        is_nsfw:
+          type: boolean
+          nullable: true
         is_liked:
           type: boolean
           description: Whether the authenticated user has liked this video
@@ -437,15 +485,207 @@ components:
           type: string
           nullable: true
           description: User-safe processing failure reason (present when status is `FAILED`)
+        thumbnail_url:
+          type: string
+          format: uri
+          nullable: true
       required:
         - id
         - status
         - created_at
         - updated_at
         - is_anonymous
+        - is_nsfw
         - is_liked
         - like_count
         - url
+
+    OnboardingStatusResponse:
+      type: object
+      properties:
+        completed:
+          type: boolean
+        age_confirmed:
+          type: boolean
+        terms_accepted:
+          type: boolean
+        required_terms_version:
+          type: string
+        accepted_terms_version:
+          type: string
+          nullable: true
+        terms_url:
+          type: string
+          nullable: true
+      required:
+        - completed
+        - age_confirmed
+        - terms_accepted
+        - required_terms_version
+        - accepted_terms_version
+        - terms_url
+
+    CompleteOnboardingRequest:
+      type: object
+      properties:
+        age_confirmed:
+          type: boolean
+          description: Must be true
+        terms_version:
+          type: string
+      required:
+        - age_confirmed
+        - terms_version
+
+    ReportVideoRequest:
+      type: object
+      properties:
+        reason_codes:
+          type: array
+          items:
+            type: string
+        details:
+          type: string
+          nullable: true
+        timestamp_seconds:
+          type: integer
+          nullable: true
+      required:
+        - reason_codes
+
+    VideoReportDto:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        video_id:
+          type: string
+          format: uuid
+        reporter_user_id:
+          type: string
+          format: uuid
+        reason_codes:
+          type: array
+          items:
+            type: string
+        details:
+          type: string
+          nullable: true
+        timestamp_seconds:
+          type: integer
+          nullable: true
+        severity_score:
+          type: integer
+        status:
+          type: string
+        auto_quarantined:
+          type: boolean
+        auto_rule:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        closed_at:
+          type: string
+          format: date-time
+          nullable: true
+        resolution_code:
+          type: string
+          nullable: true
+        resolution_note:
+          type: string
+          nullable: true
+      required:
+        - id
+        - video_id
+        - reporter_user_id
+        - reason_codes
+        - severity_score
+        - status
+        - auto_quarantined
+        - created_at
+        - updated_at
+
+    ReportVideoResponse:
+      type: object
+      properties:
+        created:
+          type: boolean
+        report:
+          $ref: "#/components/schemas/VideoReportDto"
+      required:
+        - created
+        - report
+
+    MyReportsResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+        next_cursor:
+          type: integer
+          nullable: true
+      required:
+        - items
+        - next_cursor
+
+    ModeStatusResponse:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+      required:
+        - enabled
+
+    TermsResponse:
+      type: object
+      properties:
+        version:
+          type: string
+        url:
+          type: string
+          nullable: true
+        content_type:
+          type: string
+          nullable: true
+        content_sha256:
+          type: string
+          nullable: true
+        content:
+          type: string
+          nullable: true
+        effective_at:
+          type: string
+          nullable: true
+          description: RFC3339/ISO-style effective date metadata from terms frontmatter
+        jurisdictions:
+          type: array
+          items:
+            type: string
+          description: Active legal jurisdiction tags for current terms
+        legal_contact_email:
+          type: string
+          nullable: true
+        abuse_contact_email:
+          type: string
+          nullable: true
+      required:
+        - version
+        - url
+        - content_type
+        - content_sha256
+        - content
+        - effective_at
+        - jurisdictions
+        - legal_contact_email
+        - abuse_contact_email
 
     RealtimeVideoSignal:
       type: object
@@ -939,6 +1179,7 @@ paths:
       summary: Complete signup by choosing a username
       description: |
         Finalizes account creation for new Google users who are required to choose a custom username.
+        Age confirmation (`18+`) and acceptance of the current terms version are mandatory.
       operationId: signupComplete
       requestBody:
         required: true
@@ -1002,6 +1243,7 @@ paths:
       summary: Initialize video upload
       description: |
         Request a presigned URL for uploading a video file.
+        New uploads must explicitly provide `is_nsfw`.
 
         **Upload Flow:**
         1. Call this endpoint to get a `video_id` and `upload_url`
@@ -1071,6 +1313,55 @@ paths:
         "500":
           $ref: "#/components/responses/InternalServerError"
 
+  /videos/{id}/report:
+    post:
+      tags:
+        - Videos
+      summary: Report a video for abuse/policy violations
+      operationId: reportVideo
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReportVideoRequest"
+      responses:
+        "201":
+          description: New report created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReportVideoResponse"
+        "200":
+          description: Existing open report updated idempotently
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReportVideoResponse"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "429":
+          $ref: "#/components/responses/TooManyRequestsError"
+        "503":
+          description: Report submission temporarily unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
   /videos/init/anonymous:
     post:
       tags:
@@ -1079,6 +1370,7 @@ paths:
       description: |
         Request a presigned URL for uploading an anonymous video file.
         Anonymous videos do not expose the uploader's identity in the feed.
+        New uploads must explicitly provide `is_nsfw`.
 
         **Differences from Regular Upload:**
         - Stricter rate limit: 128 MB/hour (50% of regular limit)
@@ -1362,6 +1654,12 @@ paths:
             maxLength: 64
             pattern: "^[A-Za-z0-9_-]+$"
             example: "session_01J8N4T0V4K8"
+        - name: include_nsfw
+          in: query
+          required: true
+          description: Whether NSFW videos should be included in the feed
+          schema:
+            type: boolean
       responses:
         "200":
           description: Feed retrieved successfully
@@ -1422,6 +1720,12 @@ paths:
               - recent
               - popular
             default: relevance
+        - name: include_nsfw
+          in: query
+          required: true
+          description: Whether NSFW videos should be included in results
+          schema:
+            type: boolean
       responses:
         "200":
           description: Search results
@@ -1860,6 +2164,101 @@ paths:
         "500":
           $ref: "#/components/responses/InternalServerError"
 
+  /users/me/onboarding/status:
+    get:
+      tags:
+        - Users
+      summary: Get onboarding status
+      description: Returns whether the authenticated session user has completed age and terms onboarding.
+      operationId: getOnboardingStatus
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Onboarding status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OnboardingStatusResponse"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "429":
+          $ref: "#/components/responses/TooManyRequestsError"
+        "503":
+          description: Status check temporarily unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /users/me/onboarding/complete:
+    post:
+      tags:
+        - Users
+      summary: Complete onboarding
+      description: |
+        Idempotently completes onboarding for the authenticated session user.
+        `age_confirmed` must be true and `terms_version` must match the current server version.
+      operationId: completeOnboarding
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CompleteOnboardingRequest"
+      responses:
+        "200":
+          description: Onboarding completed (or already complete)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OnboardingStatusResponse"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "429":
+          $ref: "#/components/responses/TooManyRequestsError"
+        "503":
+          description: Completion temporarily unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /users/me/reports:
+    get:
+      tags:
+        - Users
+      summary: List authenticated user's abuse reports
+      operationId: getMyReports
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: query
+          name: limit
+          required: false
+          schema:
+            type: integer
+        - in: query
+          name: cursor
+          required: false
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Abuse reports page
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MyReportsResponse"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+
   /users/me/username:
     put:
       tags:
@@ -1979,6 +2378,73 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
+  /system/terms:
+    get:
+      tags:
+        - System
+      summary: Get current terms and policy document
+      description: Returns the active terms version and optional embedded content configured in backend.
+      operationId: getTerms
+      responses:
+        "200":
+          description: Terms document
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TermsResponse"
+
+  /system/read-only:
+    get:
+      tags:
+        - System
+      summary: Get read-only mode status
+      operationId: getReadOnlyStatus
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Read-only mode status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModeStatusResponse"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "429":
+          $ref: "#/components/responses/TooManyRequestsError"
+        "503":
+          description: Status check temporarily unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /system/maintenance:
+    get:
+      tags:
+        - System
+      summary: Get maintenance mode status
+      operationId: getMaintenanceStatus
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Maintenance mode status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModeStatusResponse"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "429":
+          $ref: "#/components/responses/TooManyRequestsError"
+        "503":
+          description: Status check temporarily unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
   /videos/bulk-delete:
     post:
       tags:
@@ -2053,6 +2519,159 @@ paths:
   #               $ref: "#/components/schemas/BulkDownloadStatus"
   #       "404":
   #         $ref: "#/components/responses/NotFoundError"
+
+  /admin/abuse/reports:
+    get:
+      tags:
+        - Admin
+      summary: List abuse reports
+      operationId: adminListAbuseReports
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: query
+          name: status
+          required: false
+          schema:
+            type: string
+        - in: query
+          name: reason
+          required: false
+          schema:
+            type: string
+        - in: query
+          name: severity_min
+          required: false
+          schema:
+            type: integer
+        - in: query
+          name: video_id
+          required: false
+          schema:
+            type: string
+            format: uuid
+        - in: query
+          name: limit
+          required: false
+          schema:
+            type: integer
+        - in: query
+          name: cursor
+          required: false
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Abuse report list
+          content:
+            application/json:
+              schema:
+                type: object
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+
+  /admin/abuse/reports/{report_id}:
+    get:
+      tags:
+        - Admin
+      summary: Get abuse report details
+      operationId: adminGetAbuseReport
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: path
+          name: report_id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Abuse report details
+          content:
+            application/json:
+              schema:
+                type: object
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+    post:
+      tags:
+        - Admin
+      summary: Resolve an abuse report
+      operationId: adminResolveAbuseReport
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: path
+          name: report_id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: Abuse report resolved
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+
+  /admin/moderation/videos/{video_id}/action:
+    post:
+      tags:
+        - Admin
+      summary: Apply manual moderation action to a video
+      operationId: adminVideoModerationAction
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: path
+          name: video_id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: Video moderation action result
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
 
   /admin/db/tables:
     get:

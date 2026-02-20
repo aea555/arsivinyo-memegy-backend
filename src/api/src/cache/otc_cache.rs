@@ -18,6 +18,9 @@ pub struct OtcAuthTokenData {
 pub struct OtcSignupRequiredData {
     pub signup_ticket: String,
     pub suggested_username: String,
+    pub required_terms_version: String,
+    pub terms_url: Option<String>,
+    pub requires_age_confirmation: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

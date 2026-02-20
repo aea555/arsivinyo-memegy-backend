@@ -17,6 +17,12 @@ pub struct Model {
     pub duration_seconds: Option<i32>,
     pub like_count: i64,
     pub is_anonymous: bool,
+    pub is_nsfw: Option<bool>,
+    pub moderation_state: String,
+    pub moderation_reason_code: Option<String>,
+    pub moderation_updated_at: Option<DateTimeWithTimeZone>,
+    pub moderation_updated_by: Option<String>,
+    pub moderation_source_report_id: Option<Uuid>,
     pub processing_error_code: Option<String>,
     pub processing_error_message: Option<String>,
     pub failed_at: Option<DateTimeWithTimeZone>,
@@ -27,6 +33,8 @@ pub struct Model {
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
+    #[sea_orm(has_many = "super::abuse_reports::Entity")]
+    AbuseReports,
     #[sea_orm(has_many = "super::likes::Entity")]
     Likes,
     #[sea_orm(
@@ -37,6 +45,12 @@ pub enum Relation {
         on_delete = "Cascade"
     )]
     Users,
+}
+
+impl Related<super::abuse_reports::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::AbuseReports.def()
+    }
 }
 
 impl Related<super::likes::Entity> for Entity {

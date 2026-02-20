@@ -72,6 +72,9 @@ pub struct UsernameRequiredResponse {
     pub error: String,
     pub signup_ticket: String,
     pub suggested_username: String,
+    pub requires_age_confirmation: bool,
+    pub required_terms_version: String,
+    pub terms_url: Option<String>,
     pub rules: UsernameRulesDto,
 }
 
@@ -79,6 +82,8 @@ pub struct UsernameRequiredResponse {
 pub struct SignupCompleteRequest {
     pub signup_ticket: String,
     pub username: String,
+    pub age_confirmed: bool,
+    pub terms_version: String,
 }
 
 #[derive(Deserialize)]

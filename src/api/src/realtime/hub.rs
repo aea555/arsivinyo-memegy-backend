@@ -85,11 +85,11 @@ impl RealtimeHub {
         conn_id: Uuid,
     ) -> Vec<String> {
         let mut state = self.inner.lock().await;
-        if let Some(connections) = state.users.get_mut(&user_id) {
-            if let Some(conn) = connections.get_mut(&conn_id) {
-                conn.bootstrapping = false;
-                return std::mem::take(&mut conn.pending);
-            }
+        if let Some(connections) = state.users.get_mut(&user_id)
+            && let Some(conn) = connections.get_mut(&conn_id)
+        {
+            conn.bootstrapping = false;
+            return std::mem::take(&mut conn.pending);
         }
         Vec::new()
     }

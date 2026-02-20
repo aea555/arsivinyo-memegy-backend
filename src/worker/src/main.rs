@@ -200,39 +200,38 @@ async fn main() -> Result<()> {
                 }
 
                 // If all retries failed update status to FAILED
-                if let Some(err) = last_error {
-                    if let Ok(Some(v)) = videos::Entity::find_by_id(job.video_id).one(&db).await {
-                        let previous_status = v.status.clone();
-                        let mut active: videos::ActiveModel = v.into();
-                        active.status = Set("FAILED".to_string());
-                        active.processing_error_code = Set(Some(err.code.to_string()));
-                        active.processing_error_message =
-                            Set(Some(sanitize_error_message(&err.message)));
-                        active.failed_at = Set(Some(chrono::Utc::now().into()));
-                        if let Ok(updated_video) = active.update(&db).await {
-                            if let Err(e) = publish_video_status_signal(
-                                &db,
-                                &queue,
-                                &config,
-                                job.user_id,
-                                "video.status.failed",
-                                Some(previous_status),
-                                &updated_video,
-                            )
-                            .await
-                            {
-                                tracing::warn!("Failed to publish failed realtime signal: {:?}", e);
-                            }
-                        }
-                        invalidate_user_video_cache(&queue, job.user_id).await;
-                        tracing::error!(
-                            "Marked video {} as FAILED after exhausting retries: code={} transient={} error={}",
-                            job.video_id,
-                            err.code,
-                            err.is_transient(),
-                            err.message
-                        );
+                if let Some(err) = last_error
+                    && let Ok(Some(v)) = videos::Entity::find_by_id(job.video_id).one(&db).await
+                {
+                    let previous_status = v.status.clone();
+                    let mut active: videos::ActiveModel = v.into();
+                    active.status = Set("FAILED".to_string());
+                    active.processing_error_code = Set(Some(err.code.to_string()));
+                    active.processing_error_message =
+                        Set(Some(sanitize_error_message(&err.message)));
+                    active.failed_at = Set(Some(chrono::Utc::now().into()));
+                    if let Ok(updated_video) = active.update(&db).await
+                        && let Err(e) = publish_video_status_signal(
+                            &db,
+                            &queue,
+                            &config,
+                            job.user_id,
+                            "video.status.failed",
+                            Some(previous_status),
+                            &updated_video,
+                        )
+                        .await
+                    {
+                        tracing::warn!("Failed to publish failed realtime signal: {:?}", e);
                     }
+                    invalidate_user_video_cache(&queue, job.user_id).await;
+                    tracing::error!(
+                        "Marked video {} as FAILED after exhausting retries: code={} transient={} error={}",
+                        job.video_id,
+                        err.code,
+                        err.is_transient(),
+                        err.message
+                    );
                 }
             }
             Ok(None) => {
@@ -404,13 +403,12 @@ async fn process_video(
 
 async fn invalidate_feed_cache(queue: &QueueService) {
     use redis::AsyncCommands;
-    if let Ok(mut conn) = queue.get_conn().await {
-        if let Ok(keys) = conn.keys::<_, Vec<String>>("feed:*").await {
-            if !keys.is_empty() {
-                let _: Result<(), _> = conn.del(&keys).await;
-                tracing::debug!("Invalidated feed cache after publishing video");
-            }
-        }
+    if let Ok(mut conn) = queue.get_conn().await
+        && let Ok(keys) = conn.keys::<_, Vec<String>>("feed:*").await
+        && !keys.is_empty()
+    {
+        let _: Result<(), _> = conn.del(&keys).await;
+        tracing::debug!("Invalidated feed cache after publishing video");
     }
 }
 
@@ -418,15 +416,15 @@ async fn invalidate_user_video_cache(queue: &QueueService, user_id: Uuid) {
     use redis::AsyncCommands;
     if let Ok(mut conn) = queue.get_conn().await {
         let pattern = format!("user:{}:videos:*", user_id);
-        if let Ok(keys) = conn.keys::<_, Vec<String>>(&pattern).await {
-            if !keys.is_empty() {
-                let _: Result<(), _> = conn.del(&keys).await;
-                tracing::debug!(
-                    "Invalidated {} /users/me/videos cache key(s) for user {}",
-                    keys.len(),
-                    user_id
-                );
-            }
+        if let Ok(keys) = conn.keys::<_, Vec<String>>(&pattern).await
+            && !keys.is_empty()
+        {
+            let _: Result<(), _> = conn.del(&keys).await;
+            tracing::debug!(
+                "Invalidated {} /users/me/videos cache key(s) for user {}",
+                keys.len(),
+                user_id
+            );
         }
     }
 }

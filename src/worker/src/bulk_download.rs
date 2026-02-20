@@ -8,7 +8,7 @@ use shared::{
 };
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
@@ -267,7 +267,7 @@ impl BulkDownloadWorker {
     }
 
     /// Download a single video from S3
-    async fn download_video(&self, temp_dir: &PathBuf, video: &videos::Model) -> Result<PathBuf> {
+    async fn download_video(&self, temp_dir: &Path, video: &videos::Model) -> Result<PathBuf> {
         let dest_path = temp_dir.join(format!("{}.mp4", video.id));
         self.storage
             .download_file(&video.s3_bucket, &video.s3_key, &dest_path)

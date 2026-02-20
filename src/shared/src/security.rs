@@ -145,7 +145,7 @@ pub fn generate_otc() -> String {
 /// Must be 43-128 chars of [A-Z a-z 0-9 - . _ ~]
 pub fn validate_code_verifier(verifier: &str) -> bool {
     let len = verifier.len();
-    if len < 43 || len > 128 {
+    if !(43..=128).contains(&len) {
         return false;
     }
 

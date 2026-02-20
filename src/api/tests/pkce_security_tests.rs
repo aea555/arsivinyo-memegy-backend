@@ -19,7 +19,7 @@ async fn test_mobile_with_valid_pkce_accepted() {
 
     // Call login endpoint with mobile source and PKCE
     let response = client
-        .get(&format!("{}/auth/google/login", app.address))
+        .get(format!("{}/auth/google/login", app.address))
         .query(&[
             ("source", "mobile"),
             ("code_challenge", &challenge),
@@ -46,7 +46,7 @@ async fn test_mobile_without_pkce_rejected() {
     let client = reqwest::Client::new();
 
     let response = client
-        .get(&format!("{}/auth/google/login", app.address))
+        .get(format!("{}/auth/google/login", app.address))
         .query(&[("source", "mobile")])
         .send()
         .await
@@ -68,7 +68,7 @@ async fn test_invalid_challenge_length_rejected() {
     let verifier = generate_otc();
 
     let response = client
-        .get(&format!("{}/auth/google/login", app.address))
+        .get(format!("{}/auth/google/login", app.address))
         .query(&[
             ("source", "mobile"),
             ("code_challenge", invalid_challenge),
@@ -98,7 +98,7 @@ async fn test_plain_method_rejected() {
     let verifier = generate_otc();
 
     let response = client
-        .get(&format!("{}/auth/google/login", app.address))
+        .get(format!("{}/auth/google/login", app.address))
         .query(&[
             ("source", "mobile"),
             ("code_challenge", &verifier), // Using verifier directly as challenge
@@ -131,7 +131,7 @@ async fn test_invalid_challenge_format_rejected() {
     let verifier = generate_otc();
 
     let response = client
-        .get(&format!("{}/auth/google/login", app.address))
+        .get(format!("{}/auth/google/login", app.address))
         .query(&[
             ("source", "mobile"),
             ("code_challenge", &invalid_challenge[..43]), // Truncate to 43
@@ -155,7 +155,7 @@ async fn test_web_without_pkce_accepted() {
         .unwrap();
 
     let response = client
-        .get(&format!("{}/auth/google/login", app.address))
+        .get(format!("{}/auth/google/login", app.address))
         .query(&[("source", "web")])
         .send()
         .await
@@ -181,7 +181,7 @@ async fn test_otc_exchange_rate_limiting() {
     // First 5 attempts should get 400 (bad request)
     for i in 0..5 {
         let response = client
-            .post(&format!("{}/auth/exchange-otc", app.address))
+            .post(format!("{}/auth/exchange-otc", app.address))
             .json(&serde_json::json!({
                 "code": format!("{}_{}", invalid_otc, i)
             }))
@@ -203,7 +203,7 @@ async fn test_otc_exchange_rate_limiting() {
 
     // 6th attempt should be rate limited
     let response = client
-        .post(&format!("{}/auth/exchange-otc", app.address))
+        .post(format!("{}/auth/exchange-otc", app.address))
         .json(&serde_json::json!({
             "code": format!("{}_6", invalid_otc)
         }))
@@ -225,7 +225,7 @@ async fn test_invalid_otc_rejected() {
     let client = reqwest::Client::new();
 
     let response = client
-        .post(&format!("{}/auth/exchange-otc", app.address))
+        .post(format!("{}/auth/exchange-otc", app.address))
         .json(&serde_json::json!({
             "code": "definitely_not_a_valid_otc"
         }))

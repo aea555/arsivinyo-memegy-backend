@@ -34,6 +34,16 @@ pub enum RefreshAccessTokenError {
     Internal(anyhow::Error),
 }
 
+pub struct RegisterWithUsernameInput<'a> {
+    pub google_user: GoogleUserResult,
+    pub username: String,
+    pub username_normalized: String,
+    pub terms_version: String,
+    pub jwt_secret: &'a str,
+    pub access_token_ttl_secs: usize,
+    pub refresh_token_ttl_days: u16,
+}
+
 impl From<sea_orm::DbErr> for RefreshAccessTokenError {
     fn from(value: sea_orm::DbErr) -> Self {
         Self::Internal(value.into())
@@ -202,20 +212,15 @@ impl AuthService {
 
     pub async fn register_with_username(
         db: &DatabaseConnection,
-        google_user: GoogleUserResult,
-        username: String,
-        username_normalized: String,
-        jwt_secret: &str,
-        access_token_ttl_secs: usize,
-        refresh_token_ttl_days: u16,
+        input: RegisterWithUsernameInput<'_>,
     ) -> std::result::Result<(String, String, users::Model), RegisterUserError> {
-        if !google_user.verified_email {
+        if !input.google_user.verified_email {
             return Err(RegisterUserError::Other(anyhow!(
                 "Email not verified by Google"
             )));
         }
 
-        if username_exists_case_insensitive(db, &username_normalized, None)
+        if username_exists_case_insensitive(db, &input.username_normalized, None)
             .await
             .map_err(|e| RegisterUserError::Other(anyhow!(e.to_string())))?
         {
@@ -223,18 +228,25 @@ impl AuthService {
         }
 
         let existing_user = users::Entity::find()
-            .filter(users::Column::GoogleId.eq(&google_user.id))
+            .filter(users::Column::GoogleId.eq(&input.google_user.id))
             .one(db)
             .await
             .map_err(|e| RegisterUserError::Other(anyhow!(e.to_string())))?;
 
         let user = match existing_user {
             Some(u) => {
+                let now = Utc::now().fixed_offset();
                 let mut active_model: users::ActiveModel = u.into();
                 if active_model.deleted_at.as_ref().is_some() {
                     active_model.deleted_at = Set(None);
                 }
-                active_model.avatar_url = Set(Some(google_user.picture));
+                active_model.username = Set(input.username.clone());
+                active_model.username_normalized = Set(Some(input.username_normalized.clone()));
+                active_model.username_updated_at = Set(Some(now));
+                active_model.age_confirmed_at = Set(Some(now));
+                active_model.terms_accepted_at = Set(Some(now));
+                active_model.terms_accepted_version = Set(Some(input.terms_version.clone()));
+                active_model.avatar_url = Set(Some(input.google_user.picture.clone()));
                 active_model.update(db).await.map_err(|e| {
                     if is_username_unique_violation(&e) {
                         RegisterUserError::UsernameTaken
@@ -247,11 +259,14 @@ impl AuthService {
                 let now = Utc::now().fixed_offset();
                 let new_user = users::ActiveModel {
                     id: Set(Uuid::new_v4()),
-                    google_id: Set(google_user.id),
-                    username: Set(username),
-                    username_normalized: Set(Some(username_normalized)),
-                    email: Set(google_user.email),
-                    avatar_url: Set(Some(google_user.picture)),
+                    google_id: Set(input.google_user.id),
+                    username: Set(input.username),
+                    username_normalized: Set(Some(input.username_normalized)),
+                    email: Set(input.google_user.email),
+                    avatar_url: Set(Some(input.google_user.picture)),
+                    age_confirmed_at: Set(Some(now)),
+                    terms_accepted_at: Set(Some(now)),
+                    terms_accepted_version: Set(Some(input.terms_version)),
                     username_updated_at: Set(Some(now)),
                     ..Default::default()
                 };
@@ -268,9 +283,9 @@ impl AuthService {
         let (access_token, refresh_token) = Self::issue_tokens_for_user(
             db,
             &user,
-            jwt_secret,
-            access_token_ttl_secs,
-            refresh_token_ttl_days,
+            input.jwt_secret,
+            input.access_token_ttl_secs,
+            input.refresh_token_ttl_days,
         )
         .await
         .map_err(RegisterUserError::Other)?;
@@ -302,29 +317,9 @@ impl AuthService {
         {
             return Ok(tokens);
         }
-
-        let new_user = users::ActiveModel {
-            id: Set(Uuid::new_v4()),
-            google_id: Set(google_user.id),
-            username: Set(google_user.name),
-            username_normalized: Set(None),
-            email: Set(google_user.email),
-            avatar_url: Set(Some(google_user.picture)),
-            username_updated_at: Set(None),
-            ..Default::default()
-        };
-        let user = new_user.insert(db).await?;
-
-        let (access_token, refresh_token) = Self::issue_tokens_for_user(
-            db,
-            &user,
-            jwt_secret,
-            access_token_ttl_secs,
-            refresh_token_ttl_days,
-        )
-        .await?;
-
-        Ok((access_token, refresh_token, user))
+        Err(anyhow!(
+            "Direct auto-registration is disabled. Signup completion is required."
+        ))
     }
 
     /// Refresh access token with proper token rotation and revocation.
@@ -413,10 +408,10 @@ impl AuthService {
             .unwrap_or(0);
 
         let remaining_ttl = old_claims.exp.saturating_sub(now_secs);
-        if remaining_ttl > 0 {
-            if let Err(e) = revocation.revoke_token(old_claims.jti, remaining_ttl).await {
-                tracing::warn!("Failed to revoke old token {}: {:?}", old_claims.jti, e);
-            }
+        if remaining_ttl > 0
+            && let Err(e) = revocation.revoke_token(old_claims.jti, remaining_ttl).await
+        {
+            tracing::warn!("Failed to revoke old token {}: {:?}", old_claims.jti, e);
         }
 
         // 6. Issue NEW access and refresh tokens

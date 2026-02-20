@@ -12,7 +12,8 @@ use axum_extra::{
 
 use crate::{error::ApiErrorResponse, state::AppState};
 
-use super::auth::{extract_client_ip, verify_admin_jwt};
+use super::auth::verify_admin_jwt;
+use crate::services::client_ip::extract_client_ip_from_headers_and_extensions;
 
 #[derive(Debug, Clone)]
 pub struct AdminPrincipal {
@@ -42,8 +43,9 @@ impl FromRequestParts<AppState> for AdminPrincipal {
                 .await
                 .map_err(|_| ApiErrorResponse::unauthorized("Missing admin bearer token"))?;
 
-        let client_ip = extract_client_ip(
-            parts,
+        let client_ip = extract_client_ip_from_headers_and_extensions(
+            &parts.headers,
+            &parts.extensions,
             &state.config.environment,
             state.config.require_cloudflare_headers,
         )?;

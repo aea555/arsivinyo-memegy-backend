@@ -8,6 +8,7 @@ pub mod middleware;
 pub mod realtime;
 pub mod services;
 pub mod state;
+pub mod system;
 pub mod users;
 pub mod videos;
 
@@ -126,6 +127,7 @@ pub fn create_router(state: AppState) -> Router {
 
     public_router = public_router
         .merge(videos::router::videos_router(&state.config))
+        .nest("/system", system::router::system_router(&state.config))
         .nest("/users", users::router::users_router(&state.config))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -137,5 +139,11 @@ pub fn create_router(state: AppState) -> Router {
         app_router = app_router.nest("/admin", admin::router::admin_router());
     }
 
-    app_router.layer(cors).with_state(state)
+    app_router
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            middleware::platform_mode_guard::platform_mode_guard,
+        ))
+        .layer(cors)
+        .with_state(state)
 }

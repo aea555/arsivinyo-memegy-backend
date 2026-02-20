@@ -1,11 +1,8 @@
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::StatusCode,
-};
-use axum_extra::{
-    TypedHeader,
-    headers::{Authorization, authorization::Bearer},
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
 };
 use chrono::Utc;
 use sea_orm::*;
@@ -14,7 +11,6 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use super::dtos::*;
-use crate::auth::service::AuthService;
 use crate::{
     auth::extractors::{AuthUser, ExtensionAuth},
     error::{ApiErrorResponse, ApiResult},
@@ -23,12 +19,16 @@ use crate::{
         KEYBOARD_TICKET_EXPIRED_TOTAL, WS_EVENTS_PUBLISHED_TOTAL,
     },
     realtime::messages::{EVENT_PROCESSING, RealtimeSignalMessage},
+    services::{
+        abuse_report_service::{self, SubmitReportInput},
+        client_ip::ClientIp,
+    },
     state::AppState,
     users::handlers::video_model_to_user_dto,
 };
 use redis::AsyncCommands;
 use shared::{
-    entities::{likes, send_tickets, videos},
+    entities::{abuse_reports, likes, send_tickets, videos},
     queue::VideoProcessJob,
 };
 
@@ -37,6 +37,7 @@ pub struct FeedQuery {
     pub sort: Option<String>, // "latest", "popular", "random"
     pub page: Option<u64>,
     pub random_seed: Option<String>,
+    pub include_nsfw: Option<bool>,
 }
 
 fn normalize_random_seed(seed: Option<&str>) -> Option<String> {
@@ -55,15 +56,28 @@ fn normalize_random_seed(seed: Option<&str>) -> Option<String> {
     }
 }
 
+fn enforce_read_only_upload_restriction(state: &AppState) -> ApiResult<()> {
+    if state.config.read_only_mode_enabled {
+        return Err(ApiErrorResponse::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "read_only_mode_enabled",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct VideoFeedItem {
     pub id: Uuid,
     pub title: Option<String>,
     pub url: String, // Public URL
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumbnail_url: Option<String>,
     pub like_count: i64,
     pub created_at: chrono::DateTime<chrono::FixedOffset>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uploader: Option<UploaderInfo>, // None if video is anonymous
+    pub is_nsfw: bool,
     pub is_liked: bool,
 }
 
@@ -73,11 +87,35 @@ pub struct UploaderInfo {
     pub username: String,
 }
 
+pub(crate) fn abuse_report_model_to_dto(report: abuse_reports::Model) -> VideoReportDto {
+    VideoReportDto {
+        id: report.id,
+        video_id: report.video_id,
+        reporter_user_id: report.reporter_user_id,
+        reason_codes: report.reason_codes,
+        details: report.details,
+        timestamp_seconds: report.timestamp_seconds,
+        severity_score: report.severity_score,
+        status: report.status,
+        auto_quarantined: report.auto_quarantined,
+        auto_rule: report.auto_rule,
+        created_at: report.created_at,
+        updated_at: report.updated_at,
+        closed_at: report.closed_at,
+        resolution_code: report.resolution_code,
+        resolution_note: report.resolution_note,
+    }
+}
+
 pub async fn get_feed(
     State(state): State<AppState>,
     AuthUser(user_id): AuthUser,
     Query(query): Query<FeedQuery>,
 ) -> ApiResult<Json<Vec<VideoFeedItem>>> {
+    let include_nsfw = query
+        .include_nsfw
+        .ok_or_else(|| ApiErrorResponse::bad_request("include_nsfw query parameter is required"))?;
+
     // Rate limiting for feed access
     let feed_rate_key = crate::services::rate_limiter::RateLimiter::feed_rpm_key(&user_id);
     match state
@@ -119,61 +157,75 @@ pub async fn get_feed(
     let random_seed =
         normalize_random_seed(query.random_seed.as_deref()).unwrap_or_else(|| user_id.to_string());
 
+    let nsfw_cache_tag = if include_nsfw {
+        Some("include_nsfw")
+    } else {
+        Some("exclude_nsfw")
+    };
+
     // Try cache first (skip for random to keep it truly random)
-    if sort != "random" {
-        if let Ok(Some(cached)) = state.feed_cache.get_feed(sort, None, page).await {
-            let base_url = format!(
-                "{}/{}",
-                state.config.minio_public_endpoint, state.config.minio_bucket_videos
-            );
+    if sort != "random"
+        && let Ok(Some(cached)) = state.feed_cache.get_feed(sort, nsfw_cache_tag, page).await
+    {
+        let base_url = format!(
+            "{}/{}",
+            state.config.minio_public_endpoint, state.config.minio_bucket_videos
+        );
 
-            let items: Vec<VideoFeedItem> = cached
-                .into_iter()
-                .map(|c| VideoFeedItem {
-                    id: c.id,
-                    title: c.title,
-                    url: format!("{}/{}", base_url, c.url.split('/').last().unwrap_or(&c.url)),
-                    like_count: c.like_count,
-                    created_at: c.created_at,
-                    uploader: if c.is_anonymous {
-                        None
-                    } else {
-                        c.uploader.map(|u| UploaderInfo {
-                            id: u.id,
-                            username: u.username,
-                        })
-                    },
-                    is_liked: false, // Will be populated shortly
-                })
-                .collect();
+        let items: Vec<VideoFeedItem> = cached
+            .into_iter()
+            .map(|c| VideoFeedItem {
+                id: c.id,
+                title: c.title,
+                url: format!(
+                    "{}/{}",
+                    base_url,
+                    c.url.split('/').next_back().unwrap_or(&c.url)
+                ),
+                thumbnail_url: c
+                    .thumbnail_url
+                    .or_else(|| Some(format!("{}/{}_thumb.jpg", base_url, c.id))),
+                like_count: c.like_count,
+                created_at: c.created_at,
+                uploader: if c.is_anonymous {
+                    None
+                } else {
+                    c.uploader.map(|u| UploaderInfo {
+                        id: u.id,
+                        username: u.username,
+                    })
+                },
+                is_nsfw: c.is_nsfw.unwrap_or(true),
+                is_liked: false, // Will be populated shortly
+            })
+            .collect();
 
-            // Batch check for likes
-            let video_ids: Vec<Uuid> = items.iter().map(|i| i.id).collect();
-            let liked_video_ids: Vec<Uuid> = likes::Entity::find()
-                .select_only()
-                .column(likes::Column::VideoId)
-                .filter(
-                    Condition::all()
-                        .add(likes::Column::UserId.eq(user_id))
-                        .add(likes::Column::VideoId.is_in(video_ids)),
-                )
-                .into_tuple()
-                .all(&state.db)
-                .await
-                .map_err(|e| ApiErrorResponse::internal_error(e.to_string()))?;
+        // Batch check for likes
+        let video_ids: Vec<Uuid> = items.iter().map(|i| i.id).collect();
+        let liked_video_ids: Vec<Uuid> = likes::Entity::find()
+            .select_only()
+            .column(likes::Column::VideoId)
+            .filter(
+                Condition::all()
+                    .add(likes::Column::UserId.eq(user_id))
+                    .add(likes::Column::VideoId.is_in(video_ids)),
+            )
+            .into_tuple()
+            .all(&state.db)
+            .await
+            .map_err(|e| ApiErrorResponse::internal_error(e.to_string()))?;
 
-            let liked_set: std::collections::HashSet<Uuid> = liked_video_ids.into_iter().collect();
+        let liked_set: std::collections::HashSet<Uuid> = liked_video_ids.into_iter().collect();
 
-            let items = items
-                .into_iter()
-                .map(|mut item| {
-                    item.is_liked = liked_set.contains(&item.id);
-                    item
-                })
-                .collect();
+        let items = items
+            .into_iter()
+            .map(|mut item| {
+                item.is_liked = liked_set.contains(&item.id);
+                item
+            })
+            .collect();
 
-            return Ok(Json(items));
-        }
+        return Ok(Json(items));
     }
 
     // Cache miss or random - query DB with user join for non-anonymous videos
@@ -181,6 +233,7 @@ pub async fn get_feed(
 
     let mut select = videos::Entity::find()
         .filter(videos::Column::DeletedAt.is_null()) // Filter soft-deleted videos
+        .filter(videos::Column::ModerationState.eq(abuse_report_service::MODERATION_VISIBLE))
         .filter(
             Condition::any()
                 .add(videos::Column::Status.eq("PUBLISHED"))
@@ -190,6 +243,10 @@ pub async fn get_feed(
                 .add(videos::Column::S3Bucket.eq(state.config.minio_bucket_videos.clone())),
         )
         .find_also_related(users::Entity); // Left join users table
+
+    if !include_nsfw {
+        select = select.filter(videos::Column::IsNsfw.eq(false));
+    }
 
     match sort {
         "latest" => {
@@ -205,7 +262,7 @@ pub async fn get_feed(
         }
         _ => {
             select = select.order_by(
-                sea_orm::sea_query::Expr::cust(&format!(
+                sea_orm::sea_query::Expr::cust(format!(
                     "md5(videos.id::text || '{}')",
                     random_seed
                 )),
@@ -231,6 +288,7 @@ pub async fn get_feed(
             id: v.id,
             title: v.title.clone(),
             url: format!("{}/{}", base_url, v.s3_key),
+            thumbnail_url: Some(format!("{}/{}_thumb.jpg", base_url, v.id)),
             like_count: v.like_count,
             created_at: v.created_at,
             // Only include uploader for non-anonymous videos
@@ -242,6 +300,7 @@ pub async fn get_feed(
                     username: user.username.clone(),
                 })
             },
+            is_nsfw: v.is_nsfw.unwrap_or(true),
             is_liked: false,
         })
         .collect();
@@ -275,11 +334,12 @@ pub async fn get_feed(
                 id: v.id,
                 title: v.title.clone(),
                 url: v.s3_key.clone(),
-                thumbnail_url: None,
+                thumbnail_url: Some(format!("{}/{}_thumb.jpg", base_url, v.id)),
                 like_count: v.like_count,
                 created_at: v.created_at,
                 deleted_at: v.deleted_at,
                 is_anonymous: v.is_anonymous,
+                is_nsfw: v.is_nsfw,
                 uploader: if v.is_anonymous {
                     None
                 } else {
@@ -295,7 +355,7 @@ pub async fn get_feed(
         // Cache with 5-minute TTL (300 seconds)
         let _ = state
             .feed_cache
-            .set_feed(sort, None, page, &cached_items, 300)
+            .set_feed(sort, nsfw_cache_tag, page, &cached_items, 300)
             .await;
     }
 
@@ -307,6 +367,8 @@ pub async fn init_upload(
     AuthUser(user_id): AuthUser,
     Json(payload): Json<InitUploadRequest>,
 ) -> ApiResult<Json<InitUploadResponse>> {
+    enforce_read_only_upload_restriction(&state)?;
+
     // 1. Validate file size
     if payload.size_bytes > state.config.max_file_size_bytes {
         return Err(ApiErrorResponse::bad_request(format!(
@@ -346,6 +408,12 @@ pub async fn init_upload(
         duration_seconds: Set(None),
         like_count: Set(0),
         is_anonymous: Set(false), // Regular upload, not anonymous
+        is_nsfw: Set(Some(payload.is_nsfw)),
+        moderation_state: Set(abuse_report_service::MODERATION_VISIBLE.to_string()),
+        moderation_reason_code: Set(None),
+        moderation_updated_at: Set(None),
+        moderation_updated_by: Set(None),
+        moderation_source_report_id: Set(None),
         processing_error_code: Set(None),
         processing_error_message: Set(None),
         failed_at: Set(None),
@@ -384,6 +452,8 @@ pub async fn init_anonymous_upload(
     AuthUser(user_id): AuthUser,
     Json(payload): Json<InitUploadRequest>,
 ) -> ApiResult<Json<InitUploadResponse>> {
+    enforce_read_only_upload_restriction(&state)?;
+
     // 1. Validate file size
     if payload.size_bytes > state.config.max_file_size_bytes {
         return Err(ApiErrorResponse::bad_request(format!(
@@ -425,6 +495,12 @@ pub async fn init_anonymous_upload(
         duration_seconds: Set(None),
         like_count: Set(0),
         is_anonymous: Set(true), // ANONYMOUS upload
+        is_nsfw: Set(Some(payload.is_nsfw)),
+        moderation_state: Set(abuse_report_service::MODERATION_VISIBLE.to_string()),
+        moderation_reason_code: Set(None),
+        moderation_updated_at: Set(None),
+        moderation_updated_by: Set(None),
+        moderation_source_report_id: Set(None),
         processing_error_code: Set(None),
         processing_error_message: Set(None),
         failed_at: Set(None),
@@ -462,6 +538,8 @@ pub async fn confirm_upload(
     AuthUser(user_id): AuthUser,
     Path(video_id): Path<Uuid>,
 ) -> ApiResult<StatusCode> {
+    enforce_read_only_upload_restriction(&state)?;
+
     let txn = state.db.begin().await?;
 
     // 1. SELECT FOR UPDATE for idempotency
@@ -584,6 +662,149 @@ pub async fn confirm_upload(
     Ok(StatusCode::ACCEPTED)
 }
 
+pub async fn report_video(
+    State(state): State<AppState>,
+    AuthUser(user_id): AuthUser,
+    ClientIp(client_ip): ClientIp,
+    headers: HeaderMap,
+    Path(video_id): Path<Uuid>,
+    Json(payload): Json<ReportVideoRequest>,
+) -> ApiResult<impl IntoResponse> {
+    let user_rate_key =
+        crate::services::rate_limiter::RateLimiter::report_create_user_key(&user_id);
+    match state
+        .rate_limiter
+        .check_and_increment_strict(&user_rate_key, state.config.report_create_rpm_per_user, 60)
+        .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(_)) => {
+            return Err(ApiErrorResponse::too_many_requests(
+                "Abuse report rate limit exceeded for user",
+            ));
+        }
+        Err(_) => {
+            return Err(ApiErrorResponse::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Abuse report rate limiter unavailable",
+            ));
+        }
+    }
+
+    let ip_rate_key =
+        crate::services::rate_limiter::RateLimiter::report_create_ip_key(&client_ip.to_string());
+    match state
+        .rate_limiter
+        .check_and_increment_strict(&ip_rate_key, state.config.report_create_rpm_per_ip, 60)
+        .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(_)) => {
+            return Err(ApiErrorResponse::too_many_requests(
+                "Abuse report rate limit exceeded for IP",
+            ));
+        }
+        Err(_) => {
+            return Err(ApiErrorResponse::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Abuse report rate limiter unavailable",
+            ));
+        }
+    }
+
+    let normalized_reason_codes = state
+        .abuse_report_service
+        .normalize_reason_codes(&payload.reason_codes)
+        .map_err(ApiErrorResponse::bad_request)?;
+
+    if let Some(ref details) = payload.details
+        && details.chars().count() > state.config.report_details_max_chars
+    {
+        return Err(ApiErrorResponse::bad_request(format!(
+            "details exceeds max length {}",
+            state.config.report_details_max_chars
+        )));
+    }
+
+    if let Some(timestamp_seconds) = payload.timestamp_seconds
+        && timestamp_seconds < 0
+    {
+        return Err(ApiErrorResponse::bad_request(
+            "timestamp_seconds must be >= 0",
+        ));
+    }
+
+    let user_agent = headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
+
+    let outcome = state
+        .abuse_report_service
+        .submit_or_update_report(SubmitReportInput {
+            video_id,
+            reporter_user_id: user_id,
+            reason_codes: normalized_reason_codes.clone(),
+            details: payload.details.clone(),
+            timestamp_seconds: payload.timestamp_seconds,
+            client_ip: client_ip.to_string(),
+            user_agent: user_agent.clone(),
+        })
+        .await?;
+
+    let _ = state
+        .security_event_service
+        .record(
+            if outcome.created {
+                "abuse.report_submitted"
+            } else {
+                "abuse.report_updated"
+            },
+            Some(user_id),
+            &client_ip.to_string(),
+            None,
+            user_agent.as_deref(),
+            serde_json::json!({
+                "video_id": video_id,
+                "reason_codes": normalized_reason_codes,
+                "auto_quarantined": outcome.auto_quarantined,
+                "auto_rule": outcome.auto_rule.clone(),
+            }),
+        )
+        .await;
+    if outcome.auto_quarantined {
+        let _ = state
+            .security_event_service
+            .record(
+                "abuse.auto_quarantined",
+                Some(user_id),
+                &client_ip.to_string(),
+                None,
+                user_agent.as_deref(),
+                serde_json::json!({
+                    "video_id": video_id,
+                    "report_id": outcome.report.id,
+                    "auto_rule": outcome.auto_rule.clone(),
+                }),
+            )
+            .await;
+    }
+
+    let response = ReportVideoResponse {
+        created: outcome.created,
+        report: abuse_report_model_to_dto(outcome.report),
+    };
+
+    let status = if response.created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(response)))
+}
+
 fn looks_like_supported_video_container(prefix: &[u8]) -> bool {
     // ISO BMFF family: MP4/MOV/M4V/3GP usually has "ftyp" at bytes 4..8.
     if prefix.len() >= 8 && &prefix[4..8] == b"ftyp" {
@@ -675,6 +896,7 @@ async fn get_published_video_or_404(
 ) -> ApiResult<videos::Model> {
     videos::Entity::find_by_id(video_id)
         .filter(videos::Column::Status.eq("PUBLISHED"))
+        .filter(videos::Column::ModerationState.eq(abuse_report_service::MODERATION_VISIBLE))
         .one(db)
         .await?
         .ok_or_else(|| ApiErrorResponse::not_found("Video not found or not published"))
@@ -850,11 +1072,9 @@ pub async fn delete_video(
     txn.commit().await?;
 
     // 5. Invalidate feed cache ONLY if video was published
-    if was_published {
-        if let Err(e) = invalidate_feed_cache(&state).await {
-            tracing::warn!("Failed to invalidate feed cache after deletion: {:?}", e);
-            // Don't fail the request - cache will expire naturally
-        }
+    if was_published && let Err(e) = invalidate_feed_cache(&state).await {
+        tracing::warn!("Failed to invalidate feed cache after deletion: {:?}", e);
+        // Don't fail the request - cache will expire naturally
     }
 
     // 6. Invalidate User's Video List Cache (Always, as list includes drafts)
@@ -882,20 +1102,20 @@ pub async fn update_video_metadata(
     Json(payload): Json<UpdateVideoRequest>,
 ) -> ApiResult<StatusCode> {
     // 1. Validate payload
-    if let Some(ref title) = payload.title {
-        if title.len() > 200 {
-            return Err(ApiErrorResponse::bad_request(
-                "Title too long. Maximum 200 characters.",
-            ));
-        }
+    if let Some(ref title) = payload.title
+        && title.len() > 200
+    {
+        return Err(ApiErrorResponse::bad_request(
+            "Title too long. Maximum 200 characters.",
+        ));
     }
 
-    if let Some(ref description) = payload.description {
-        if description.len() > 2000 {
-            return Err(ApiErrorResponse::bad_request(
-                "Description too long. Maximum 2000 characters.",
-            ));
-        }
+    if let Some(ref description) = payload.description
+        && description.len() > 2000
+    {
+        return Err(ApiErrorResponse::bad_request(
+            "Description too long. Maximum 2000 characters.",
+        ));
     }
 
     // 2. Fetch video with ownership verification
@@ -929,9 +1149,17 @@ pub async fn update_video_metadata(
         }
     }
 
-    if let Some(is_anonymous) = payload.is_anonymous {
-        if active.is_anonymous.as_ref() != &is_anonymous {
-            active.is_anonymous = Set(is_anonymous);
+    if let Some(is_anonymous) = payload.is_anonymous
+        && active.is_anonymous.as_ref() != &is_anonymous
+    {
+        active.is_anonymous = Set(is_anonymous);
+        has_changes = true;
+    }
+
+    if let Some(is_nsfw) = payload.is_nsfw {
+        let next = Some(is_nsfw);
+        if active.is_nsfw.as_ref() != &next {
+            active.is_nsfw = Set(next);
             has_changes = true;
         }
     }
@@ -964,11 +1192,9 @@ pub async fn update_video_metadata(
     active.update(&state.db).await?;
 
     // 6. Invalidate feed cache ONLY if video was published
-    if was_published {
-        if let Err(e) = invalidate_feed_cache(&state).await {
-            tracing::warn!("Failed to invalidate feed cache after update: {:?}", e);
-            // Don't fail the request - cache will expire naturally
-        }
+    if was_published && let Err(e) = invalidate_feed_cache(&state).await {
+        tracing::warn!("Failed to invalidate feed cache after update: {:?}", e);
+        // Don't fail the request - cache will expire naturally
     }
 
     // 7. Invalidate User's Video List Cache
@@ -1032,6 +1258,7 @@ pub async fn download_video(
     let video = videos::Entity::find_by_id(video_id)
         .filter(videos::Column::DeletedAt.is_null())
         .filter(videos::Column::Status.eq("PUBLISHED"))
+        .filter(videos::Column::ModerationState.eq(abuse_report_service::MODERATION_VISIBLE))
         .one(&state.db)
         .await
         .map_err(|e| {
@@ -1148,6 +1375,7 @@ pub async fn refresh_download_url(
     let video = videos::Entity::find_by_id(video_id)
         .filter(videos::Column::DeletedAt.is_null())
         .filter(videos::Column::Status.eq("PUBLISHED"))
+        .filter(videos::Column::ModerationState.eq(abuse_report_service::MODERATION_VISIBLE))
         .one(&state.db)
         .await
         .map_err(|e| {
@@ -1233,30 +1461,27 @@ pub async fn create_bulk_download(
             .ok()
             .flatten();
 
-        if let Some(job_id_str) = existing_job_id {
-            if let Ok(job_id) = Uuid::parse_str(&job_id_str) {
-                // Return existing job
-                if let Ok(Some(existing_job)) = download_jobs::Entity::find_by_id(job_id)
-                    .one(&state.db)
-                    .await
-                {
-                    tracing::info!(
-                        "Returning existing bulk download job: {} (idempotency)",
-                        job_id
-                    );
-                    return Ok(Json(BulkDownloadJobResponse {
-                        job_id: existing_job.id,
-                        status: existing_job.status,
-                        video_count: existing_job.video_ids.len(),
-                        created_at: existing_job.created_at,
-                        download_url: existing_job.zip_url,
-                        zip_size_bytes: existing_job.zip_size_bytes,
-                        error_message: existing_job.error_message,
-                        completed_at: existing_job.completed_at,
-                        expires_at: existing_job.expires_at,
-                    }));
-                }
-            }
+        if let Some(job_id_str) = existing_job_id
+            && let Ok(job_id) = Uuid::parse_str(&job_id_str)
+            && let Ok(Some(existing_job)) = download_jobs::Entity::find_by_id(job_id)
+                .one(&state.db)
+                .await
+        {
+            tracing::info!(
+                "Returning existing bulk download job: {} (idempotency)",
+                job_id
+            );
+            return Ok(Json(BulkDownloadJobResponse {
+                job_id: existing_job.id,
+                status: existing_job.status,
+                video_count: existing_job.video_ids.len(),
+                created_at: existing_job.created_at,
+                download_url: existing_job.zip_url,
+                zip_size_bytes: existing_job.zip_size_bytes,
+                error_message: existing_job.error_message,
+                completed_at: existing_job.completed_at,
+                expires_at: existing_job.expires_at,
+            }));
         }
     }
 
@@ -1306,6 +1531,7 @@ pub async fn create_bulk_download(
         .filter(videos::Column::Id.is_in(req.video_ids.clone()))
         .filter(videos::Column::DeletedAt.is_null())
         .filter(videos::Column::Status.eq("PUBLISHED"))
+        .filter(videos::Column::ModerationState.eq(abuse_report_service::MODERATION_VISIBLE))
         .all(&state.db)
         .await
         .map_err(|e| {
@@ -1484,6 +1710,12 @@ fn validate_search_query(query: &str, config: &SearchConfig) -> Result<String, A
         return Err(ApiErrorResponse::bad_request("Query cannot be empty"));
     }
 
+    if normalized.chars().count() < 3 {
+        return Err(ApiErrorResponse::bad_request(
+            "Query must be at least 3 characters",
+        ));
+    }
+
     // 3. Character count limit (Unicode-aware)
     if normalized.chars().count() > config.max_query_chars {
         return Err(ApiErrorResponse::bad_request(format!(
@@ -1512,6 +1744,30 @@ fn validate_search_query(query: &str, config: &SearchConfig) -> Result<String, A
     }
 
     Ok(normalized)
+}
+
+fn build_search_like_pattern(query: &str) -> String {
+    format!("%{}%", query.to_lowercase())
+}
+
+fn build_relaxed_like_pattern(query: &str) -> Option<String> {
+    let mut tokens = query.split_whitespace();
+    let token = tokens.next()?;
+    if tokens.next().is_some() {
+        return None;
+    }
+
+    let token_len = token.chars().count();
+    if token_len < 5 {
+        return None;
+    }
+
+    let stem: String = token.chars().take(token_len - 1).collect();
+    if stem.chars().count() < 3 {
+        return None;
+    }
+
+    Some(format!("%{}%", stem.to_lowercase()))
 }
 
 /// Logs suspicious search queries for security monitoring
@@ -1657,6 +1913,8 @@ pub async fn search_videos_keyboard(
 
     let search_config = SearchConfig::from_config(&state.config);
     let query = validate_search_query(&params.q, &search_config)?;
+    let like_pattern = build_search_like_pattern(&query);
+    let relaxed_like_pattern = build_relaxed_like_pattern(&query);
     let limit = params
         .limit
         .max(1)
@@ -1668,8 +1926,20 @@ pub async fn search_videos_keyboard(
             r#"
             SELECT id, title, status, s3_bucket, s3_key, size_bytes, duration_seconds
             FROM videos
-            WHERE search_vector @@ plainto_tsquery('english', $1)
-              AND deleted_at IS NULL
+            WHERE deleted_at IS NULL
+              AND moderation_state = 'VISIBLE'
+              AND (
+                search_vector @@ plainto_tsquery('english', $1)
+                OR LOWER(COALESCE(title, '')) LIKE $5
+                OR LOWER(COALESCE(description, '')) LIKE $5
+                OR (
+                  $6 IS NOT NULL
+                  AND (
+                    LOWER(COALESCE(title, '')) LIKE $6
+                    OR LOWER(COALESCE(description, '')) LIKE $6
+                  )
+                )
+              )
               AND (UPPER(status) = 'PUBLISHED' OR UPPER(status) = 'COMPLETED' OR s3_bucket = $4)
             ORDER BY created_at DESC
             LIMIT $2 OFFSET $3
@@ -1679,8 +1949,20 @@ pub async fn search_videos_keyboard(
             r#"
             SELECT id, title, status, s3_bucket, s3_key, size_bytes, duration_seconds
             FROM videos
-            WHERE search_vector @@ plainto_tsquery('english', $1)
-              AND deleted_at IS NULL
+            WHERE deleted_at IS NULL
+              AND moderation_state = 'VISIBLE'
+              AND (
+                search_vector @@ plainto_tsquery('english', $1)
+                OR LOWER(COALESCE(title, '')) LIKE $5
+                OR LOWER(COALESCE(description, '')) LIKE $5
+                OR (
+                  $6 IS NOT NULL
+                  AND (
+                    LOWER(COALESCE(title, '')) LIKE $6
+                    OR LOWER(COALESCE(description, '')) LIKE $6
+                  )
+                )
+              )
               AND (UPPER(status) = 'PUBLISHED' OR UPPER(status) = 'COMPLETED' OR s3_bucket = $4)
             ORDER BY like_count DESC, created_at DESC
             LIMIT $2 OFFSET $3
@@ -1691,8 +1973,20 @@ pub async fn search_videos_keyboard(
             SELECT id, title, status, s3_bucket, s3_key, size_bytes, duration_seconds,
                    ts_rank(search_vector, plainto_tsquery('english', $1)) as rank
             FROM videos
-            WHERE search_vector @@ plainto_tsquery('english', $1)
-              AND deleted_at IS NULL
+            WHERE deleted_at IS NULL
+              AND moderation_state = 'VISIBLE'
+              AND (
+                search_vector @@ plainto_tsquery('english', $1)
+                OR LOWER(COALESCE(title, '')) LIKE $5
+                OR LOWER(COALESCE(description, '')) LIKE $5
+                OR (
+                  $6 IS NOT NULL
+                  AND (
+                    LOWER(COALESCE(title, '')) LIKE $6
+                    OR LOWER(COALESCE(description, '')) LIKE $6
+                  )
+                )
+              )
               AND (UPPER(status) = 'PUBLISHED' OR UPPER(status) = 'COMPLETED' OR s3_bucket = $4)
             ORDER BY rank DESC, like_count DESC
             LIMIT $2 OFFSET $3
@@ -1710,6 +2004,8 @@ pub async fn search_videos_keyboard(
                 (limit as i64).into(),
                 (offset as i64).into(),
                 state.config.minio_bucket_videos.clone().into(),
+                like_pattern.clone().into(),
+                relaxed_like_pattern.clone().into(),
             ],
         )),
     )
@@ -1772,6 +2068,9 @@ pub async fn search_videos(
 ) -> ApiResult<Json<Vec<VideoFeedItem>>> {
     let start_time = std::time::Instant::now();
     let search_config = SearchConfig::from_config(&state.config);
+    let include_nsfw = params
+        .include_nsfw
+        .ok_or_else(|| ApiErrorResponse::bad_request("include_nsfw query parameter is required"))?;
 
     // 1. RATE LIMITING (BEFORE cache - prevents bypass attacks)
     let search_key = format!("search:{}:rpm", user_id);
@@ -1800,6 +2099,8 @@ pub async fn search_videos(
 
     // 2. VALIDATE & NORMALIZE QUERY (ReDoS protection)
     let query = validate_search_query(&params.q, &search_config)?;
+    let like_pattern = build_search_like_pattern(&query);
+    let relaxed_like_pattern = build_relaxed_like_pattern(&query);
 
     // 3. Security logging for suspicious patterns
     let token_count = query.split_whitespace().count();
@@ -1815,69 +2116,113 @@ pub async fn search_videos(
     let limit = params.limit.min(100);
     let offset = params.offset;
     let cache_key = format!(
-        "search:cache:{}:v2:{}:{}:{}:{}",
+        "search:cache:{}:v5:{}:{}:{}:{}:{}",
         user_id, // CRITICAL: User-scoped cache
         query.to_lowercase(),
         params.sort,
+        include_nsfw,
         limit,
         offset
     );
 
     // Try cache AFTER rate limiting (prevents rate limit bypass)
-    if let Ok(mut redis_conn) = state.queue.get_conn().await {
-        if let Ok(cached_json) = redis::cmd("GET")
+    if let Ok(mut redis_conn) = state.queue.get_conn().await
+        && let Ok(cached_json) = redis::cmd("GET")
             .arg(&cache_key)
             .query_async::<String>(&mut redis_conn)
             .await
-        {
-            if let Ok(results) = serde_json::from_str::<Vec<VideoFeedItem>>(&cached_json) {
-                let duration_ms = start_time.elapsed().as_millis() as u64;
-                track_search_analytics(
-                    &state.queue,
-                    user_id,
-                    &query,
-                    results.len(),
-                    true, // cache hit
-                    duration_ms,
-                )
-                .await;
-                return Ok(Json(results));
-            }
-        }
+        && let Ok(results) = serde_json::from_str::<Vec<VideoFeedItem>>(&cached_json)
+    {
+        let duration_ms = start_time.elapsed().as_millis() as u64;
+        track_search_analytics(
+            &state.queue,
+            user_id,
+            &query,
+            results.len(),
+            true, // cache hit
+            duration_ms,
+        )
+        .await;
+        return Ok(Json(results));
     }
 
     // 5. BUILD SQL with parameterized queries
     let sql = match params.sort.as_str() {
         "recent" => {
             r#"
-            SELECT id, user_id, title, description, s3_bucket, s3_key, status, size_bytes, like_count, is_anonymous, created_at, updated_at
-            FROM videos
-            WHERE search_vector @@ plainto_tsquery('english', $1)
-            AND deleted_at IS NULL
-            AND (UPPER(status) = 'PUBLISHED' OR UPPER(status) = 'COMPLETED' OR s3_bucket = $4)
-            ORDER BY created_at DESC
+            SELECT v.id, v.user_id, v.title, v.description, v.s3_bucket, v.s3_key, v.status, v.size_bytes, v.like_count, v.is_anonymous, v.is_nsfw, v.created_at, v.updated_at,
+                   u.id AS uploader_id, u.username AS uploader_username
+            FROM videos v
+            LEFT JOIN users u ON u.id = v.user_id
+            WHERE v.deleted_at IS NULL
+            AND v.moderation_state = 'VISIBLE'
+            AND (
+              v.search_vector @@ plainto_tsquery('english', $1)
+              OR LOWER(COALESCE(v.title, '')) LIKE $5
+              OR LOWER(COALESCE(v.description, '')) LIKE $5
+              OR (
+                $6 IS NOT NULL
+                AND (
+                  LOWER(COALESCE(v.title, '')) LIKE $6
+                  OR LOWER(COALESCE(v.description, '')) LIKE $6
+                )
+              )
+            )
+            AND ($7::boolean = true OR v.is_nsfw = false)
+            AND (UPPER(v.status) = 'PUBLISHED' OR UPPER(v.status) = 'COMPLETED' OR v.s3_bucket = $4)
+            ORDER BY v.created_at DESC
             LIMIT $2 OFFSET $3
             "#
         }
         "popular" => {
             r#"
-            SELECT id, user_id, title, description, s3_bucket, s3_key, status, size_bytes, like_count, is_anonymous, created_at, updated_at
-            FROM videos
-            WHERE search_vector @@ plainto_tsquery('english', $1)
-            AND deleted_at IS NULL
-            AND (UPPER(status) = 'PUBLISHED' OR UPPER(status) = 'COMPLETED' OR s3_bucket = $4)
-            ORDER BY like_count DESC, created_at DESC
+            SELECT v.id, v.user_id, v.title, v.description, v.s3_bucket, v.s3_key, v.status, v.size_bytes, v.like_count, v.is_anonymous, v.is_nsfw, v.created_at, v.updated_at,
+                   u.id AS uploader_id, u.username AS uploader_username
+            FROM videos v
+            LEFT JOIN users u ON u.id = v.user_id
+            WHERE v.deleted_at IS NULL
+            AND v.moderation_state = 'VISIBLE'
+            AND (
+              v.search_vector @@ plainto_tsquery('english', $1)
+              OR LOWER(COALESCE(v.title, '')) LIKE $5
+              OR LOWER(COALESCE(v.description, '')) LIKE $5
+              OR (
+                $6 IS NOT NULL
+                AND (
+                  LOWER(COALESCE(v.title, '')) LIKE $6
+                  OR LOWER(COALESCE(v.description, '')) LIKE $6
+                )
+              )
+            )
+            AND ($7::boolean = true OR v.is_nsfw = false)
+            AND (UPPER(v.status) = 'PUBLISHED' OR UPPER(v.status) = 'COMPLETED' OR v.s3_bucket = $4)
+            ORDER BY v.like_count DESC, v.created_at DESC
             LIMIT $2 OFFSET $3
             "#
         }
         _ => {
             r#"
-            SELECT id, user_id, title, description, s3_bucket, s3_key, status, size_bytes, like_count, is_anonymous, created_at, updated_at,
-                   ts_rank(search_vector, plainto_tsquery('english', $1)) as rank
-            FROM videos
-            WHERE search_vector @@ plainto_tsquery('english', $1)
-            AND deleted_at IS NULL
-            AND (UPPER(status) = 'PUBLISHED' OR UPPER(status) = 'COMPLETED' OR s3_bucket = $4)
+            SELECT v.id, v.user_id, v.title, v.description, v.s3_bucket, v.s3_key, v.status, v.size_bytes, v.like_count, v.is_anonymous, v.is_nsfw, v.created_at, v.updated_at,
+                   u.id AS uploader_id, u.username AS uploader_username,
+                   ts_rank(v.search_vector, plainto_tsquery('english', $1)) as rank
+            FROM videos v
+            LEFT JOIN users u ON u.id = v.user_id
+            WHERE v.deleted_at IS NULL
+            AND v.moderation_state = 'VISIBLE'
+            AND (
+              v.search_vector @@ plainto_tsquery('english', $1)
+              OR LOWER(COALESCE(v.title, '')) LIKE $5
+              OR LOWER(COALESCE(v.description, '')) LIKE $5
+              OR (
+                $6 IS NOT NULL
+                AND (
+                  LOWER(COALESCE(v.title, '')) LIKE $6
+                  OR LOWER(COALESCE(v.description, '')) LIKE $6
+                )
+              )
+            )
+            AND ($7::boolean = true OR v.is_nsfw = false)
+            AND (UPPER(v.status) = 'PUBLISHED' OR UPPER(v.status) = 'COMPLETED' OR v.s3_bucket = $4)
             ORDER BY rank DESC, like_count DESC
             LIMIT $2 OFFSET $3
             "#
@@ -1893,6 +2238,9 @@ pub async fn search_videos(
             (limit as i64).into(),
             (offset as i64).into(),
             state.config.minio_bucket_videos.clone().into(),
+            like_pattern.clone().into(),
+            relaxed_like_pattern.clone().into(),
+            include_nsfw.into(),
         ],
     ));
 
@@ -1912,18 +2260,19 @@ pub async fn search_videos(
 
     // 7. CONVERT TO RESPONSE
     let mut feed = vec![];
-    let base_url = format!("{}", state.config.minio_public_endpoint);
+    let base_url = state.config.minio_public_endpoint.to_string();
     for row in results {
         let video_id: Uuid = row.try_get("", "id").map_err(|e| {
             tracing::error!("Failed to parse video ID: {:?}", e);
             ApiErrorResponse::internal_error("Failed to parse results")
         })?;
 
-        let uploader_id: Uuid = row.try_get("", "user_id")?;
         let is_anonymous: bool = row.try_get("", "is_anonymous")?;
         let status: String = row.try_get("", "status")?;
         let s3_bucket: String = row.try_get("", "s3_bucket")?;
         let s3_key: String = row.try_get("", "s3_key")?;
+        let uploader_id: Option<Uuid> = row.try_get("", "uploader_id").ok();
+        let uploader_username: Option<String> = row.try_get("", "uploader_username").ok();
         let is_published_like =
             status.eq_ignore_ascii_case("PUBLISHED") || status.eq_ignore_ascii_case("COMPLETED");
         let url_bucket = if is_published_like {
@@ -1932,28 +2281,28 @@ pub async fn search_videos(
             s3_bucket
         };
 
-        // Fetch uploader username if not anonymous
         let uploader = if is_anonymous {
             None
         } else {
-            shared::entities::users::Entity::find_by_id(uploader_id)
-                .one(&state.db)
-                .await
-                .ok()
-                .flatten()
-                .map(|u| UploaderInfo {
-                    id: u.id,
-                    username: u.username,
-                })
+            match (uploader_id, uploader_username) {
+                (Some(id), Some(username)) => Some(UploaderInfo { id, username }),
+                _ => None,
+            }
         };
+        let is_nsfw: Option<bool> = row.try_get("", "is_nsfw").unwrap_or(None);
 
         feed.push(VideoFeedItem {
             id: video_id,
             title: row.try_get("", "title")?,
             url: format!("{}/{}/{}", base_url, url_bucket, s3_key),
+            thumbnail_url: Some(format!(
+                "{}/{}/{}_thumb.jpg",
+                state.config.minio_public_endpoint, state.config.minio_bucket_videos, video_id
+            )),
             like_count: row.try_get("", "like_count")?,
             created_at: row.try_get("", "created_at")?,
             uploader,
+            is_nsfw: is_nsfw.unwrap_or(true),
             is_liked: false,
         });
     }
@@ -1980,15 +2329,15 @@ pub async fn search_videos(
     }
 
     // 8. CACHE RESULTS (user-scoped)
-    if let Ok(mut conn) = state.queue.get_conn().await {
-        if let Ok(json) = serde_json::to_string(&feed) {
-            let _: Result<(), redis::RedisError> = redis::cmd("SETEX")
-                .arg(&cache_key)
-                .arg(search_config.cache_ttl_secs)
-                .arg(json)
-                .query_async(&mut conn)
-                .await;
-        }
+    if let Ok(mut conn) = state.queue.get_conn().await
+        && let Ok(json) = serde_json::to_string(&feed)
+    {
+        let _: Result<(), redis::RedisError> = redis::cmd("SETEX")
+            .arg(&cache_key)
+            .arg(search_config.cache_ttl_secs)
+            .arg(json)
+            .query_async(&mut conn)
+            .await;
     }
 
     // 9. ANALYTICS TRACKING
@@ -2221,18 +2570,9 @@ pub async fn redeem_send_ticket_media(
 /// Bulk soft-delete videos owned by the authenticated user.
 pub async fn bulk_delete_videos(
     State(state): State<AppState>,
-    TypedHeader(auth): TypedHeader<Authorization<Bearer>>,
+    AuthUser(user_id): AuthUser,
     Json(payload): Json<BulkDeleteRequest>,
 ) -> ApiResult<()> {
-    let token = auth.token();
-    let claims = AuthService::validate_token(token, &state.config.jwt_secret)
-        .map_err(|_| ApiErrorResponse::unauthorized("Invalid token"))?;
-
-    if state.token_revocation.is_revoked(claims.jti).await {
-        return Err(ApiErrorResponse::unauthorized("Token revoked"));
-    }
-    let user_id = claims.sub;
-
     if payload.video_ids.is_empty() {
         return Ok(());
     }

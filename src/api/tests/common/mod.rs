@@ -1,7 +1,16 @@
+#![allow(dead_code)]
+
 use api::{
-    auth::revocation::TokenRevocationService, cache::feed_cache::FeedCacheService,
-    cache::otc_cache::OtcCacheService, create_router, realtime::hub::RealtimeHub,
-    services::rate_limiter::RateLimiter, state::AppState,
+    auth::revocation::TokenRevocationService,
+    cache::feed_cache::FeedCacheService,
+    cache::otc_cache::OtcCacheService,
+    create_router,
+    realtime::hub::RealtimeHub,
+    services::{
+        abuse_report_service::AbuseReportService, ban_service::BanService,
+        rate_limiter::RateLimiter, security_event_service::SecurityEventService,
+    },
+    state::AppState,
 };
 use sea_orm::Database;
 use sea_orm_migration::MigratorTrait;
@@ -26,6 +35,17 @@ pub struct TestApp {
     // Containers kept alive
     pub _pg_container: ContainerAsync<Postgres>,
     pub _redis_container: ContainerAsync<Redis>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TestAppOptions {
+    pub admin_enabled: bool,
+    pub read_only_mode_enabled: bool,
+    pub maintenance_mode_enabled: bool,
+    pub terms_url: Option<&'static str>,
+    pub terms_content: Option<&'static str>,
+    pub terms_content_type: Option<&'static str>,
+    pub terms_current_version: Option<&'static str>,
 }
 
 #[derive(Clone)]
@@ -91,14 +111,22 @@ impl StorageBackend for MockStorage {
 }
 
 pub async fn spawn_app() -> TestApp {
-    spawn_app_internal(false).await
+    spawn_app_internal(TestAppOptions::default()).await
 }
 
 pub async fn spawn_app_with_admin() -> TestApp {
-    spawn_app_internal(true).await
+    spawn_app_internal(TestAppOptions {
+        admin_enabled: true,
+        ..Default::default()
+    })
+    .await
 }
 
-async fn spawn_app_internal(admin_enabled: bool) -> TestApp {
+pub async fn spawn_app_with_options(options: TestAppOptions) -> TestApp {
+    spawn_app_internal(options).await
+}
+
+async fn spawn_app_internal(options: TestAppOptions) -> TestApp {
     // 1. Start Containers
     let pg_container: ContainerAsync<Postgres> = Postgres::default()
         .start()
@@ -123,7 +151,7 @@ async fn spawn_app_internal(admin_enabled: bool) -> TestApp {
         .await
         .expect("Failed to get Redis port");
     let redis_url = format!("redis://127.0.0.1:{}", redis_host_port);
-    let admin_public_keys = if admin_enabled {
+    let admin_public_keys = if options.admin_enabled {
         std::collections::HashMap::from([(
             TEST_ADMIN_KID.to_string(),
             TEST_ADMIN_PUBLIC_KEY_PEM.to_string(),
@@ -155,14 +183,31 @@ async fn spawn_app_internal(admin_enabled: bool) -> TestApp {
         access_token_ttl_secs: 900,
         refresh_token_ttl_days: 14,
         auth_require_username_on_google_signup: true,
+        terms_current_version: options.terms_current_version.unwrap_or("v1").to_string(),
+        terms_url: options
+            .terms_url
+            .map(|v| v.to_string())
+            .or_else(|| Some("https://example.com/terms".to_string())),
+        terms_content: options.terms_content.map(|v| v.to_string()),
+        terms_content_type: options.terms_content_type.map(|v| v.to_string()),
+        terms_content_sha256: options
+            .terms_content
+            .map(shared::config::Config::sha256_hex),
+        terms_effective_at: None,
+        terms_jurisdictions: vec!["US".to_string(), "TR".to_string(), "GLOBAL".to_string()],
+        terms_require_version_match: true,
+        terms_legal_contact_email: Some("legal@example.com".to_string()),
+        terms_abuse_contact_email: Some("abuse@example.com".to_string()),
+        read_only_mode_enabled: options.read_only_mode_enabled,
+        maintenance_mode_enabled: options.maintenance_mode_enabled,
         username_reserved_values: "admin,support".to_string(),
-        admin_api_enabled: admin_enabled,
-        admin_jwt_issuer: if admin_enabled {
+        admin_api_enabled: options.admin_enabled,
+        admin_jwt_issuer: if options.admin_enabled {
             Some(TEST_ADMIN_ISSUER.to_string())
         } else {
             None
         },
-        admin_jwt_audience: if admin_enabled {
+        admin_jwt_audience: if options.admin_enabled {
             Some(TEST_ADMIN_AUDIENCE.to_string())
         } else {
             None
@@ -191,12 +236,32 @@ async fn spawn_app_internal(admin_enabled: bool) -> TestApp {
         feed_cache_ttl_secs: 60,
         limit_feed_rpm: 100,
         rate_limit_window_secs: 3600,
-        ip_rate_limit_rpm: if admin_enabled { 5 } else { 100 },
+        ip_rate_limit_rpm: if options.admin_enabled { 5 } else { 100 },
         like_actions_rpm_limit: 60,
         like_actions_window_secs: 60,
         username_signup_rpm_per_ip: 20,
         username_signup_attempts_per_ticket: 10,
         username_update_rpm_per_user: 5,
+        read_only_status_rpm_per_user: 20,
+        maintenance_status_rpm_per_user: 20,
+        onboarding_status_rpm_per_user: 30,
+        onboarding_complete_rpm_per_user: 10,
+        report_create_rpm_per_user: 10,
+        report_create_rpm_per_ip: 20,
+        report_details_max_chars: 2000,
+        report_reason_max_count: 5,
+        auto_quarantine_enabled: true,
+        auto_quarantine_window_secs: 1800,
+        auto_quarantine_severe_distinct_reporters: 2,
+        security_events_retention_days: 180,
+        security_events_purge_interval_secs: 86400,
+        abuse_report_retention_days: 365,
+        abuse_report_purge_interval_secs: 86400,
+        ban_user_cache_negative_ttl_secs: 60,
+        ban_user_cache_permanent_ttl_secs: 21600,
+        ban_ip_cache_negative_ttl_secs: 60,
+        ban_ip_cache_permanent_ttl_secs: 21600,
+        ban_ip_verdict_ttl_secs: 60,
         search_max_tokens: 50,
         search_max_token_length: 50,
         search_max_query_chars: 200,
@@ -234,6 +299,15 @@ async fn spawn_app_internal(admin_enabled: bool) -> TestApp {
     let otc_cache = OtcCacheService::new(queue.clone());
     let rate_limiter = RateLimiter::new(queue.clone());
     let otc_rate_limiter = api::middleware::rate_limit::RateLimiter::new(5, 60);
+    let config_arc = Arc::new(config.clone());
+    let ban_service = BanService::new(db.clone(), queue.clone(), config_arc.clone());
+    let abuse_report_service = AbuseReportService::new(
+        db.clone(),
+        queue.clone(),
+        feed_cache.clone(),
+        config_arc.clone(),
+    );
+    let security_event_service = SecurityEventService::new(db.clone(), queue.clone(), config_arc);
 
     let state = AppState {
         db: db.clone(),
@@ -250,6 +324,9 @@ async fn spawn_app_internal(admin_enabled: bool) -> TestApp {
             config.video_ws_max_conn_global,
             config.video_ws_send_buffer,
         ),
+        ban_service,
+        abuse_report_service,
+        security_event_service,
     };
 
     // 5. App Router
@@ -285,7 +362,7 @@ impl TestApp {
     pub async fn login_as_dev(&self, username: &str, email: &str) -> String {
         let client = reqwest::Client::new();
         let response = client
-            .post(&format!("{}/auth/dev/login", self.address))
+            .post(format!("{}/auth/dev/login", self.address))
             .json(&serde_json::json!({
                 "username": username,
                 "email": email
@@ -317,11 +394,12 @@ impl TestApp {
     ) -> (String, String) {
         let client = reqwest::Client::new();
         let response = client
-            .post(&format!("{}/videos/init", self.address))
+            .post(format!("{}/videos/init", self.address))
             .header("Authorization", format!("Bearer {}", token))
             .json(&serde_json::json!({
                 "filename": filename,
-                "size_bytes": size_bytes
+                "size_bytes": size_bytes,
+                "is_nsfw": false
             }))
             .send()
             .await
@@ -350,7 +428,7 @@ impl TestApp {
     pub async fn confirm_upload(&self, token: &str, video_id: &str) {
         let client = reqwest::Client::new();
         let response = client
-            .post(&format!("{}/videos/{}/confirm", self.address, video_id))
+            .post(format!("{}/videos/{}/confirm", self.address, video_id))
             .header("Authorization", format!("Bearer {}", token))
             .send()
             .await
@@ -383,6 +461,12 @@ impl TestApp {
             duration_seconds: Set(None),
             like_count: Set(0),
             is_anonymous: Set(is_anonymous),
+            is_nsfw: Set(Some(false)),
+            moderation_state: Set("VISIBLE".to_string()),
+            moderation_reason_code: Set(None),
+            moderation_updated_at: Set(None),
+            moderation_updated_by: Set(None),
+            moderation_source_report_id: Set(None),
             processing_error_code: Set(None),
             processing_error_message: Set(None),
             failed_at: Set(None),

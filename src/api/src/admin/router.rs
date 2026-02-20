@@ -30,8 +30,54 @@ pub fn admin_router() -> Router<AppState> {
             "/refresh-tokens/:id/hard",
             delete(handlers::hard_delete_refresh_token),
         )
+        .route(
+            "/users/:user_id/ban",
+            get(handlers::get_user_ban)
+                .put(handlers::upsert_user_ban)
+                .delete(handlers::delete_user_ban),
+        )
+        .route(
+            "/ip-bans",
+            get(handlers::get_ip_ban)
+                .put(handlers::upsert_ip_ban)
+                .delete(handlers::delete_ip_ban),
+        )
+        .route(
+            "/security/users/:user_id/ips",
+            get(handlers::investigate_user_ips),
+        )
+        .route(
+            "/security/ips/:ip/users",
+            get(handlers::investigate_ip_users),
+        )
+        .route("/abuse/reports", get(handlers::list_abuse_reports))
+        .route(
+            "/abuse/reports/:report_id",
+            get(handlers::get_abuse_report).post(handlers::resolve_abuse_report),
+        )
+        .route(
+            "/moderation/videos/:video_id/action",
+            post(handlers::admin_video_moderation_action),
+        )
+        .route("/system/terms", get(handlers::admin_get_terms))
+        .route(
+            "/system/read-only",
+            get(handlers::admin_get_read_only_status),
+        )
+        .route(
+            "/system/maintenance",
+            get(handlers::admin_get_maintenance_status),
+        )
         // Full regular-user surface via run-as-user admin endpoints.
         .route("/users/:user_id/feed", get(handlers::as_user_feed))
+        .route(
+            "/users/:user_id/onboarding/status",
+            get(handlers::as_user_onboarding_status),
+        )
+        .route(
+            "/users/:user_id/onboarding/complete",
+            post(handlers::as_user_onboarding_complete),
+        )
         .route(
             "/users/:user_id/profile",
             get(handlers::as_user_get_profile),
@@ -96,6 +142,10 @@ pub fn admin_router() -> Router<AppState> {
         .route(
             "/users/:user_id/videos/:id",
             delete(handlers::as_user_delete_video).patch(handlers::as_user_update_video_metadata),
+        )
+        .route(
+            "/users/:user_id/videos/:id/report",
+            post(handlers::as_user_report_video),
         )
         .route(
             "/users/:user_id/videos/bulk-delete",

@@ -119,6 +119,33 @@ impl RateLimiter {
         }
     }
 
+    /// Strict variant of check_and_increment.
+    /// Returns an error if Redis is unavailable (fail-closed).
+    pub async fn check_and_increment_strict(
+        &self,
+        key: &str,
+        max_count: u64,
+        window_secs: usize,
+    ) -> Result<Result<u64, u64>> {
+        if self.bypass {
+            return Ok(Ok(u64::MAX));
+        }
+
+        let mut conn = self.queue.get_conn().await?;
+        let current: Option<u64> = conn.get(key).await?;
+        let count = current.unwrap_or(0);
+        if count >= max_count {
+            return Ok(Err(count));
+        }
+
+        let new_count: u64 = conn.incr(key, 1).await?;
+        if new_count == 1 {
+            let _: () = conn.expire(key, window_secs as i64).await?;
+        }
+
+        Ok(Ok(max_count - new_count))
+    }
+
     /// Get the current count for a rate limit key.
     pub async fn get_count(&self, key: &str) -> Result<u64> {
         if self.bypass {
@@ -204,5 +231,35 @@ impl RateLimiter {
     /// Generate key for keyboard send nonce replay prevention
     pub fn keyboard_nonce_key(user_id: &uuid::Uuid, nonce: &str) -> String {
         format!("keyboard:nonce:{}:{}", user_id, nonce)
+    }
+
+    /// Generate key for read-only mode status checks per user
+    pub fn read_only_status_user_key(user_id: &uuid::Uuid) -> String {
+        format!("ratelimit:system:read_only_status:user:{}", user_id)
+    }
+
+    /// Generate key for maintenance mode status checks per user
+    pub fn maintenance_status_user_key(user_id: &uuid::Uuid) -> String {
+        format!("ratelimit:system:maintenance_status:user:{}", user_id)
+    }
+
+    /// Generate key for onboarding status checks per user
+    pub fn onboarding_status_user_key(user_id: &uuid::Uuid) -> String {
+        format!("ratelimit:onboarding:status:user:{}", user_id)
+    }
+
+    /// Generate key for onboarding completion attempts per user
+    pub fn onboarding_complete_user_key(user_id: &uuid::Uuid) -> String {
+        format!("ratelimit:onboarding:complete:user:{}", user_id)
+    }
+
+    /// Generate key for abuse report submission per user
+    pub fn report_create_user_key(user_id: &uuid::Uuid) -> String {
+        format!("ratelimit:abuse:report:create:user:{}", user_id)
+    }
+
+    /// Generate key for abuse report submission per IP
+    pub fn report_create_ip_key(ip: &str) -> String {
+        format!("ratelimit:abuse:report:create:ip:{}", ip)
     }
 }

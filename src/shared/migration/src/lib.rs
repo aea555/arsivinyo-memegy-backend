@@ -15,6 +15,10 @@ mod m20260207_010000_create_extension_sessions_and_send_tickets;
 mod m20260207_020000_add_keyboard_duration_and_indexes;
 mod m20260208_000001_add_username_normalization;
 mod m20260208_000002_create_admin_audit_logs;
+mod m20260219_000001_add_user_onboarding_terms;
+mod m20260219_000002_add_video_is_nsfw;
+mod m20260220_000001_create_bans_and_security_events;
+mod m20260220_000002_create_abuse_reports_and_video_moderation;
 
 pub struct Migrator;
 
@@ -37,6 +41,10 @@ impl MigratorTrait for Migrator {
             Box::new(m20260207_020000_add_keyboard_duration_and_indexes::Migration),
             Box::new(m20260208_000001_add_username_normalization::Migration),
             Box::new(m20260208_000002_create_admin_audit_logs::Migration),
+            Box::new(m20260219_000001_add_user_onboarding_terms::Migration),
+            Box::new(m20260219_000002_add_video_is_nsfw::Migration),
+            Box::new(m20260220_000001_create_bans_and_security_events::Migration),
+            Box::new(m20260220_000002_create_abuse_reports_and_video_moderation::Migration),
         ]
     }
 }
