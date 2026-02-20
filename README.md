@@ -178,6 +178,8 @@ This will:
 - Deployment workflow builds/pushes images in CI, then VPS runs `pull` + `up -d --no-build --remove-orphans`, so production no longer compiles on-host.
 - Production requires `BACKEND_IMAGE` in `.env.production` (managed automatically by the deploy workflow).
 - Nightly production DB backups are handled by `.github/workflows/backup-production-db.yml` (plus manual `workflow_dispatch` support).
+- MinIO snapshot backups to Google Drive are handled by `.github/workflows/backup-production-minio.yml` on a self-hosted `backup-laptop` runner.
+- Operational setup/restore instructions live in `docs/ops/minio-backup-runbook.md`.
 
 ## License
 MIT

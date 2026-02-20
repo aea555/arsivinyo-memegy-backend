@@ -1,0 +1,239 @@
+name: Backup Production MinIO
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: "Operation to run"
+        required: true
+        default: backup
+        type: choice
+        options:
+          - backup
+          - check
+          - both
+      force_backup:
+        description: "Ignore the 72h cadence gate"
+        required: false
+        default: false
+        type: boolean
+      dry_run:
+        description: "Run without remote mutations (rclone/restic dry-run)"
+        required: false
+        default: false
+        type: boolean
+      mirror_only:
+        description: "Sync MinIO mirror only (skip snapshot + retention)"
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: "10 2 * * *"
+    - cron: "40 3 * * 0"
+
+jobs:
+  backup_minio:
+    runs-on: [self-hosted, backup-laptop]
+    timeout-minutes: 360
+    concurrency:
+      group: backup-production-minio
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve execution mode
+        id: mode
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MODE="backup"
+          FORCE_FLAG=""
+          DRY_FLAG=""
+          MIRROR_ONLY_FLAG=""
+
+          if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
+            if [[ "${{ github.event.schedule }}" == "40 3 * * 0" ]]; then
+              MODE="check"
+            fi
+          elif [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            MODE="${{ inputs.operation }}"
+            if [[ "${{ inputs.force_backup }}" == "true" ]]; then
+              FORCE_FLAG="--force"
+            fi
+            if [[ "${{ inputs.dry_run }}" == "true" ]]; then
+              DRY_FLAG="--dry-run"
+            fi
+            if [[ "${{ inputs.mirror_only }}" == "true" ]]; then
+              MIRROR_ONLY_FLAG="--mirror-only"
+            fi
+          fi
+
+          echo "mode=${MODE}" >> "$GITHUB_OUTPUT"
+          echo "force_flag=${FORCE_FLAG}" >> "$GITHUB_OUTPUT"
+          echo "dry_flag=${DRY_FLAG}" >> "$GITHUB_OUTPUT"
+          echo "mirror_only_flag=${MIRROR_ONLY_FLAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate required tools on runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          for bin in ssh curl rclone restic jq flock ionice nice; do
+            command -v "$bin" >/dev/null 2>&1 || {
+              echo "Missing required binary: $bin" >&2
+              exit 1
+            }
+          done
+
+      - name: Prepare SSH key
+        if: steps.mode.outputs.mode != 'check'
+        shell: bash
+        env:
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+        run: |
+          set -euo pipefail
+
+          key_value="${VPS_SSH_KEY:-${SSH_KEY:-}}"
+          if [[ -z "${key_value}" ]]; then
+            echo "VPS_SSH_KEY or SSH_KEY secret must be set" >&2
+            exit 1
+          fi
+
+          key_file="${RUNNER_TEMP}/memegy_backup_ssh_key"
+          printf '%s\n' "${key_value}" > "${key_file}"
+          chmod 600 "${key_file}"
+          echo "VPS_SSH_KEY_FILE=${key_file}" >> "$GITHUB_ENV"
+
+      - name: Prepare rclone config
+        shell: bash
+        env:
+          RCLONE_CONFIG_SECRET: ${{ secrets.RCLONE_CONFIG }}
+          RCLONE_CONFIG_PATH: ${{ vars.RCLONE_CONFIG_PATH }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${RCLONE_CONFIG_SECRET:-}" ]]; then
+            config_file="${RUNNER_TEMP}/rclone.conf"
+            printf '%s\n' "${RCLONE_CONFIG_SECRET}" > "${config_file}"
+            chmod 600 "${config_file}"
+            echo "RCLONE_CONFIG=${config_file}" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          if [[ -n "${RCLONE_CONFIG_PATH:-}" ]]; then
+            echo "RCLONE_CONFIG=${RCLONE_CONFIG_PATH}" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          echo "RCLONE_CONFIG secret or RCLONE_CONFIG_PATH variable must be provided" >&2
+          exit 1
+
+      - name: Run MinIO backup/check script
+        shell: bash
+        env:
+          VPS_SSH_HOST: ${{ secrets.VPS_SSH_HOST }}
+          VPS_SSH_USER: ${{ secrets.VPS_SSH_USER }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+
+          VPS_SSH_PORT: ${{ vars.VPS_SSH_PORT }}
+          SSH_TUNNEL_LOCAL_PORT: ${{ vars.MINIO_BACKUP_LOCAL_PORT }}
+
+          MINIO_ACCESS_KEY: ${{ secrets.MINIO_BACKUP_ACCESS_KEY }}
+          MINIO_SECRET_KEY: ${{ secrets.MINIO_BACKUP_SECRET_KEY }}
+          MINIO_ROOT_USER: ${{ secrets.MINIO_ROOT_USER }}
+          MINIO_ROOT_PASSWORD: ${{ secrets.MINIO_ROOT_PASSWORD }}
+
+          RESTIC_REPOSITORY: ${{ vars.MINIO_RESTIC_REPOSITORY }}
+          RESTIC_PASSWORD: ${{ secrets.RESTIC_PASSWORD }}
+
+          BACKUP_STATE_DIR: ${{ vars.MINIO_BACKUP_STATE_DIR }}
+          MINIO_MIRROR_DIR: ${{ vars.MINIO_BACKUP_MIRROR_DIR }}
+          BACKUP_MIN_INTERVAL_SECS: ${{ vars.MINIO_BACKUP_MIN_INTERVAL_SECS }}
+          RETENTION_KEEP_WITHIN: ${{ vars.MINIO_BACKUP_RETENTION_KEEP_WITHIN }}
+          RESTIC_CHECK_READ_DATA_SUBSET: ${{ vars.MINIO_BACKUP_CHECK_READ_DATA_SUBSET }}
+
+          RCLONE_TRANSFERS: ${{ vars.MINIO_BACKUP_RCLONE_TRANSFERS }}
+          RCLONE_CHECKERS: ${{ vars.MINIO_BACKUP_RCLONE_CHECKERS }}
+          RCLONE_BWLIMIT: ${{ vars.MINIO_BACKUP_RCLONE_BWLIMIT }}
+          RCLONE_RETRIES: ${{ vars.MINIO_BACKUP_RCLONE_RETRIES }}
+          RCLONE_LOW_LEVEL_RETRIES: ${{ vars.MINIO_BACKUP_RCLONE_LOW_LEVEL_RETRIES }}
+
+          NICE_LEVEL: ${{ vars.MINIO_BACKUP_NICE_LEVEL }}
+          IONICE_CLASS: ${{ vars.MINIO_BACKUP_IONICE_CLASS }}
+          IONICE_LEVEL: ${{ vars.MINIO_BACKUP_IONICE_LEVEL }}
+        run: |
+          set -euo pipefail
+
+          export VPS_SSH_HOST="${VPS_SSH_HOST:-${SSH_HOST:-}}"
+          export VPS_SSH_USER="${VPS_SSH_USER:-${SSH_USER:-}}"
+
+          export VPS_SSH_PORT="${VPS_SSH_PORT:-22}"
+          export SSH_TUNNEL_LOCAL_PORT="${SSH_TUNNEL_LOCAL_PORT:-19000}"
+          export MINIO_ENDPOINT="http://127.0.0.1:${SSH_TUNNEL_LOCAL_PORT}"
+
+          export MINIO_ACCESS_KEY="${MINIO_ACCESS_KEY:-${MINIO_ROOT_USER:-}}"
+          export MINIO_SECRET_KEY="${MINIO_SECRET_KEY:-${MINIO_ROOT_PASSWORD:-}}"
+
+          export BACKUP_STATE_DIR="${BACKUP_STATE_DIR:-$HOME/.local/state/memegy-backup}"
+          export MINIO_MIRROR_DIR="${MINIO_MIRROR_DIR:-$HOME/memegy-backups/minio-mirror}"
+          export BACKUP_MIN_INTERVAL_SECS="${BACKUP_MIN_INTERVAL_SECS:-259200}"
+          export RETENTION_KEEP_WITHIN="${RETENTION_KEEP_WITHIN:-90d}"
+          export RESTIC_CHECK_READ_DATA_SUBSET="${RESTIC_CHECK_READ_DATA_SUBSET:-5%}"
+
+          export RCLONE_TRANSFERS="${RCLONE_TRANSFERS:-4}"
+          export RCLONE_CHECKERS="${RCLONE_CHECKERS:-8}"
+          export RCLONE_BWLIMIT="${RCLONE_BWLIMIT:-off}"
+          export RCLONE_RETRIES="${RCLONE_RETRIES:-3}"
+          export RCLONE_LOW_LEVEL_RETRIES="${RCLONE_LOW_LEVEL_RETRIES:-6}"
+
+          export NICE_LEVEL="${NICE_LEVEL:-10}"
+          export IONICE_CLASS="${IONICE_CLASS:-2}"
+          export IONICE_LEVEL="${IONICE_LEVEL:-7}"
+
+          [[ -n "${RESTIC_REPOSITORY:-}" ]] || {
+            echo "Repository variable MINIO_RESTIC_REPOSITORY is required" >&2
+            exit 1
+          }
+          [[ -n "${RESTIC_PASSWORD:-}" ]] || {
+            echo "RESTIC_PASSWORD secret is required" >&2
+            exit 1
+          }
+
+          args=(--mode "${{ steps.mode.outputs.mode }}")
+          if [[ -n "${{ steps.mode.outputs.force_flag }}" ]]; then
+            args+=("${{ steps.mode.outputs.force_flag }}")
+          fi
+          if [[ -n "${{ steps.mode.outputs.dry_flag }}" ]]; then
+            args+=("${{ steps.mode.outputs.dry_flag }}")
+          fi
+          if [[ -n "${{ steps.mode.outputs.mirror_only_flag }}" ]]; then
+            args+=("${{ steps.mode.outputs.mirror_only_flag }}")
+          fi
+
+          ./scripts/backup/minio_snapshot_backup.sh "${args[@]}"
+
+      - name: Upload backup manifests
+        if: always()
+        shell: bash
+        env:
+          MINIO_BACKUP_STATE_DIR: ${{ vars.MINIO_BACKUP_STATE_DIR }}
+        run: |
+          set -euo pipefail
+          state_dir="${MINIO_BACKUP_STATE_DIR:-$HOME/.local/state/memegy-backup}"
+          out_dir="${RUNNER_TEMP}/minio-backup-manifests"
+          mkdir -p "$out_dir"
+          if [[ -d "${state_dir}/manifests" ]]; then
+            cp -f "${state_dir}/manifests/"*.json "$out_dir/" 2>/dev/null || true
+          fi
+
+      - name: Upload backup manifests artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: minio-backup-manifests-${{ github.run_id }}
+          path: ${{ runner.temp }}/minio-backup-manifests/*.json
+          if-no-files-found: warn
