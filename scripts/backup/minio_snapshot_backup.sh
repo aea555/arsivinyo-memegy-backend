@@ -204,7 +204,6 @@ ensure_restic_repo() {
 list_buckets() {
   rclone lsf ":s3:" \
     --s3-provider "Minio" \
-    --s3-env-auth=false \
     --s3-access-key-id "$MINIO_ACCESS_KEY" \
     --s3-secret-access-key "$MINIO_SECRET_KEY" \
     --s3-endpoint "$MINIO_ENDPOINT" \
@@ -231,7 +230,6 @@ sync_bucket() {
   run_with_priority rclone sync \
     ":s3:${bucket}" "$destination" \
     --s3-provider "Minio" \
-    --s3-env-auth=false \
     --s3-access-key-id "$MINIO_ACCESS_KEY" \
     --s3-secret-access-key "$MINIO_SECRET_KEY" \
     --s3-endpoint "$MINIO_ENDPOINT" \
