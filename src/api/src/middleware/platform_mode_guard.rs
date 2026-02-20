@@ -5,7 +5,13 @@ use axum::{
     response::Response,
 };
 
-use crate::{error::ApiErrorResponse, state::AppState};
+use crate::{
+    error::ApiErrorResponse,
+    services::{
+        ban_service::BanEnforcementError, client_ip::extract_client_ip_from_headers_and_extensions,
+    },
+    state::AppState,
+};
 
 fn is_admin_path(path: &str) -> bool {
     path == "/admin" || path.starts_with("/admin/")
@@ -23,22 +29,6 @@ fn is_maintenance_allowlisted(method: &Method, path: &str) -> bool {
     )
 }
 
-fn is_confirm_upload_path(method: &Method, path: &str) -> bool {
-    if method != Method::POST {
-        return false;
-    }
-
-    let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
-    parts.len() == 3 && parts[0] == "videos" && parts[2] == "confirm" && !parts[1].is_empty()
-}
-
-fn is_read_only_blocked_path(method: &Method, path: &str) -> bool {
-    matches!(
-        (method, path),
-        (&Method::POST, "/videos/init") | (&Method::POST, "/videos/init/anonymous")
-    ) || is_confirm_upload_path(method, path)
-}
-
 pub async fn platform_mode_guard(
     State(state): State<AppState>,
     req: Request,
@@ -47,22 +37,34 @@ pub async fn platform_mode_guard(
     let path = req.uri().path();
     let method = req.method();
 
-    if is_admin_path(path) {
-        return Ok(next.run(req).await);
-    }
-
-    if state.config.maintenance_mode_enabled && !is_maintenance_allowlisted(method, path) {
+    if state.config.maintenance_mode_enabled
+        && !is_admin_path(path)
+        && !is_maintenance_allowlisted(method, path)
+    {
         return Err(ApiErrorResponse::new(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             "maintenance_mode_enabled",
         ));
     }
 
-    if state.config.read_only_mode_enabled && is_read_only_blocked_path(method, path) {
-        return Err(ApiErrorResponse::new(
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            "read_only_mode_enabled",
-        ));
+    let client_ip = extract_client_ip_from_headers_and_extensions(
+        req.headers(),
+        req.extensions(),
+        &state.config.environment,
+        state.config.require_cloudflare_headers,
+    )?;
+
+    match state.ban_service.ensure_ip_not_banned(client_ip).await {
+        Ok(()) => {}
+        Err(BanEnforcementError::Banned) => {
+            return Err(ApiErrorResponse::forbidden("ip_banned"));
+        }
+        Err(BanEnforcementError::Unavailable) => {
+            return Err(ApiErrorResponse::new(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "ban_check_unavailable",
+            ));
+        }
     }
 
     Ok(next.run(req).await)

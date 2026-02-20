@@ -1,9 +1,16 @@
 #![allow(dead_code)]
 
 use api::{
-    auth::revocation::TokenRevocationService, cache::feed_cache::FeedCacheService,
-    cache::otc_cache::OtcCacheService, create_router, realtime::hub::RealtimeHub,
-    services::rate_limiter::RateLimiter, state::AppState,
+    auth::revocation::TokenRevocationService,
+    cache::feed_cache::FeedCacheService,
+    cache::otc_cache::OtcCacheService,
+    create_router,
+    realtime::hub::RealtimeHub,
+    services::{
+        ban_service::BanService, rate_limiter::RateLimiter,
+        security_event_service::SecurityEventService,
+    },
+    state::AppState,
 };
 use sea_orm::Database;
 use sea_orm_migration::MigratorTrait;
@@ -234,6 +241,13 @@ async fn spawn_app_internal(options: TestAppOptions) -> TestApp {
         maintenance_status_rpm_per_user: 20,
         onboarding_status_rpm_per_user: 30,
         onboarding_complete_rpm_per_user: 10,
+        security_events_retention_days: 180,
+        security_events_purge_interval_secs: 86400,
+        ban_user_cache_negative_ttl_secs: 60,
+        ban_user_cache_permanent_ttl_secs: 21600,
+        ban_ip_cache_negative_ttl_secs: 60,
+        ban_ip_cache_permanent_ttl_secs: 21600,
+        ban_ip_verdict_ttl_secs: 60,
         search_max_tokens: 50,
         search_max_token_length: 50,
         search_max_query_chars: 200,
@@ -271,6 +285,9 @@ async fn spawn_app_internal(options: TestAppOptions) -> TestApp {
     let otc_cache = OtcCacheService::new(queue.clone());
     let rate_limiter = RateLimiter::new(queue.clone());
     let otc_rate_limiter = api::middleware::rate_limit::RateLimiter::new(5, 60);
+    let config_arc = Arc::new(config.clone());
+    let ban_service = BanService::new(db.clone(), queue.clone(), config_arc.clone());
+    let security_event_service = SecurityEventService::new(db.clone(), queue.clone(), config_arc);
 
     let state = AppState {
         db: db.clone(),
@@ -287,6 +304,8 @@ async fn spawn_app_internal(options: TestAppOptions) -> TestApp {
             config.video_ws_max_conn_global,
             config.video_ws_send_buffer,
         ),
+        ban_service,
+        security_event_service,
     };
 
     // 5. App Router

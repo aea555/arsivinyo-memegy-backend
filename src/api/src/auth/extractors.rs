@@ -1,8 +1,4 @@
-use axum::{
-    async_trait,
-    extract::FromRequestParts,
-    http::{StatusCode, request::Parts},
-};
+use axum::{async_trait, extract::FromRequestParts, http::request::Parts};
 use axum_extra::{
     TypedHeader,
     headers::{Authorization, authorization::Bearer},
@@ -15,7 +11,7 @@ use shared::{
 };
 use uuid::Uuid;
 
-use crate::state::AppState;
+use crate::{error::ApiErrorResponse, services::ban_service::BanEnforcementError, state::AppState};
 
 pub struct SessionUser(pub Uuid);
 pub struct AuthUser(pub Uuid);
@@ -36,19 +32,35 @@ impl ExtensionAuth {
 pub type AuthorizedUser = AuthUser;
 pub type AuthorizedExtension = ExtensionAuth;
 
-async fn extract_session_user_id(parts: &mut Parts, state: &AppState) -> Result<Uuid, StatusCode> {
+async fn extract_session_user_id(
+    parts: &mut Parts,
+    state: &AppState,
+) -> Result<Uuid, ApiErrorResponse> {
     let TypedHeader(Authorization(bearer)) =
         TypedHeader::<Authorization<Bearer>>::from_request_parts(parts, state)
             .await
-            .map_err(|_| StatusCode::UNAUTHORIZED)?;
+            .map_err(|_| ApiErrorResponse::unauthorized("Missing or invalid token"))?;
 
     let token = bearer.token();
-    let claims =
-        verify_jwt(token, &state.config.jwt_secret).map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let claims = verify_jwt(token, &state.config.jwt_secret)
+        .map_err(|_| ApiErrorResponse::unauthorized("Invalid token"))?;
 
     if state.token_revocation.is_revoked(claims.jti).await {
         tracing::debug!("Rejected revoked token: {}", claims.jti);
-        return Err(StatusCode::UNAUTHORIZED);
+        return Err(ApiErrorResponse::unauthorized("Token revoked"));
+    }
+
+    match state.ban_service.ensure_user_not_banned(claims.sub).await {
+        Ok(()) => {}
+        Err(BanEnforcementError::Banned) => {
+            return Err(ApiErrorResponse::forbidden("user_banned"));
+        }
+        Err(BanEnforcementError::Unavailable) => {
+            return Err(ApiErrorResponse::new(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "ban_check_unavailable",
+            ));
+        }
     }
 
     Ok(claims.sub)
@@ -57,15 +69,28 @@ async fn extract_session_user_id(parts: &mut Parts, state: &AppState) -> Result<
 pub async fn ensure_user_onboarding_complete(
     state: &AppState,
     user_id: Uuid,
-) -> Result<(), StatusCode> {
+) -> Result<(), ApiErrorResponse> {
+    match state.ban_service.ensure_user_not_banned(user_id).await {
+        Ok(()) => {}
+        Err(BanEnforcementError::Banned) => {
+            return Err(ApiErrorResponse::forbidden("user_banned"));
+        }
+        Err(BanEnforcementError::Unavailable) => {
+            return Err(ApiErrorResponse::new(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "ban_check_unavailable",
+            ));
+        }
+    }
+
     let user = users::Entity::find_by_id(user_id)
         .one(&state.db)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::UNAUTHORIZED)?;
+        .map_err(ApiErrorResponse::db_error)?
+        .ok_or_else(|| ApiErrorResponse::unauthorized("User not found"))?;
 
     if user.deleted_at.is_some() {
-        return Err(StatusCode::UNAUTHORIZED);
+        return Err(ApiErrorResponse::unauthorized("Invalid token"));
     }
 
     let age_confirmed = user.age_confirmed_at.is_some();
@@ -76,13 +101,13 @@ pub async fn ensure_user_onboarding_complete(
     if age_confirmed && terms_accepted {
         Ok(())
     } else {
-        Err(StatusCode::FORBIDDEN)
+        Err(ApiErrorResponse::forbidden("onboarding_required"))
     }
 }
 
 #[async_trait]
 impl FromRequestParts<AppState> for SessionUser {
-    type Rejection = StatusCode;
+    type Rejection = ApiErrorResponse;
 
     async fn from_request_parts(
         parts: &mut Parts,
@@ -94,7 +119,7 @@ impl FromRequestParts<AppState> for SessionUser {
 
 #[async_trait]
 impl FromRequestParts<AppState> for AuthUser {
-    type Rejection = StatusCode;
+    type Rejection = ApiErrorResponse;
 
     async fn from_request_parts(
         parts: &mut Parts,
@@ -108,7 +133,7 @@ impl FromRequestParts<AppState> for AuthUser {
 
 #[async_trait]
 impl FromRequestParts<AppState> for ExtensionAuth {
-    type Rejection = StatusCode;
+    type Rejection = ApiErrorResponse;
 
     async fn from_request_parts(
         parts: &mut Parts,
@@ -117,21 +142,34 @@ impl FromRequestParts<AppState> for ExtensionAuth {
         let TypedHeader(Authorization(bearer)) =
             TypedHeader::<Authorization<Bearer>>::from_request_parts(parts, state)
                 .await
-                .map_err(|_| StatusCode::UNAUTHORIZED)?;
+                .map_err(|_| ApiErrorResponse::unauthorized("Missing or invalid token"))?;
 
         let claims = verify_extension_jwt(bearer.token(), &state.config.jwt_secret)
-            .map_err(|_| StatusCode::UNAUTHORIZED)?;
+            .map_err(|_| ApiErrorResponse::unauthorized("Invalid token"))?;
 
         let session = extension_sessions::Entity::find_by_id(claims.jti)
             .filter(extension_sessions::Column::UserId.eq(claims.sub))
             .filter(extension_sessions::Column::RevokedAt.is_null())
             .one(&state.db)
             .await
-            .map_err(|_| StatusCode::UNAUTHORIZED)?
-            .ok_or(StatusCode::UNAUTHORIZED)?;
+            .map_err(ApiErrorResponse::db_error)?
+            .ok_or_else(|| ApiErrorResponse::unauthorized("Invalid session"))?;
 
         if session.expires_at <= Utc::now() {
-            return Err(StatusCode::UNAUTHORIZED);
+            return Err(ApiErrorResponse::unauthorized("Session expired"));
+        }
+
+        match state.ban_service.ensure_user_not_banned(claims.sub).await {
+            Ok(()) => {}
+            Err(BanEnforcementError::Banned) => {
+                return Err(ApiErrorResponse::forbidden("user_banned"));
+            }
+            Err(BanEnforcementError::Unavailable) => {
+                return Err(ApiErrorResponse::new(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "ban_check_unavailable",
+                ));
+            }
         }
 
         ensure_user_onboarding_complete(state, claims.sub).await?;

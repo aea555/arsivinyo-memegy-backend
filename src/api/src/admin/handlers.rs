@@ -26,7 +26,11 @@ use crate::{
     },
     error::{ApiErrorResponse, ApiResult},
     state::AppState,
-    users::{dtos::UpdateUsernameRequest, handlers::video_model_to_user_dto},
+    system::handlers::{ModeStatusResponse, TermsResponse},
+    users::{
+        dtos::{CompleteOnboardingRequest, OnboardingStatusResponse, UpdateUsernameRequest},
+        handlers::{build_onboarding_status, video_model_to_user_dto},
+    },
     videos::{
         dtos::{
             BulkDeleteRequest, BulkDownloadJobResponse, BulkDownloadStatus,
@@ -46,7 +50,9 @@ use shared::security::create_access_token;
 use super::{
     dtos::{
         AdminEnvelope, AdminResponseMeta, AdminTableInfo, GetRowResponse, HardDeleteResponse,
-        ListRowsQuery, ListRowsResponse, ListTablesResponse,
+        InvestigationQuery, InvestigationResponse, IpBanQuery, IpBanStatusResponse,
+        IpBanUpsertRequest, IpUserInvestigationItem, ListRowsQuery, ListRowsResponse,
+        ListTablesResponse, UpsertBanRequest, UserBanStatusResponse, UserIpInvestigationItem,
     },
     extractors::AdminPrincipal,
 };
@@ -108,6 +114,21 @@ const TABLE_SPECS: &[TableSpec] = &[
     },
     TableSpec {
         name: "admin_audit_logs",
+        pk: TablePrimaryKey::Single("id"),
+        order_by: "created_at DESC, id DESC",
+    },
+    TableSpec {
+        name: "user_bans",
+        pk: TablePrimaryKey::Single("id"),
+        order_by: "created_at DESC, id DESC",
+    },
+    TableSpec {
+        name: "ip_bans",
+        pk: TablePrimaryKey::Single("id"),
+        order_by: "created_at DESC, id DESC",
+    },
+    TableSpec {
+        name: "security_events",
         pk: TablePrimaryKey::Single("id"),
         order_by: "created_at DESC, id DESC",
     },
@@ -808,6 +829,8 @@ pub async fn hard_delete_refresh_token(
 
 fn admin_passthrough_state(state: &AppState) -> AppState {
     let mut cfg = (*state.config).clone();
+    cfg.read_only_mode_enabled = false;
+    cfg.maintenance_mode_enabled = false;
     cfg.limit_feed_rpm = u64::MAX / 4;
     cfg.limit_upload_bytes_hourly = i64::MAX / 4;
     cfg.like_actions_rpm_limit = u64::MAX / 4;
@@ -1442,6 +1465,13 @@ pub async fn as_user_update_video_metadata(
         active.is_anonymous = Set(is_anonymous);
         has_changes = true;
     }
+    if let Some(is_nsfw) = payload.is_nsfw {
+        let next = Some(is_nsfw);
+        if active.is_nsfw.as_ref() != &next {
+            active.is_nsfw = Set(next);
+            has_changes = true;
+        }
+    }
 
     if has_changes {
         active.updated_at = Set(Utc::now().into());
@@ -1881,4 +1911,398 @@ pub async fn as_user_my_videos_ws(
     )
     .await;
     result
+}
+
+fn map_user_ban_status(
+    user_id: Uuid,
+    ban: Option<shared::entities::user_bans::Model>,
+) -> UserBanStatusResponse {
+    match ban {
+        Some(model) => UserBanStatusResponse {
+            user_id,
+            active: true,
+            banned_until: model.banned_until.map(|dt| dt.with_timezone(&Utc)),
+            reason: model.reason,
+            created_at: Some(model.created_at.with_timezone(&Utc)),
+            created_by_admin_sub: Some(model.created_by_admin_sub),
+        },
+        None => UserBanStatusResponse {
+            user_id,
+            active: false,
+            banned_until: None,
+            reason: None,
+            created_at: None,
+            created_by_admin_sub: None,
+        },
+    }
+}
+
+fn map_ip_ban_status(
+    target: String,
+    target_kind: String,
+    ban: Option<shared::entities::ip_bans::Model>,
+) -> IpBanStatusResponse {
+    match ban {
+        Some(model) => IpBanStatusResponse {
+            target,
+            target_kind,
+            active: true,
+            banned_until: model.banned_until.map(|dt| dt.with_timezone(&Utc)),
+            reason: model.reason,
+            created_at: Some(model.created_at.with_timezone(&Utc)),
+            created_by_admin_sub: Some(model.created_by_admin_sub),
+        },
+        None => IpBanStatusResponse {
+            target,
+            target_kind,
+            active: false,
+            banned_until: None,
+            reason: None,
+            created_at: None,
+            created_by_admin_sub: None,
+        },
+    }
+}
+
+pub async fn get_user_ban(
+    State(state): State<AppState>,
+    principal: AdminPrincipal,
+    headers: HeaderMap,
+    Path(user_id): Path<Uuid>,
+) -> ApiResult<Json<UserBanStatusResponse>> {
+    let active = state
+        .ban_service
+        .get_active_user_ban(user_id)
+        .await
+        .map_err(ApiErrorResponse::from)?;
+    audit_as_user_action(
+        &state,
+        &principal,
+        &headers,
+        "get_user_ban",
+        user_id,
+        "success",
+        json!({ "active": active.is_some() }),
+    )
+    .await;
+    Ok(Json(map_user_ban_status(user_id, active)))
+}
+
+pub async fn upsert_user_ban(
+    State(state): State<AppState>,
+    principal: AdminPrincipal,
+    headers: HeaderMap,
+    Path(user_id): Path<Uuid>,
+    Json(payload): Json<UpsertBanRequest>,
+) -> ApiResult<Json<UserBanStatusResponse>> {
+    if let Some(expires_at) = payload.expires_at
+        && expires_at <= Utc::now()
+    {
+        return Err(ApiErrorResponse::bad_request(
+            "expires_at must be in the future",
+        ));
+    }
+
+    let active = state
+        .ban_service
+        .upsert_user_ban(
+            user_id,
+            payload.expires_at.map(|dt| dt.fixed_offset()),
+            payload.reason.clone(),
+            &principal.sub,
+        )
+        .await
+        .map_err(ApiErrorResponse::from)?;
+
+    AuthService::logout_all(&state.db, user_id)
+        .await
+        .map_err(ApiErrorResponse::from)?;
+    AuthService::revoke_extension_sessions(&state.db, user_id)
+        .await
+        .map_err(ApiErrorResponse::from)?;
+
+    audit_as_user_action(
+        &state,
+        &principal,
+        &headers,
+        "upsert_user_ban",
+        user_id,
+        "success",
+        json!({ "banned_until": active.banned_until }),
+    )
+    .await;
+    Ok(Json(map_user_ban_status(user_id, Some(active))))
+}
+
+pub async fn delete_user_ban(
+    State(state): State<AppState>,
+    principal: AdminPrincipal,
+    headers: HeaderMap,
+    Path(user_id): Path<Uuid>,
+) -> ApiResult<Json<UserBanStatusResponse>> {
+    let lifted = state
+        .ban_service
+        .lift_user_ban(user_id, &principal.sub, None)
+        .await
+        .map_err(ApiErrorResponse::from)?;
+    audit_as_user_action(
+        &state,
+        &principal,
+        &headers,
+        "delete_user_ban",
+        user_id,
+        "success",
+        json!({ "lifted": lifted }),
+    )
+    .await;
+    Ok(Json(map_user_ban_status(user_id, None)))
+}
+
+pub async fn get_ip_ban(
+    State(state): State<AppState>,
+    _principal: AdminPrincipal,
+    Query(query): Query<IpBanQuery>,
+) -> ApiResult<Json<IpBanStatusResponse>> {
+    let target = crate::services::ban_service::ParsedIpTarget::parse(&query.target)
+        .ok_or_else(|| ApiErrorResponse::bad_request("invalid ip/cidr target"))?;
+    let active = state
+        .ban_service
+        .get_active_ip_ban(&target)
+        .await
+        .map_err(ApiErrorResponse::from)?;
+    Ok(Json(map_ip_ban_status(
+        target.canonical(),
+        target.target_kind().to_string(),
+        active,
+    )))
+}
+
+pub async fn upsert_ip_ban(
+    State(state): State<AppState>,
+    principal: AdminPrincipal,
+    Json(payload): Json<IpBanUpsertRequest>,
+) -> ApiResult<Json<IpBanStatusResponse>> {
+    if let Some(expires_at) = payload.expires_at
+        && expires_at <= Utc::now()
+    {
+        return Err(ApiErrorResponse::bad_request(
+            "expires_at must be in the future",
+        ));
+    }
+    let target = crate::services::ban_service::ParsedIpTarget::parse(&payload.target)
+        .ok_or_else(|| ApiErrorResponse::bad_request("invalid ip/cidr target"))?;
+    let active = state
+        .ban_service
+        .upsert_ip_ban(
+            &target,
+            payload.expires_at.map(|dt| dt.fixed_offset()),
+            payload.reason.clone(),
+            &principal.sub,
+        )
+        .await
+        .map_err(ApiErrorResponse::from)?;
+    Ok(Json(map_ip_ban_status(
+        target.canonical(),
+        target.target_kind().to_string(),
+        Some(active),
+    )))
+}
+
+pub async fn delete_ip_ban(
+    State(state): State<AppState>,
+    principal: AdminPrincipal,
+    Query(query): Query<IpBanQuery>,
+) -> ApiResult<Json<IpBanStatusResponse>> {
+    let target = crate::services::ban_service::ParsedIpTarget::parse(&query.target)
+        .ok_or_else(|| ApiErrorResponse::bad_request("invalid ip/cidr target"))?;
+    state
+        .ban_service
+        .lift_ip_ban(&target, &principal.sub, None)
+        .await
+        .map_err(ApiErrorResponse::from)?;
+    Ok(Json(map_ip_ban_status(
+        target.canonical(),
+        target.target_kind().to_string(),
+        None,
+    )))
+}
+
+pub async fn investigate_user_ips(
+    State(state): State<AppState>,
+    _principal: AdminPrincipal,
+    Path(user_id): Path<Uuid>,
+    Query(query): Query<InvestigationQuery>,
+) -> ApiResult<Json<InvestigationResponse<UserIpInvestigationItem>>> {
+    let page = state
+        .security_event_service
+        .recent_ips_for_user(
+            user_id,
+            query.window_days.unwrap_or(30),
+            query.limit.unwrap_or(50),
+            query.cursor.unwrap_or(0),
+        )
+        .await
+        .map_err(ApiErrorResponse::from)?;
+    let items = page
+        .items
+        .into_iter()
+        .map(|item| UserIpInvestigationItem {
+            ip: item.ip,
+            last_seen: item.last_seen.with_timezone(&Utc),
+            event_count: item.event_count,
+        })
+        .collect();
+    Ok(Json(InvestigationResponse {
+        items,
+        next_cursor: page.next_cursor,
+    }))
+}
+
+pub async fn investigate_ip_users(
+    State(state): State<AppState>,
+    _principal: AdminPrincipal,
+    Path(ip): Path<String>,
+    Query(query): Query<InvestigationQuery>,
+) -> ApiResult<Json<InvestigationResponse<IpUserInvestigationItem>>> {
+    let _ = ip
+        .parse::<std::net::IpAddr>()
+        .map_err(|_| ApiErrorResponse::bad_request("invalid ip"))?;
+    let page = state
+        .security_event_service
+        .recent_users_for_ip(
+            &ip,
+            query.window_days.unwrap_or(30),
+            query.limit.unwrap_or(50),
+            query.cursor.unwrap_or(0),
+        )
+        .await
+        .map_err(ApiErrorResponse::from)?;
+    let items = page
+        .items
+        .into_iter()
+        .map(|item| IpUserInvestigationItem {
+            user_id: item.user_id,
+            last_seen: item.last_seen.with_timezone(&Utc),
+            event_count: item.event_count,
+        })
+        .collect();
+    Ok(Json(InvestigationResponse {
+        items,
+        next_cursor: page.next_cursor,
+    }))
+}
+
+pub async fn admin_get_terms(
+    State(state): State<AppState>,
+    _principal: AdminPrincipal,
+) -> ApiResult<Json<TermsResponse>> {
+    Ok(Json(TermsResponse {
+        version: state.config.terms_current_version.clone(),
+        url: state.config.terms_url.clone(),
+        content_type: state.config.terms_content_type.clone(),
+        content_sha256: state.config.terms_content_sha256.clone(),
+        content: state.config.terms_content.clone(),
+    }))
+}
+
+pub async fn admin_get_read_only_status(
+    State(state): State<AppState>,
+    _principal: AdminPrincipal,
+) -> ApiResult<Json<ModeStatusResponse>> {
+    Ok(Json(ModeStatusResponse {
+        enabled: state.config.read_only_mode_enabled,
+    }))
+}
+
+pub async fn admin_get_maintenance_status(
+    State(state): State<AppState>,
+    _principal: AdminPrincipal,
+) -> ApiResult<Json<ModeStatusResponse>> {
+    Ok(Json(ModeStatusResponse {
+        enabled: state.config.maintenance_mode_enabled,
+    }))
+}
+
+pub async fn as_user_onboarding_status(
+    State(state): State<AppState>,
+    principal: AdminPrincipal,
+    headers: HeaderMap,
+    Path(user_id): Path<Uuid>,
+) -> ApiResult<Json<OnboardingStatusResponse>> {
+    let user = users::Entity::find_by_id(user_id)
+        .one(&state.db)
+        .await
+        .map_err(ApiErrorResponse::db_error)?
+        .ok_or_else(|| ApiErrorResponse::not_found("User not found"))?;
+    let status = build_onboarding_status(&user, &state.config);
+    audit_as_user_action(
+        &state,
+        &principal,
+        &headers,
+        "as_user_onboarding_status",
+        user_id,
+        "success",
+        json!({}),
+    )
+    .await;
+    Ok(Json(status))
+}
+
+pub async fn as_user_onboarding_complete(
+    State(state): State<AppState>,
+    principal: AdminPrincipal,
+    headers: HeaderMap,
+    Path(user_id): Path<Uuid>,
+    Json(payload): Json<CompleteOnboardingRequest>,
+) -> ApiResult<Json<OnboardingStatusResponse>> {
+    if !payload.age_confirmed {
+        return Err(ApiErrorResponse::bad_request("age_confirmed must be true"));
+    }
+    if payload.terms_version != state.config.terms_current_version {
+        return Err(ApiErrorResponse::bad_request(format!(
+            "terms_version must match current version: {}",
+            state.config.terms_current_version
+        )));
+    }
+
+    let user = users::Entity::find_by_id(user_id)
+        .one(&state.db)
+        .await
+        .map_err(ApiErrorResponse::db_error)?
+        .ok_or_else(|| ApiErrorResponse::not_found("User not found"))?;
+
+    let now = Utc::now().fixed_offset();
+    let already_complete = user.age_confirmed_at.is_some()
+        && user.terms_accepted_at.is_some()
+        && user.terms_accepted_version.as_deref()
+            == Some(state.config.terms_current_version.as_str());
+    let updated = if already_complete {
+        user
+    } else {
+        let mut active: users::ActiveModel = user.into();
+        active.age_confirmed_at = Set(Some(now));
+        active.terms_accepted_at = Set(Some(now));
+        active.terms_accepted_version = Set(Some(state.config.terms_current_version.clone()));
+        active
+            .update(&state.db)
+            .await
+            .map_err(ApiErrorResponse::db_error)?
+    };
+
+    if let Ok(mut conn) = state.queue.get_conn().await {
+        let _: Result<(), _> = conn.del(format!("user:{}:profile", user_id)).await;
+    }
+
+    audit_as_user_action(
+        &state,
+        &principal,
+        &headers,
+        "as_user_onboarding_complete",
+        user_id,
+        "success",
+        json!({ "already_complete": already_complete }),
+    )
+    .await;
+
+    Ok(Json(build_onboarding_status(&updated, &state.config)))
 }

@@ -3,8 +3,11 @@
 pub use super::admin_audit_logs::Entity as AdminAuditLogs;
 pub use super::download_jobs::Entity as DownloadJobs;
 pub use super::extension_sessions::Entity as ExtensionSessions;
+pub use super::ip_bans::Entity as IpBans;
 pub use super::likes::Entity as Likes;
 pub use super::refresh_tokens::Entity as RefreshTokens;
+pub use super::security_events::Entity as SecurityEvents;
 pub use super::send_tickets::Entity as SendTickets;
+pub use super::user_bans::Entity as UserBans;
 pub use super::users::Entity as Users;
 pub use super::videos::Entity as Videos;

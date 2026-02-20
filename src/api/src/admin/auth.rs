@@ -1,6 +1,6 @@
 use std::{collections::HashSet, net::IpAddr, str::FromStr, time::UNIX_EPOCH};
 
-use axum::http::{StatusCode, request::Parts};
+use axum::http::StatusCode;
 use ipnet::IpNet;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::Deserialize;
@@ -33,51 +33,6 @@ pub struct AdminClaims {
     pub nbf: usize,
     pub exp: usize,
     pub role: String,
-}
-
-pub fn extract_client_ip(
-    parts: &Parts,
-    environment: &str,
-    require_cloudflare_headers: bool,
-) -> Result<IpAddr, ApiErrorResponse> {
-    if environment == "production" || require_cloudflare_headers {
-        if let Some(cf_ip) = parts.headers.get("cf-connecting-ip") {
-            let ip = cf_ip
-                .to_str()
-                .ok()
-                .and_then(|v| v.parse::<IpAddr>().ok())
-                .ok_or_else(|| {
-                    ApiErrorResponse::bad_request("Malformed CF-Connecting-IP header")
-                })?;
-            return Ok(ip);
-        }
-        return Err(ApiErrorResponse::forbidden(
-            "Direct access not allowed. Use Cloudflare endpoint.",
-        ));
-    }
-
-    if let Some(cf_ip) = parts.headers.get("cf-connecting-ip")
-        && let Ok(ip) = cf_ip.to_str().unwrap_or_default().parse::<IpAddr>()
-    {
-        return Ok(ip);
-    }
-    if let Some(real_ip) = parts.headers.get("x-real-ip")
-        && let Ok(ip) = real_ip.to_str().unwrap_or_default().parse::<IpAddr>()
-    {
-        return Ok(ip);
-    }
-    if let Some(forwarded) = parts.headers.get("x-forwarded-for")
-        && let Some(first_ip) = forwarded
-            .to_str()
-            .ok()
-            .and_then(|raw| raw.split(',').next())
-            .map(str::trim)
-        && let Ok(ip) = first_ip.parse::<IpAddr>()
-    {
-        return Ok(ip);
-    }
-
-    Ok("127.0.0.1".parse().expect("valid localhost IP"))
 }
 
 fn enforce_ip_allowlist(configured: &str, ip: IpAddr) -> Result<(), ApiErrorResponse> {

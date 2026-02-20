@@ -80,6 +80,13 @@ pub struct Config {
     pub maintenance_status_rpm_per_user: u64,
     pub onboarding_status_rpm_per_user: u64,
     pub onboarding_complete_rpm_per_user: u64,
+    pub security_events_retention_days: i64,
+    pub security_events_purge_interval_secs: u64,
+    pub ban_user_cache_negative_ttl_secs: usize,
+    pub ban_user_cache_permanent_ttl_secs: usize,
+    pub ban_ip_cache_negative_ttl_secs: usize,
+    pub ban_ip_cache_permanent_ttl_secs: usize,
+    pub ban_ip_verdict_ttl_secs: usize,
 
     // OTC Rate Limiting
     pub otc_rate_limit_max_attempts: u32,
@@ -382,6 +389,27 @@ impl Config {
                 .parse()?,
             onboarding_complete_rpm_per_user: env::var("ONBOARDING_COMPLETE_RPM_PER_USER")
                 .unwrap_or_else(|_| "10".to_string())
+                .parse()?,
+            security_events_retention_days: env::var("SECURITY_EVENTS_RETENTION_DAYS")
+                .unwrap_or_else(|_| "180".to_string())
+                .parse()?,
+            security_events_purge_interval_secs: env::var("SECURITY_EVENTS_PURGE_INTERVAL_SECS")
+                .unwrap_or_else(|_| "86400".to_string())
+                .parse()?,
+            ban_user_cache_negative_ttl_secs: env::var("BAN_USER_CACHE_NEGATIVE_TTL_SECS")
+                .unwrap_or_else(|_| "60".to_string())
+                .parse()?,
+            ban_user_cache_permanent_ttl_secs: env::var("BAN_USER_CACHE_PERMANENT_TTL_SECS")
+                .unwrap_or_else(|_| "21600".to_string())
+                .parse()?,
+            ban_ip_cache_negative_ttl_secs: env::var("BAN_IP_CACHE_NEGATIVE_TTL_SECS")
+                .unwrap_or_else(|_| "60".to_string())
+                .parse()?,
+            ban_ip_cache_permanent_ttl_secs: env::var("BAN_IP_CACHE_PERMANENT_TTL_SECS")
+                .unwrap_or_else(|_| "21600".to_string())
+                .parse()?,
+            ban_ip_verdict_ttl_secs: env::var("BAN_IP_VERDICT_TTL_SECS")
+                .unwrap_or_else(|_| "60".to_string())
                 .parse()?,
 
             // OTC Rate Limiting

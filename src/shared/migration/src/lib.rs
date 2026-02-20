@@ -17,6 +17,7 @@ mod m20260208_000001_add_username_normalization;
 mod m20260208_000002_create_admin_audit_logs;
 mod m20260219_000001_add_user_onboarding_terms;
 mod m20260219_000002_add_video_is_nsfw;
+mod m20260220_000001_create_bans_and_security_events;
 
 pub struct Migrator;
 
@@ -41,6 +42,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260208_000002_create_admin_audit_logs::Migration),
             Box::new(m20260219_000001_add_user_onboarding_terms::Migration),
             Box::new(m20260219_000002_add_video_is_nsfw::Migration),
+            Box::new(m20260220_000001_create_bans_and_security_events::Migration),
         ]
     }
 }

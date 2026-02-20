@@ -1,6 +1,6 @@
 use axum::{
     Json,
-    extract::{ConnectInfo, Query, State},
+    extract::{Query, State},
     http::StatusCode,
     response::IntoResponse,
 };
@@ -16,6 +16,7 @@ use crate::{
     cache::otc_cache::{OtcAuthTokenData, OtcSignupRequiredData, OtcTokenData},
     error::{ApiErrorResponse, ApiResult},
     metrics::*,
+    services::{ban_service::BanEnforcementError, client_ip::ClientIp},
     state::AppState,
     users::username::{
         USERNAME_MAX_LEN, USERNAME_MIN_LEN, USERNAME_PATTERN, suggest_username_from_google_name,
@@ -202,6 +203,7 @@ fn oauth_client(state: &AppState) -> BasicClient {
 
 pub async fn google_login(
     State(state): State<AppState>,
+    ClientIp(client_ip): ClientIp,
     jar: CookieJar,
     Query(query): Query<GoogleLoginQuery>,
 ) -> Result<(CookieJar, impl IntoResponse), ApiErrorResponse> {
@@ -293,6 +295,20 @@ pub async fn google_login(
         has_pkce: code_verifier.is_some(),
         timestamp: Utc::now(),
     });
+    let _ = state
+        .security_event_service
+        .record(
+            "auth.google_login_initiated",
+            None,
+            &client_ip.to_string(),
+            None,
+            None,
+            serde_json::json!({
+                "source": source,
+                "has_pkce": code_verifier.is_some(),
+            }),
+        )
+        .await;
 
     // Build state parameter: "csrf:source[:challenge]"
     let csrf = CsrfToken::new_random();
@@ -337,6 +353,7 @@ pub async fn google_login(
 
 pub async fn google_callback(
     State(state): State<AppState>,
+    ClientIp(client_ip): ClientIp,
     jar: CookieJar,
     Query(query): Query<GoogleCallbackQuery>,
 ) -> ApiResult<impl IntoResponse> {
@@ -362,6 +379,17 @@ pub async fn google_callback(
             source: None,
             timestamp: Utc::now(),
         });
+        let _ = state
+            .security_event_service
+            .record(
+                "auth.google_callback_failure",
+                None,
+                &client_ip.to_string(),
+                None,
+                None,
+                serde_json::json!({ "reason": "csrf_mismatch" }),
+            )
+            .await;
         return Err(ApiErrorResponse::bad_request("Invalid state"));
     }
 
@@ -439,12 +467,39 @@ pub async fn google_callback(
             tracing::error!("Existing login failed: {:?}", e);
             ApiErrorResponse::internal_error("Failed to complete authentication")
         })? {
+        match state.ban_service.ensure_user_not_banned(user.id).await {
+            Ok(()) => {}
+            Err(BanEnforcementError::Banned) => {
+                return Err(ApiErrorResponse::forbidden("user_banned"));
+            }
+            Err(BanEnforcementError::Unavailable) => {
+                return Err(ApiErrorResponse::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "ban_check_unavailable",
+                ));
+            }
+        }
+
         log_audit_event(AuditEvent::OAuthCallbackSuccess {
             user_id: user.id,
             source: oauth_state.source.clone(),
             pkce_validated,
             timestamp: Utc::now(),
         });
+        let _ = state
+            .security_event_service
+            .record(
+                "auth.google_callback_success",
+                Some(user.id),
+                &client_ip.to_string(),
+                None,
+                None,
+                serde_json::json!({
+                    "source": oauth_state.source.clone(),
+                    "pkce_validated": pkce_validated,
+                }),
+            )
+            .await;
 
         OtcTokenData::AuthSuccess(OtcAuthTokenData {
             access_token,
@@ -555,8 +610,25 @@ pub async fn google_callback(
 
 pub async fn refresh_token(
     State(state): State<AppState>,
+    ClientIp(client_ip): ClientIp,
     Json(payload): Json<RefreshRequest>,
 ) -> ApiResult<Json<RefreshResponse>> {
+    let claims =
+        AuthService::get_claims_ignoring_expiry(&payload.access_token, &state.config.jwt_secret)
+            .map_err(|_| ApiErrorResponse::unauthorized("Invalid or expired token"))?;
+    match state.ban_service.ensure_user_not_banned(claims.sub).await {
+        Ok(()) => {}
+        Err(BanEnforcementError::Banned) => {
+            return Err(ApiErrorResponse::forbidden("user_banned"));
+        }
+        Err(BanEnforcementError::Unavailable) => {
+            return Err(ApiErrorResponse::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ban_check_unavailable",
+            ));
+        }
+    }
+
     let (new_access_token, new_refresh_token) = match AuthService::refresh_access_token(
         &state.db,
         &state.token_revocation,
@@ -591,6 +663,18 @@ pub async fn refresh_token(
         }
     };
 
+    let _ = state
+        .security_event_service
+        .record(
+            "auth.refresh",
+            Some(claims.sub),
+            &client_ip.to_string(),
+            None,
+            None,
+            serde_json::json!({}),
+        )
+        .await;
+
     Ok(Json(RefreshResponse {
         access_token: new_access_token,
         refresh_token: new_refresh_token,
@@ -599,7 +683,7 @@ pub async fn refresh_token(
 
 pub async fn signup_complete(
     State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    ClientIp(client_ip): ClientIp,
     Json(payload): Json<SignupCompleteRequest>,
 ) -> ApiResult<Json<AuthResponse>> {
     if !payload.age_confirmed {
@@ -620,7 +704,7 @@ pub async fn signup_complete(
         ApiErrorResponse::bad_request(e.message())
     })?;
 
-    let client_ip = addr.ip().to_string();
+    let client_ip = client_ip.to_string();
     let ip_rate_key =
         crate::services::rate_limiter::RateLimiter::username_signup_ip_key(&client_ip);
     match state
@@ -780,6 +864,17 @@ pub async fn signup_complete(
             user_id: response.user.id,
             timestamp: Utc::now(),
         });
+        let _ = state
+            .security_event_service
+            .record(
+                "auth.signup_complete",
+                Some(response.user.id),
+                &client_ip,
+                None,
+                None,
+                serde_json::json!({ "signup_ticket": payload.signup_ticket }),
+            )
+            .await;
 
         Ok(Json(response))
     }
@@ -858,6 +953,7 @@ pub async fn create_extension_session(
 
 pub async fn logout(
     State(state): State<AppState>,
+    ClientIp(client_ip): ClientIp,
     TypedHeader(auth): TypedHeader<Authorization<Bearer>>,
 ) -> ApiResult<()> {
     let claims = AuthService::validate_token(auth.token(), &state.config.jwt_secret)
@@ -867,6 +963,18 @@ pub async fn logout(
         return Err(ApiErrorResponse::unauthorized("Token revoked"));
     }
     let user_id = claims.sub;
+    match state.ban_service.ensure_user_not_banned(user_id).await {
+        Ok(()) => {}
+        Err(BanEnforcementError::Banned) => {
+            return Err(ApiErrorResponse::forbidden("user_banned"));
+        }
+        Err(BanEnforcementError::Unavailable) => {
+            return Err(ApiErrorResponse::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ban_check_unavailable",
+            ));
+        }
+    }
 
     AuthService::logout_all(&state.db, user_id).await?;
     AuthService::revoke_extension_sessions(&state.db, user_id).await?;
@@ -878,6 +986,17 @@ pub async fn logout(
             .revoke_token(claims.jti, claims.exp - now_secs)
             .await;
     }
+    let _ = state
+        .security_event_service
+        .record(
+            "auth.logout",
+            Some(user_id),
+            &client_ip.to_string(),
+            None,
+            None,
+            serde_json::json!({}),
+        )
+        .await;
     Ok(())
 }
 
@@ -885,6 +1004,7 @@ pub async fn logout(
 /// Only works when RUST_LOG contains "debug"
 pub async fn dev_login(
     State(state): State<AppState>,
+    ClientIp(client_ip): ClientIp,
     Json(payload): Json<DevLoginRequest>,
 ) -> ApiResult<Json<AuthResponse>> {
     // Only allow in development mode or test environment
@@ -906,6 +1026,18 @@ pub async fn dev_login(
 
     let user = match user {
         Some(u) => {
+            match state.ban_service.ensure_user_not_banned(u.id).await {
+                Ok(()) => {}
+                Err(BanEnforcementError::Banned) => {
+                    return Err(ApiErrorResponse::forbidden("user_banned"));
+                }
+                Err(BanEnforcementError::Unavailable) => {
+                    return Err(ApiErrorResponse::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "ban_check_unavailable",
+                    ));
+                }
+            }
             let needs_onboarding = u.age_confirmed_at.is_none()
                 || u.terms_accepted_at.is_none()
                 || u.terms_accepted_version.as_deref()
@@ -969,16 +1101,28 @@ pub async fn dev_login(
         },
     };
 
+    let _ = state
+        .security_event_service
+        .record(
+            "auth.dev_login",
+            Some(response.user.id),
+            &client_ip.to_string(),
+            None,
+            None,
+            serde_json::json!({}),
+        )
+        .await;
+
     Ok(Json(response))
 }
 
 /// Exchange one-time code for access/refresh tokens
 pub async fn exchange_otc(
     State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    ClientIp(client_ip): ClientIp,
     Json(payload): Json<ExchangeOtcRequest>,
 ) -> ApiResult<impl IntoResponse> {
-    let client_ip = addr.ip().to_string();
+    let client_ip = client_ip.to_string();
     let timer = OTC_EXCHANGE_DURATION.start_timer();
 
     // Rate limiting
@@ -1026,11 +1170,39 @@ pub async fn exchange_otc(
 
     match token_data {
         OtcTokenData::AuthSuccess(token_data) => {
+            match state
+                .ban_service
+                .ensure_user_not_banned(token_data.user_id)
+                .await
+            {
+                Ok(()) => {}
+                Err(BanEnforcementError::Banned) => {
+                    return Err(ApiErrorResponse::forbidden("user_banned"));
+                }
+                Err(BanEnforcementError::Unavailable) => {
+                    return Err(ApiErrorResponse::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "ban_check_unavailable",
+                    ));
+                }
+            }
+
             log_audit_event(AuditEvent::OtcExchangeSuccess {
                 user_id: token_data.user_id,
-                client_ip,
+                client_ip: client_ip.clone(),
                 timestamp: Utc::now(),
             });
+            let _ = state
+                .security_event_service
+                .record(
+                    "auth.exchange_otc_success",
+                    Some(token_data.user_id),
+                    &client_ip,
+                    None,
+                    None,
+                    serde_json::json!({}),
+                )
+                .await;
 
             let response = ExchangeOtcResponse {
                 access_token: token_data.access_token,
@@ -1046,6 +1218,17 @@ pub async fn exchange_otc(
             Ok((StatusCode::OK, Json(response)).into_response())
         }
         OtcTokenData::SignupRequired(signup_data) => {
+            let _ = state
+                .security_event_service
+                .record(
+                    "auth.exchange_otc_signup_required",
+                    None,
+                    &client_ip,
+                    None,
+                    None,
+                    serde_json::json!({}),
+                )
+                .await;
             let response = UsernameRequiredResponse {
                 error: "username_required".to_string(),
                 signup_ticket: signup_data.signup_ticket,

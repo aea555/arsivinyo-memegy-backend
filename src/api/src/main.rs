@@ -5,6 +5,7 @@ use api::{
     create_router, metrics,
     realtime::{hub::RealtimeHub, subscriber::spawn_realtime_subscriber},
     services::rate_limiter::RateLimiter,
+    services::{ban_service::BanService, security_event_service::SecurityEventService},
     state::AppState,
 };
 use sea_orm::Database;
@@ -45,6 +46,9 @@ async fn main() -> anyhow::Result<()> {
     let feed_cache = FeedCacheService::new(queue.clone());
     let otc_cache = OtcCacheService::new(queue.clone());
     let rate_limiter = RateLimiter::new(queue.clone());
+    let ban_service = BanService::new(db.clone(), queue.clone(), Arc::new(config.clone()));
+    let security_event_service =
+        SecurityEventService::new(db.clone(), queue.clone(), Arc::new(config.clone()));
 
     // 6. OTC Rate Limiter
     let otc_rate_limiter = api::middleware::rate_limit::RateLimiter::new(
@@ -69,6 +73,8 @@ async fn main() -> anyhow::Result<()> {
         rate_limiter,
         otc_rate_limiter,
         realtime_hub,
+        ban_service,
+        security_event_service,
     };
 
     // 8. Spawn rate limiter cleanup task
@@ -84,10 +90,24 @@ async fn main() -> anyhow::Result<()> {
     // 9. Spawn realtime pubsub listener
     spawn_realtime_subscriber(state.clone());
 
-    // 10. Routes (via library)
+    // 10. Spawn periodic purge for security events retention policy
+    let security_event_service = state.security_event_service.clone();
+    let purge_interval_secs = state.config.security_events_purge_interval_secs.max(60);
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(purge_interval_secs));
+        loop {
+            interval.tick().await;
+            if let Err(err) = security_event_service.purge_expired().await {
+                tracing::warn!("Failed to purge expired security events: {:?}", err);
+            }
+        }
+    });
+
+    // 11. Routes (via library)
     let app = create_router(state.clone());
 
-    // 11. Server
+    // 12. Server
     let addr = SocketAddr::from(([0, 0, 0, 0], state.config.server_port));
     tracing::info!("Server listening on {}", addr);
 

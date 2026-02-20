@@ -51,6 +51,16 @@ fn normalize_random_seed(seed: Option<&str>) -> Option<String> {
     }
 }
 
+fn enforce_read_only_upload_restriction(state: &AppState) -> ApiResult<()> {
+    if state.config.read_only_mode_enabled {
+        return Err(ApiErrorResponse::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "read_only_mode_enabled",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct VideoFeedItem {
     pub id: Uuid,
@@ -331,6 +341,8 @@ pub async fn init_upload(
     AuthUser(user_id): AuthUser,
     Json(payload): Json<InitUploadRequest>,
 ) -> ApiResult<Json<InitUploadResponse>> {
+    enforce_read_only_upload_restriction(&state)?;
+
     // 1. Validate file size
     if payload.size_bytes > state.config.max_file_size_bytes {
         return Err(ApiErrorResponse::bad_request(format!(
@@ -409,6 +421,8 @@ pub async fn init_anonymous_upload(
     AuthUser(user_id): AuthUser,
     Json(payload): Json<InitUploadRequest>,
 ) -> ApiResult<Json<InitUploadResponse>> {
+    enforce_read_only_upload_restriction(&state)?;
+
     // 1. Validate file size
     if payload.size_bytes > state.config.max_file_size_bytes {
         return Err(ApiErrorResponse::bad_request(format!(
@@ -488,6 +502,8 @@ pub async fn confirm_upload(
     AuthUser(user_id): AuthUser,
     Path(video_id): Path<Uuid>,
 ) -> ApiResult<StatusCode> {
+    enforce_read_only_upload_restriction(&state)?;
+
     let txn = state.db.begin().await?;
 
     // 1. SELECT FOR UPDATE for idempotency

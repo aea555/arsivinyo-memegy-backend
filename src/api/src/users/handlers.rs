@@ -28,6 +28,7 @@ use crate::{
         WS_CONNECTION_REJECTED_TOTAL,
     },
     realtime::{hub::HubRegisterError, messages::RealtimeSignalMessage},
+    services::client_ip::ClientIp,
     services::rate_limiter::RateLimiter,
     state::AppState,
     users::username::{
@@ -170,7 +171,7 @@ pub async fn get_me(
     Ok(Json(dto))
 }
 
-fn build_onboarding_status(
+pub(crate) fn build_onboarding_status(
     user: &users::Model,
     config: &shared::config::Config,
 ) -> OnboardingStatusResponse {
@@ -226,6 +227,7 @@ pub async fn get_onboarding_status(
 pub async fn complete_onboarding(
     State(state): State<AppState>,
     SessionUser(user_id): SessionUser,
+    ClientIp(client_ip): ClientIp,
     Json(payload): Json<CompleteOnboardingRequest>,
 ) -> ApiResult<Json<OnboardingStatusResponse>> {
     let key = RateLimiter::onboarding_complete_user_key(&user_id);
@@ -286,6 +288,17 @@ pub async fn complete_onboarding(
     if let Ok(mut conn) = state.queue.get_conn().await {
         let _: Result<(), _> = conn.del(format!("user:{}:profile", user_id)).await;
     }
+    let _ = state
+        .security_event_service
+        .record(
+            "users.onboarding_complete",
+            Some(user_id),
+            &client_ip.to_string(),
+            None,
+            None,
+            serde_json::json!({ "already_complete": already_complete }),
+        )
+        .await;
 
     Ok(Json(build_onboarding_status(&updated, &state.config)))
 }
@@ -295,6 +308,7 @@ pub async fn complete_onboarding(
 pub async fn delete_account(
     State(state): State<AppState>,
     AuthUser(user_id): AuthUser,
+    ClientIp(client_ip): ClientIp,
 ) -> ApiResult<axum::http::StatusCode> {
     // 1. Soft Delete User
     let active_model = users::ActiveModel {
@@ -316,6 +330,17 @@ pub async fn delete_account(
     if let Ok(mut conn) = state.queue.get_conn().await {
         let _: Result<(), _> = conn.del(format!("user:{}:profile", user_id)).await;
     }
+    let _ = state
+        .security_event_service
+        .record(
+            "users.delete_account",
+            Some(user_id),
+            &client_ip.to_string(),
+            None,
+            None,
+            serde_json::json!({}),
+        )
+        .await;
 
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
@@ -379,6 +404,7 @@ pub async fn get_my_videos(
 pub async fn update_username(
     State(state): State<AppState>,
     AuthUser(user_id): AuthUser,
+    ClientIp(client_ip): ClientIp,
     headers: HeaderMap,
     Json(payload): Json<UpdateUsernameRequest>,
 ) -> ApiResult<Json<UserDto>> {
@@ -526,6 +552,17 @@ pub async fn update_username(
         user_id,
         timestamp: chrono::Utc::now(),
     });
+    let _ = state
+        .security_event_service
+        .record(
+            "users.username_update",
+            Some(user_id),
+            &client_ip.to_string(),
+            None,
+            None,
+            serde_json::json!({}),
+        )
+        .await;
 
     Ok(Json(response))
 }
@@ -554,13 +591,7 @@ pub async fn my_videos_ws(
     }
 
     let user_id = claims.sub;
-    ensure_user_onboarding_complete(&state, user_id)
-        .await
-        .map_err(|status| match status {
-            axum::http::StatusCode::FORBIDDEN => ApiErrorResponse::forbidden("onboarding_required"),
-            axum::http::StatusCode::UNAUTHORIZED => ApiErrorResponse::unauthorized("Invalid token"),
-            _ => ApiErrorResponse::internal_error("Failed to authorize websocket session"),
-        })?;
+    ensure_user_onboarding_complete(&state, user_id).await?;
 
     let client_ip = connect_info
         .map(|c| c.0.ip().to_string())
