@@ -292,14 +292,14 @@ append_step_summary() {
     {
       echo "## MinIO backup snapshot"
       echo
-      echo "- Snapshot ID: \\`$snapshot_id\\`"
+      printf -- '- Snapshot ID: `%s`\n' "$snapshot_id"
       echo "- Buckets mirrored: $bucket_count"
       echo "- Mirror size (bytes): $mirror_bytes"
       echo "- Files new: $files_new"
       echo "- Files changed: $files_changed"
       echo "- Files unmodified: $files_unmodified"
       echo "- Data added (bytes): $data_added"
-      echo "- Manifest: \\`$summary_file\\`"
+      printf -- '- Manifest: `%s`\n' "$summary_file"
     } >> "$GITHUB_STEP_SUMMARY"
   fi
 }
