@@ -508,6 +508,12 @@ pub async fn google_callback(
             username: user.username,
             email: user.email,
             avatar_url: user.avatar_url,
+            age_confirmed: user.age_confirmed_at.is_some(),
+            terms_accepted: user.terms_accepted_at.is_some()
+                && user.terms_accepted_version.as_deref()
+                    == Some(state.config.terms_current_version.as_str()),
+            required_terms_version: state.config.terms_current_version.clone(),
+            accepted_terms_version: user.terms_accepted_version,
         })
     } else {
         let signup_ticket = generate_otc();
@@ -846,12 +852,7 @@ pub async fn signup_complete(
         let response = AuthResponse {
             access_token,
             refresh_token,
-            user: UserDto {
-                id: user.id,
-                username: user.username,
-                email: user.email,
-                avatar_url: user.avatar_url,
-            },
+            user: UserDto::from_user_model(&user, &state.config.terms_current_version),
         };
 
         if let Err(e) = write_signup_result(&state, &payload.signup_ticket, &response).await {
@@ -1093,12 +1094,7 @@ pub async fn dev_login(
     let response = AuthResponse {
         access_token,
         refresh_token,
-        user: UserDto {
-            id: user.id,
-            username: user.username,
-            email: user.email,
-            avatar_url: user.avatar_url,
-        },
+        user: UserDto::from_user_model(&user, &state.config.terms_current_version),
     };
 
     let _ = state
@@ -1204,15 +1200,30 @@ pub async fn exchange_otc(
                 )
                 .await;
 
-            let response = ExchangeOtcResponse {
-                access_token: token_data.access_token,
-                refresh_token: token_data.refresh_token,
-                user: UserDto {
+            let user_dto = users::Entity::find_by_id(token_data.user_id)
+                .one(&state.db)
+                .await
+                .map_err(ApiErrorResponse::db_error)?
+                .map(|user| UserDto::from_user_model(&user, &state.config.terms_current_version))
+                .unwrap_or(UserDto {
                     id: token_data.user_id,
                     username: token_data.username,
                     email: token_data.email,
                     avatar_url: token_data.avatar_url,
-                },
+                    age_confirmed: token_data.age_confirmed,
+                    terms_accepted: token_data.terms_accepted,
+                    required_terms_version: if token_data.required_terms_version.is_empty() {
+                        state.config.terms_current_version.clone()
+                    } else {
+                        token_data.required_terms_version
+                    },
+                    accepted_terms_version: token_data.accepted_terms_version,
+                });
+
+            let response = ExchangeOtcResponse {
+                access_token: token_data.access_token,
+                refresh_token: token_data.refresh_token,
+                user: user_dto,
             };
 
             Ok((StatusCode::OK, Json(response)).into_response())

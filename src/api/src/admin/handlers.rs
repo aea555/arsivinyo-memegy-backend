@@ -516,6 +516,12 @@ async fn delete_record_by_uuid(
 async fn invalidate_user_related_cache(state: &AppState, user_id: Uuid) {
     if let Ok(mut conn) = state.queue.get_conn().await {
         let _: Result<(), _> = conn.del(format!("user:{}:profile", user_id)).await;
+        let _: Result<(), _> = conn
+            .del(format!(
+                "user:{}:profile:v2:{}",
+                user_id, state.config.terms_current_version
+            ))
+            .await;
         let pattern = format!("user:{}:videos:*", user_id);
         let keys: Vec<String> = conn.keys(&pattern).await.unwrap_or_default();
         if !keys.is_empty() {
@@ -1590,12 +1596,7 @@ pub async fn as_user_get_profile(
         .await
         .map_err(ApiErrorResponse::db_error)?
         .ok_or_else(|| ApiErrorResponse::not_found("User not found"))?;
-    let dto = UserDto {
-        id: user.id,
-        username: user.username,
-        email: user.email,
-        avatar_url: user.avatar_url,
-    };
+    let dto = UserDto::from_user_model(&user, &state.config.terms_current_version);
     audit_as_user_action(
         &state,
         &principal,
@@ -1743,12 +1744,7 @@ pub async fn as_user_update_username(
     })?;
 
     invalidate_user_related_cache(&state, user_id).await;
-    let dto = UserDto {
-        id: updated.id,
-        username: updated.username,
-        email: updated.email,
-        avatar_url: updated.avatar_url,
-    };
+    let dto = UserDto::from_user_model(&updated, &state.config.terms_current_version);
     audit_as_user_action(
         &state,
         &principal,
@@ -1798,12 +1794,7 @@ pub async fn create_user_session(
     Ok(Json(AuthResponse {
         access_token,
         refresh_token,
-        user: UserDto {
-            id: user.id,
-            username: user.username,
-            email: user.email,
-            avatar_url: user.avatar_url,
-        },
+        user: UserDto::from_user_model(&user, &state.config.terms_current_version),
     }))
 }
 
@@ -2651,6 +2642,12 @@ pub async fn as_user_onboarding_complete(
 
     if let Ok(mut conn) = state.queue.get_conn().await {
         let _: Result<(), _> = conn.del(format!("user:{}:profile", user_id)).await;
+        let _: Result<(), _> = conn
+            .del(format!(
+                "user:{}:profile:v2:{}",
+                user_id, state.config.terms_current_version
+            ))
+            .await;
     }
 
     audit_as_user_action(

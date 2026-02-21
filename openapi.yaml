@@ -96,10 +96,31 @@ components:
           format: uri
           nullable: true
           example: https://lh3.googleusercontent.com/a/ACg8oc...
+        age_confirmed:
+          type: boolean
+          description: Whether the account has completed 18+ confirmation
+          example: true
+        terms_accepted:
+          type: boolean
+          description: Whether the account accepted the active terms version
+          example: true
+        required_terms_version:
+          type: string
+          description: Current server terms version the user must accept
+          example: v1
+        accepted_terms_version:
+          type: string
+          nullable: true
+          description: Most recently accepted terms version by the user
+          example: v1
       required:
         - id
         - username
         - email
+        - age_confirmed
+        - terms_accepted
+        - required_terms_version
+        - accepted_terms_version
 
     RefreshRequest:
       type: object
@@ -628,13 +649,33 @@ components:
         items:
           type: array
           items:
-            type: object
+            $ref: "#/components/schemas/MyReportItem"
         next_cursor:
           type: integer
           nullable: true
       required:
         - items
         - next_cursor
+
+    MyReportItem:
+      type: object
+      properties:
+        report:
+          $ref: "#/components/schemas/VideoReportDto"
+        video_title:
+          type: string
+          nullable: true
+        video_status:
+          type: string
+          nullable: true
+        video_moderation_state:
+          type: string
+          nullable: true
+      required:
+        - report
+        - video_title
+        - video_status
+        - video_moderation_state
 
     ModeStatusResponse:
       type: object
@@ -2128,7 +2169,9 @@ paths:
       tags:
         - Users
       summary: Get user profile
-      description: Retrieve the authenticated user's profile information.
+      description: |
+        Retrieve the authenticated session user's profile information.
+        This endpoint is available before onboarding completion and includes onboarding state fields.
       operationId: getMyProfile
       security:
         - BearerAuth: []
