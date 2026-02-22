@@ -85,6 +85,7 @@ services:
   nginx:
     networks:
       - memegy-network
+      - shared-services
     image: nginx:1.28.1-alpine
     container_name: memegy_prod_nginx
     restart: always
@@ -412,3 +413,6 @@ services:
 networks:
   memegy-network:
     driver: bridge
+  shared-services:
+    external: true
+    name: ${SHARED_SERVICES_NETWORK:-arsivinyo-shared}
