@@ -61,7 +61,7 @@ The documentation includes:
 - Error responses
 
 Admin integration and security runbook:
-- `ADMIN_PANEL_SUPERADMIN_GUIDE.txt`
+- `ADMIN_PANEL_SUPERADMIN_GUIDE.md`
 
 ## Endpoints
 
