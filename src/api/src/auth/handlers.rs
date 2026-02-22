@@ -543,11 +543,7 @@ pub async fn google_callback(
             signup_ticket,
             suggested_username,
             required_terms_version: state.config.terms_current_version.clone(),
-            terms_url: state
-                .config
-                .terms_url
-                .clone()
-                .or_else(|| Some("/system/terms".to_string())),
+            terms_url: Some("/system/terms".to_string()),
             requires_age_confirmation: true,
         })
     };

@@ -30,7 +30,10 @@ use crate::{
         client_ip::ClientIp,
     },
     state::AppState,
-    system::handlers::{ModeStatusResponse, TermsResponse},
+    system::handlers::{
+        ModeStatusResponse, TermsBundleDocuments, TermsBundleResponse,
+        build_terms_response_for_language,
+    },
     users::{
         dtos::{CompleteOnboardingRequest, OnboardingStatusResponse, UpdateUsernameRequest},
         handlers::{build_onboarding_status, video_model_to_user_dto},
@@ -2542,17 +2545,15 @@ pub async fn admin_video_moderation_action(
 pub async fn admin_get_terms(
     State(state): State<AppState>,
     _principal: AdminPrincipal,
-) -> ApiResult<Json<TermsResponse>> {
-    Ok(Json(TermsResponse {
+) -> ApiResult<Json<TermsBundleResponse>> {
+    Ok(Json(TermsBundleResponse {
         version: state.config.terms_current_version.clone(),
-        url: state.config.terms_url.clone(),
-        content_type: state.config.terms_content_type.clone(),
-        content_sha256: state.config.terms_content_sha256.clone(),
-        content: state.config.terms_content.clone(),
-        effective_at: state.config.terms_effective_at.clone(),
-        jurisdictions: state.config.terms_jurisdictions.clone(),
-        legal_contact_email: state.config.terms_legal_contact_email.clone(),
-        abuse_contact_email: state.config.terms_abuse_contact_email.clone(),
+        default_language: state.config.terms_default_language.clone(),
+        available_languages: vec!["en".to_string(), "tr".to_string()],
+        documents: TermsBundleDocuments {
+            en: build_terms_response_for_language(&state, "en")?,
+            tr: build_terms_response_for_language(&state, "tr")?,
+        },
     }))
 }
 

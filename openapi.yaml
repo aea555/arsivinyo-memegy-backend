@@ -685,9 +685,12 @@ components:
       required:
         - enabled
 
-    TermsResponse:
+    LocalizedTermsResponse:
       type: object
       properties:
+        language:
+          type: string
+          enum: [en, tr]
         version:
           type: string
         url:
@@ -718,6 +721,7 @@ components:
           type: string
           nullable: true
       required:
+        - language
         - version
         - url
         - content_type
@@ -727,6 +731,38 @@ components:
         - jurisdictions
         - legal_contact_email
         - abuse_contact_email
+
+    TermsBundleDocuments:
+      type: object
+      properties:
+        en:
+          $ref: "#/components/schemas/LocalizedTermsResponse"
+        tr:
+          $ref: "#/components/schemas/LocalizedTermsResponse"
+      required:
+        - en
+        - tr
+
+    TermsBundleResponse:
+      type: object
+      properties:
+        version:
+          type: string
+        default_language:
+          type: string
+          enum: [en, tr]
+        available_languages:
+          type: array
+          items:
+            type: string
+            enum: [en, tr]
+        documents:
+          $ref: "#/components/schemas/TermsBundleDocuments"
+      required:
+        - version
+        - default_language
+        - available_languages
+        - documents
 
     RealtimeVideoSignal:
       type: object
@@ -2425,16 +2461,50 @@ paths:
     get:
       tags:
         - System
-      summary: Get current terms and policy document
-      description: Returns the active terms version and optional embedded content configured in backend.
+      summary: Get localized terms bundle
+      description: Returns the active terms version and all supported localized terms documents.
       operationId: getTerms
       responses:
         "200":
-          description: Terms document
+          description: Localized terms bundle
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/TermsResponse"
+                $ref: "#/components/schemas/TermsBundleResponse"
+        "304":
+          description: Terms bundle not modified (ETag matched)
+
+  /system/terms/en:
+    get:
+      tags:
+        - System
+      summary: Get English terms document
+      operationId: getTermsEn
+      responses:
+        "200":
+          description: English terms document
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LocalizedTermsResponse"
+        "304":
+          description: Terms document not modified (ETag matched)
+
+  /system/terms/tr:
+    get:
+      tags:
+        - System
+      summary: Get Turkish terms document
+      operationId: getTermsTr
+      responses:
+        "200":
+          description: Turkish terms document
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LocalizedTermsResponse"
+        "304":
+          description: Terms document not modified (ETag matched)
 
   /system/read-only:
     get:

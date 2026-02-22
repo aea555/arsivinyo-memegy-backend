@@ -14,7 +14,11 @@ use api::{
 };
 use sea_orm::Database;
 use sea_orm_migration::MigratorTrait;
-use shared::{config::Config, queue::QueueService, storage::StorageBackend};
+use shared::{
+    config::{Config, LocalizedTermsDocument},
+    queue::QueueService,
+    storage::StorageBackend,
+};
 use std::sync::Arc;
 use std::time::Duration;
 use testcontainers::{ContainerAsync, runners::AsyncRunner};
@@ -159,6 +163,56 @@ async fn spawn_app_internal(options: TestAppOptions) -> TestApp {
     } else {
         std::collections::HashMap::new()
     };
+    let terms_current_version = options.terms_current_version.unwrap_or("v1").to_string();
+    let terms_url = options
+        .terms_url
+        .map(|v| v.to_string())
+        .or_else(|| Some("https://example.com/terms".to_string()));
+    let terms_content_en = options.terms_content.map(|v| v.to_string());
+    let terms_content_type_en = options.terms_content_type.map(|v| v.to_string());
+    let terms_content_sha_en = terms_content_en.as_ref().map(|v| Config::sha256_hex(v));
+    let terms_content_tr = Some("# Sartlar\n\nBu, Turkce test icerigidir.".to_string());
+    let terms_content_type_tr = Some("text/markdown".to_string());
+    let terms_content_sha_tr = terms_content_tr.as_ref().map(|v| Config::sha256_hex(v));
+    let terms_jurisdictions = vec!["US".to_string(), "TR".to_string(), "GLOBAL".to_string()];
+    let terms_documents = std::collections::HashMap::from([
+        (
+            "en".to_string(),
+            LocalizedTermsDocument {
+                language: "en".to_string(),
+                version: terms_current_version.clone(),
+                url: terms_url.clone(),
+                content_type: terms_content_type_en.clone(),
+                content_sha256: terms_content_sha_en.clone(),
+                content: terms_content_en.clone(),
+                effective_at: None,
+                jurisdictions: terms_jurisdictions.clone(),
+            },
+        ),
+        (
+            "tr".to_string(),
+            LocalizedTermsDocument {
+                language: "tr".to_string(),
+                version: terms_current_version.clone(),
+                url: terms_url.clone(),
+                content_type: terms_content_type_tr,
+                content_sha256: terms_content_sha_tr,
+                content: terms_content_tr,
+                effective_at: None,
+                jurisdictions: terms_jurisdictions.clone(),
+            },
+        ),
+    ]);
+    let terms_bundle_content_sha256 = Config::sha256_hex(&format!(
+        "v={};default=en;en={:?};tr={:?}",
+        terms_current_version,
+        terms_documents
+            .get("en")
+            .and_then(|doc| doc.content_sha256.clone()),
+        terms_documents
+            .get("tr")
+            .and_then(|doc| doc.content_sha256.clone()),
+    ));
 
     // 2. Run Migrations
     let db = Database::connect(&db_url)
@@ -184,20 +238,18 @@ async fn spawn_app_internal(options: TestAppOptions) -> TestApp {
         refresh_token_ttl_days: 14,
         auth_require_username_on_google_signup: true,
         terms_current_version: options.terms_current_version.unwrap_or("v1").to_string(),
-        terms_url: options
-            .terms_url
-            .map(|v| v.to_string())
-            .or_else(|| Some("https://example.com/terms".to_string())),
-        terms_content: options.terms_content.map(|v| v.to_string()),
-        terms_content_type: options.terms_content_type.map(|v| v.to_string()),
-        terms_content_sha256: options
-            .terms_content
-            .map(shared::config::Config::sha256_hex),
+        terms_url: terms_url.clone(),
+        terms_content: terms_content_en,
+        terms_content_type: terms_content_type_en,
+        terms_content_sha256: terms_content_sha_en,
         terms_effective_at: None,
-        terms_jurisdictions: vec!["US".to_string(), "TR".to_string(), "GLOBAL".to_string()],
+        terms_jurisdictions: terms_jurisdictions.clone(),
         terms_require_version_match: true,
         terms_legal_contact_email: Some("legal@example.com".to_string()),
         terms_abuse_contact_email: Some("abuse@example.com".to_string()),
+        terms_default_language: "en".to_string(),
+        terms_documents,
+        terms_bundle_content_sha256,
         read_only_mode_enabled: options.read_only_mode_enabled,
         maintenance_mode_enabled: options.maintenance_mode_enabled,
         username_reserved_values: "admin,support".to_string(),

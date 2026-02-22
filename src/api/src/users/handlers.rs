@@ -188,10 +188,7 @@ pub(crate) fn build_onboarding_status(
         terms_accepted,
         required_terms_version: config.terms_current_version.clone(),
         accepted_terms_version: user.terms_accepted_version.clone(),
-        terms_url: config
-            .terms_url
-            .clone()
-            .or_else(|| Some("/system/terms".to_string())),
+        terms_url: Some("/system/terms".to_string()),
     }
 }
 

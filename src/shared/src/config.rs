@@ -5,6 +5,10 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::env;
 
+pub const TERMS_LANGUAGE_EN: &str = "en";
+pub const TERMS_LANGUAGE_TR: &str = "tr";
+pub const SUPPORTED_TERMS_LANGUAGES: [&str; 2] = [TERMS_LANGUAGE_EN, TERMS_LANGUAGE_TR];
+
 #[derive(Debug, Default, Deserialize)]
 struct TermsFrontmatter {
     version: Option<String>,
@@ -49,6 +53,32 @@ fn parse_csv_list(value: &str) -> Vec<String> {
         .collect()
 }
 
+fn env_opt_trimmed(key: &str) -> Option<String> {
+    env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+#[derive(Clone, Debug)]
+pub struct LocalizedTermsDocument {
+    pub language: String,
+    pub version: String,
+    pub url: Option<String>,
+    pub content_type: Option<String>,
+    pub content_sha256: Option<String>,
+    pub content: Option<String>,
+    pub effective_at: Option<String>,
+    pub jurisdictions: Vec<String>,
+}
+
+#[derive(Debug)]
+struct LocalizedTermsSource {
+    url: Option<String>,
+    content_raw: Option<String>,
+    content_type_override: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     // Server
@@ -81,6 +111,9 @@ pub struct Config {
     pub terms_require_version_match: bool,
     pub terms_legal_contact_email: Option<String>,
     pub terms_abuse_contact_email: Option<String>,
+    pub terms_default_language: String,
+    pub terms_documents: HashMap<String, LocalizedTermsDocument>,
+    pub terms_bundle_content_sha256: String,
     pub read_only_mode_enabled: bool,
     pub maintenance_mode_enabled: bool,
     pub username_reserved_values: String,
@@ -193,6 +226,155 @@ impl Config {
         format!("{:x}", hasher.finalize())
     }
 
+    fn load_localized_terms_source(
+        language: &str,
+        allow_legacy_en_fallback: bool,
+    ) -> Result<LocalizedTermsSource> {
+        let language_suffix = language.to_ascii_uppercase();
+        let url_key = format!("TERMS_URL_{}", language_suffix);
+        let content_key = format!("TERMS_CONTENT_{}", language_suffix);
+        let file_path_key = format!("TERMS_CONTENT_FILE_PATH_{}", language_suffix);
+        let content_type_key = format!("TERMS_CONTENT_TYPE_{}", language_suffix);
+
+        let url = env_opt_trimmed(&url_key).or_else(|| {
+            if allow_legacy_en_fallback {
+                env_opt_trimmed("TERMS_URL")
+            } else {
+                None
+            }
+        });
+        let content_inline = env_opt_trimmed(&content_key).or_else(|| {
+            if allow_legacy_en_fallback {
+                env_opt_trimmed("TERMS_CONTENT")
+            } else {
+                None
+            }
+        });
+        let content_file_path = env_opt_trimmed(&file_path_key).or_else(|| {
+            if allow_legacy_en_fallback {
+                env_opt_trimmed("TERMS_CONTENT_FILE_PATH")
+            } else {
+                None
+            }
+        });
+
+        if content_inline.is_some() && content_file_path.is_some() {
+            return Err(anyhow!(
+                "Set either {} or {}, not both",
+                content_key,
+                file_path_key
+            ));
+        }
+
+        let content_raw = match (content_inline, content_file_path) {
+            (Some(content), None) => Some(content),
+            (None, Some(path)) => Some(
+                std::fs::read_to_string(&path)
+                    .map_err(|e| anyhow!("Failed to read {} '{}': {}", file_path_key, path, e))?,
+            ),
+            (None, None) => None,
+            (Some(_), Some(_)) => unreachable!(),
+        };
+
+        let content_type_override = env_opt_trimmed(&content_type_key).or_else(|| {
+            if allow_legacy_en_fallback {
+                env_opt_trimmed("TERMS_CONTENT_TYPE")
+            } else {
+                None
+            }
+        });
+
+        Ok(LocalizedTermsSource {
+            url,
+            content_raw,
+            content_type_override,
+        })
+    }
+
+    fn build_localized_terms_document(
+        language: &str,
+        source: LocalizedTermsSource,
+        terms_current_version: &str,
+        terms_require_version_match: bool,
+        default_jurisdictions: &[String],
+    ) -> Result<LocalizedTermsDocument> {
+        if source.url.is_none() && source.content_raw.is_none() {
+            return Err(anyhow!(
+                "Terms for language '{}' must configure either URL or embedded content",
+                language
+            ));
+        }
+
+        let (terms_frontmatter, content) = if let Some(content) = source.content_raw {
+            let (frontmatter, body) = parse_terms_frontmatter(&content)?;
+            (frontmatter, Some(body))
+        } else {
+            (None, None)
+        };
+
+        if terms_require_version_match
+            && let Some(ref frontmatter) = terms_frontmatter
+            && let Some(ref frontmatter_version) = frontmatter.version
+            && frontmatter_version.trim() != terms_current_version
+        {
+            return Err(anyhow!(
+                "Terms frontmatter version '{}' for language '{}' does not match TERMS_CURRENT_VERSION '{}'",
+                frontmatter_version,
+                language,
+                terms_current_version
+            ));
+        }
+
+        let effective_at = terms_frontmatter
+            .as_ref()
+            .and_then(|fm| {
+                fm.effective_at
+                    .as_ref()
+                    .map(|value| value.trim().to_string())
+            })
+            .filter(|value| !value.is_empty());
+
+        let jurisdictions = terms_frontmatter
+            .as_ref()
+            .and_then(|fm| fm.jurisdictions.clone())
+            .filter(|items| !items.is_empty())
+            .unwrap_or_else(|| default_jurisdictions.to_vec());
+
+        let content_type = if content.is_some() {
+            Some(
+                source
+                    .content_type_override
+                    .unwrap_or_else(|| "text/markdown".to_string())
+                    .trim()
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+
+        if let Some(ref value) = content_type
+            && value.is_empty()
+        {
+            return Err(anyhow!(
+                "Terms content type for language '{}' must be non-empty when embedded content is configured",
+                language
+            ));
+        }
+
+        let content_sha256 = content.as_ref().map(|value| Self::sha256_hex(value));
+
+        Ok(LocalizedTermsDocument {
+            language: language.to_string(),
+            version: terms_current_version.to_string(),
+            url: source.url,
+            content_type,
+            content_sha256,
+            content,
+            effective_at,
+            jurisdictions,
+        })
+    }
+
     pub fn from_env() -> Result<Self> {
         dotenv().ok();
 
@@ -207,14 +389,20 @@ impl Config {
         if terms_current_version.is_empty() {
             return Err(anyhow!("TERMS_CURRENT_VERSION must be non-empty"));
         }
-        let terms_url = env::var("TERMS_URL")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
         let terms_require_version_match = env::var("TERMS_REQUIRE_VERSION_MATCH")
             .unwrap_or_else(|_| "true".to_string())
             .parse()
             .unwrap_or(true);
+        let terms_default_language = env::var("TERMS_DEFAULT_LANGUAGE")
+            .unwrap_or_else(|_| TERMS_LANGUAGE_EN.to_string())
+            .trim()
+            .to_ascii_lowercase();
+        if !SUPPORTED_TERMS_LANGUAGES.contains(&terms_default_language.as_str()) {
+            return Err(anyhow!(
+                "TERMS_DEFAULT_LANGUAGE '{}' is not supported. Supported values: en,tr",
+                terms_default_language
+            ));
+        }
         let terms_legal_contact_email = env::var("TERMS_LEGAL_CONTACT_EMAIL")
             .ok()
             .map(|v| v.trim().to_string())
@@ -233,77 +421,62 @@ impl Config {
                 parsed
             }
         };
-        let terms_content_inline = env::var("TERMS_CONTENT")
-            .ok()
-            .filter(|v| !v.trim().is_empty());
-        let terms_content_file_path = env::var("TERMS_CONTENT_FILE_PATH")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
-        if terms_content_inline.is_some() && terms_content_file_path.is_some() {
-            return Err(anyhow!(
-                "Set either TERMS_CONTENT or TERMS_CONTENT_FILE_PATH, not both"
-            ));
+        let mut terms_documents = HashMap::new();
+        for language in SUPPORTED_TERMS_LANGUAGES {
+            let source =
+                Self::load_localized_terms_source(language, language == TERMS_LANGUAGE_EN)?;
+            let document = Self::build_localized_terms_document(
+                language,
+                source,
+                &terms_current_version,
+                terms_require_version_match,
+                &terms_jurisdictions_env,
+            )?;
+            terms_documents.insert(language.to_string(), document);
         }
-        let terms_content_raw = match (terms_content_inline, terms_content_file_path) {
-            (Some(content), None) => Some(content),
-            (None, Some(path)) => Some(std::fs::read_to_string(&path).map_err(|e| {
-                anyhow!("Failed to read TERMS_CONTENT_FILE_PATH '{}': {}", path, e)
-            })?),
-            (None, None) => None,
-            (Some(_), Some(_)) => unreachable!(),
+        let default_terms_document = terms_documents
+            .get(&terms_default_language)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!(
+                    "Terms default language '{}' is not configured",
+                    terms_default_language
+                )
+            })?;
+        let terms_url = default_terms_document.url.clone();
+        let terms_content = default_terms_document.content.clone();
+        let terms_content_type = default_terms_document.content_type.clone();
+        let terms_content_sha256 = default_terms_document.content_sha256.clone();
+        let terms_effective_at = default_terms_document.effective_at.clone();
+        let terms_jurisdictions = default_terms_document.jurisdictions.clone();
+        let terms_bundle_content_sha256 = {
+            let mut documents_for_hash = serde_json::Map::new();
+            for language in SUPPORTED_TERMS_LANGUAGES {
+                if let Some(document) = terms_documents.get(language) {
+                    documents_for_hash.insert(
+                        language.to_string(),
+                        serde_json::json!({
+                            "language": document.language,
+                            "version": document.version,
+                            "url": document.url,
+                            "content_type": document.content_type,
+                            "content_sha256": document.content_sha256,
+                            "content": document.content,
+                            "effective_at": document.effective_at,
+                            "jurisdictions": document.jurisdictions,
+                        }),
+                    );
+                }
+            }
+            let payload = serde_json::json!({
+                "version": terms_current_version.clone(),
+                "default_language": terms_default_language.clone(),
+                "documents": documents_for_hash,
+                "legal_contact_email": terms_legal_contact_email.clone(),
+                "abuse_contact_email": terms_abuse_contact_email.clone(),
+            });
+            Self::sha256_hex(&serde_json::to_string(&payload)?)
         };
-        if terms_url.is_none() && terms_content_raw.is_none() {
-            return Err(anyhow!(
-                "Either TERMS_URL or embedded terms content (TERMS_CONTENT/TERMS_CONTENT_FILE_PATH) must be configured"
-            ));
-        }
-        let (terms_frontmatter, terms_content) = if let Some(content) = terms_content_raw {
-            let (frontmatter, body) = parse_terms_frontmatter(&content)?;
-            (frontmatter, Some(body))
-        } else {
-            (None, None)
-        };
-        if terms_require_version_match
-            && let Some(ref frontmatter) = terms_frontmatter
-            && let Some(ref frontmatter_version) = frontmatter.version
-            && frontmatter_version.trim() != terms_current_version
-        {
-            return Err(anyhow!(
-                "Terms frontmatter version '{}' does not match TERMS_CURRENT_VERSION '{}'",
-                frontmatter_version,
-                terms_current_version
-            ));
-        }
-        let terms_effective_at = terms_frontmatter
-            .as_ref()
-            .and_then(|fm| fm.effective_at.as_ref().map(|v| v.trim().to_string()))
-            .filter(|v| !v.is_empty());
-        let terms_jurisdictions = terms_frontmatter
-            .as_ref()
-            .and_then(|fm| fm.jurisdictions.clone())
-            .filter(|items| !items.is_empty())
-            .unwrap_or(terms_jurisdictions_env);
-        let terms_content_type = if terms_content.is_some() {
-            Some(
-                env::var("TERMS_CONTENT_TYPE")
-                    .unwrap_or_else(|_| "text/markdown".to_string())
-                    .trim()
-                    .to_string(),
-            )
-        } else {
-            None
-        };
-        if let Some(ref content_type) = terms_content_type
-            && content_type.is_empty()
-        {
-            return Err(anyhow!(
-                "TERMS_CONTENT_TYPE must be non-empty when embedded terms content is configured"
-            ));
-        }
-        let terms_content_sha256 = terms_content
-            .as_ref()
-            .map(|content| Self::sha256_hex(content));
         let admin_jwt_issuer = env::var("ADMIN_JWT_ISSUER")
             .ok()
             .map(|v| v.trim().to_string())
@@ -403,6 +576,9 @@ impl Config {
             terms_require_version_match,
             terms_legal_contact_email,
             terms_abuse_contact_email,
+            terms_default_language,
+            terms_documents,
+            terms_bundle_content_sha256,
             read_only_mode_enabled: env::var("READ_ONLY_MODE_ENABLED")
                 .unwrap_or_else(|_| "false".to_string())
                 .parse()
@@ -649,6 +825,10 @@ impl Config {
                 .unwrap_or_else(|_| "20".to_string())
                 .parse()?,
         })
+    }
+
+    pub fn get_terms_document(&self, language: &str) -> Option<&LocalizedTermsDocument> {
+        self.terms_documents.get(language)
     }
 }
 
