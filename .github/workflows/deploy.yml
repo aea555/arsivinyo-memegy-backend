@@ -62,6 +62,7 @@ jobs:
           BACKEND_IMAGE: ${{ needs.build_and_push.outputs.image }}
         with:
           host: ${{ secrets.SSH_HOST }}
+          port: 2558
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
           envs: BACKEND_IMAGE

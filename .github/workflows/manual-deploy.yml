@@ -71,6 +71,7 @@ jobs:
           DEPLOY_REF: ${{ inputs.ref }}
         with:
           host: ${{ secrets.SSH_HOST }}
+          port: 2558
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
           envs: BACKEND_IMAGE,DEPLOY_REF
