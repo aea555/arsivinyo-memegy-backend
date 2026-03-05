@@ -55,13 +55,15 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     needs: build_and_push
+    env:
+      TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
     steps:
       - name: Connect to Tailscale (optional)
-        if: ${{ secrets.TS_AUTHKEY != '' }}
+        if: ${{ env.TS_AUTHKEY != '' }}
         continue-on-error: true
         uses: tailscale/github-action@v3
         with:
-          authkey: ${{ secrets.TS_AUTHKEY }}
+          authkey: ${{ env.TS_AUTHKEY }}
 
       - name: Select SSH host (Tailscale first)
         id: ssh_host
@@ -184,7 +186,7 @@ jobs:
             printf '%s\n' "${BACKEND_IMAGE}" > "${LAST_SUCCESSFUL_FILE}"
 
       - name: Disconnect Tailscale
-        if: ${{ always() && secrets.TS_AUTHKEY != '' }}
+        if: ${{ always() && env.TS_AUTHKEY != '' }}
         run: |
           set +e
           if command -v tailscale >/dev/null 2>&1; then
