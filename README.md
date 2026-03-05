@@ -61,7 +61,7 @@ The documentation includes:
 - Error responses
 
 Admin integration and security runbook:
-- `ADMIN_PANEL_SUPERADMIN_GUIDE.txt`
+- `ADMIN_PANEL_SUPERADMIN_GUIDE.md`
 
 ## Endpoints
 
@@ -94,7 +94,9 @@ Admin integration and security runbook:
 - `GET /users/me/reports`: Returns the authenticated user's abuse reports with cursor pagination.
 
 ### System
-- `GET /system/terms`: Public endpoint returning active terms metadata and optional embedded terms content.
+- `GET /system/terms`: Public endpoint returning active terms bundle for all supported languages.
+- `GET /system/terms/en`: Public endpoint returning English terms document.
+- `GET /system/terms/tr`: Public endpoint returning Turkish terms document.
 - `GET /system/read-only`: Protected status endpoint for read-only mode.
 - `GET /system/maintenance`: Protected status endpoint for maintenance mode.
 
@@ -117,10 +119,16 @@ Admin integration and security runbook:
 
 Key environment flags:
 - `TERMS_CURRENT_VERSION` (required, non-empty)
-- `TERMS_URL` (optional)
-- `TERMS_CONTENT` (optional inline document text)
-- `TERMS_CONTENT_FILE_PATH` (optional file path for embedded document text)
-- `TERMS_CONTENT_TYPE` (optional, defaults to `text/markdown` when embedded content is set)
+- `TERMS_DEFAULT_LANGUAGE` (`en|tr`, defaults to `en`)
+- `TERMS_URL_EN` / `TERMS_URL_TR` (optional)
+- `TERMS_CONTENT_EN` / `TERMS_CONTENT_TR` (optional inline document text)
+- `TERMS_CONTENT_FILE_PATH_EN` / `TERMS_CONTENT_FILE_PATH_TR` (optional file path for embedded document text)
+- `TERMS_CONTENT_TYPE_EN` / `TERMS_CONTENT_TYPE_TR` (optional, defaults to `text/markdown` when embedded content is set)
+- Legacy EN fallback keys remain supported for backward compatibility:
+  - `TERMS_URL`
+  - `TERMS_CONTENT`
+  - `TERMS_CONTENT_FILE_PATH`
+  - `TERMS_CONTENT_TYPE`
 - `TERMS_REQUIRE_VERSION_MATCH` (defaults to `true`; validates frontmatter `version` against `TERMS_CURRENT_VERSION`)
 - `TERMS_LEGAL_CONTACT_EMAIL` / `TERMS_ABUSE_CONTACT_EMAIL` (optional metadata)
 - `TERMS_JURISDICTIONS` (CSV list, e.g. `US,TR,GLOBAL`)
@@ -141,8 +149,8 @@ Key environment flags:
 - `ABUSE_REPORT_PURGE_INTERVAL_SECS`
 
 Terms source rules:
-- Configure either `TERMS_CONTENT` or `TERMS_CONTENT_FILE_PATH` (not both) for backend-hosted terms text.
-- At least one of `TERMS_URL` or embedded terms content must be configured.
+- For each language (`EN` and `TR`), configure either inline content or file path (not both).
+- For each language (`EN` and `TR`), at least one of URL or embedded content must be configured.
 
 ## Testing
 

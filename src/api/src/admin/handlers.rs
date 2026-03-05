@@ -30,7 +30,10 @@ use crate::{
         client_ip::ClientIp,
     },
     state::AppState,
-    system::handlers::{ModeStatusResponse, TermsResponse},
+    system::handlers::{
+        ModeStatusResponse, TermsBundleDocuments, TermsBundleResponse,
+        build_terms_response_for_language,
+    },
     users::{
         dtos::{CompleteOnboardingRequest, OnboardingStatusResponse, UpdateUsernameRequest},
         handlers::{build_onboarding_status, video_model_to_user_dto},
@@ -516,6 +519,12 @@ async fn delete_record_by_uuid(
 async fn invalidate_user_related_cache(state: &AppState, user_id: Uuid) {
     if let Ok(mut conn) = state.queue.get_conn().await {
         let _: Result<(), _> = conn.del(format!("user:{}:profile", user_id)).await;
+        let _: Result<(), _> = conn
+            .del(format!(
+                "user:{}:profile:v2:{}",
+                user_id, state.config.terms_current_version
+            ))
+            .await;
         let pattern = format!("user:{}:videos:*", user_id);
         let keys: Vec<String> = conn.keys(&pattern).await.unwrap_or_default();
         if !keys.is_empty() {
@@ -1590,12 +1599,7 @@ pub async fn as_user_get_profile(
         .await
         .map_err(ApiErrorResponse::db_error)?
         .ok_or_else(|| ApiErrorResponse::not_found("User not found"))?;
-    let dto = UserDto {
-        id: user.id,
-        username: user.username,
-        email: user.email,
-        avatar_url: user.avatar_url,
-    };
+    let dto = UserDto::from_user_model(&user, &state.config.terms_current_version);
     audit_as_user_action(
         &state,
         &principal,
@@ -1743,12 +1747,7 @@ pub async fn as_user_update_username(
     })?;
 
     invalidate_user_related_cache(&state, user_id).await;
-    let dto = UserDto {
-        id: updated.id,
-        username: updated.username,
-        email: updated.email,
-        avatar_url: updated.avatar_url,
-    };
+    let dto = UserDto::from_user_model(&updated, &state.config.terms_current_version);
     audit_as_user_action(
         &state,
         &principal,
@@ -1798,12 +1797,7 @@ pub async fn create_user_session(
     Ok(Json(AuthResponse {
         access_token,
         refresh_token,
-        user: UserDto {
-            id: user.id,
-            username: user.username,
-            email: user.email,
-            avatar_url: user.avatar_url,
-        },
+        user: UserDto::from_user_model(&user, &state.config.terms_current_version),
     }))
 }
 
@@ -2551,17 +2545,15 @@ pub async fn admin_video_moderation_action(
 pub async fn admin_get_terms(
     State(state): State<AppState>,
     _principal: AdminPrincipal,
-) -> ApiResult<Json<TermsResponse>> {
-    Ok(Json(TermsResponse {
+) -> ApiResult<Json<TermsBundleResponse>> {
+    Ok(Json(TermsBundleResponse {
         version: state.config.terms_current_version.clone(),
-        url: state.config.terms_url.clone(),
-        content_type: state.config.terms_content_type.clone(),
-        content_sha256: state.config.terms_content_sha256.clone(),
-        content: state.config.terms_content.clone(),
-        effective_at: state.config.terms_effective_at.clone(),
-        jurisdictions: state.config.terms_jurisdictions.clone(),
-        legal_contact_email: state.config.terms_legal_contact_email.clone(),
-        abuse_contact_email: state.config.terms_abuse_contact_email.clone(),
+        default_language: state.config.terms_default_language.clone(),
+        available_languages: vec!["en".to_string(), "tr".to_string()],
+        documents: TermsBundleDocuments {
+            en: build_terms_response_for_language(&state, "en")?,
+            tr: build_terms_response_for_language(&state, "tr")?,
+        },
     }))
 }
 
@@ -2651,6 +2643,12 @@ pub async fn as_user_onboarding_complete(
 
     if let Ok(mut conn) = state.queue.get_conn().await {
         let _: Result<(), _> = conn.del(format!("user:{}:profile", user_id)).await;
+        let _: Result<(), _> = conn
+            .del(format!(
+                "user:{}:profile:v2:{}",
+                user_id, state.config.terms_current_version
+            ))
+            .await;
     }
 
     audit_as_user_action(

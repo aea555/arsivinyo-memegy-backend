@@ -7,6 +7,8 @@ docs/legal/*
 !docs/legal/terms/
 docs/legal/terms/*
 !docs/legal/terms/memegy_terms_v1.md
+!docs/legal/terms/memegy_terms_v1.en.md
+!docs/legal/terms/memegy_terms_v1.tr.md
 !docs/ops/
 !docs/ops/minio-backup-runbook.md
 **/*.rs.bk
@@ -28,4 +30,6 @@ docker/minio_data/
 !README.md
 !ADMIN_PANEL_SUPERADMIN_GUIDE.md
 !docs/legal/terms/memegy_terms_v1.md
+!docs/legal/terms/memegy_terms_v1.en.md
+!docs/legal/terms/memegy_terms_v1.tr.md
 !docs/ops/minio-backup-runbook.md

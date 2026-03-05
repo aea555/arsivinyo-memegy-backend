@@ -139,16 +139,69 @@ async fn terms_endpoint_returns_configured_embedded_content() {
 
     let terms_json: serde_json::Value = terms.json().await.expect("json");
     assert_eq!(terms_json["version"], "v7");
-    assert_eq!(terms_json["content_type"], "text/markdown");
+    assert_eq!(terms_json["default_language"], "en");
     assert_eq!(
-        terms_json["content"],
+        terms_json["available_languages"],
+        serde_json::json!(["en", "tr"])
+    );
+    assert_eq!(
+        terms_json["documents"]["en"]["content"],
         "# Terms\n\nBy using this app, you agree to the policy."
     );
-    assert_eq!(terms_json["url"], "https://example.com/terms");
+    assert_eq!(
+        terms_json["documents"]["en"]["content_type"],
+        "text/markdown"
+    );
+    assert_eq!(
+        terms_json["documents"]["en"]["url"],
+        "https://example.com/terms"
+    );
     assert!(
-        terms_json["content_sha256"].as_str().is_some(),
+        terms_json["documents"]["en"]["content_sha256"]
+            .as_str()
+            .is_some(),
         "content sha256 should be present for embedded terms"
     );
+
+    let terms_en = client
+        .get(format!("{}/system/terms/en", app.address))
+        .send()
+        .await
+        .expect("terms en request should execute");
+    assert_eq!(terms_en.status(), StatusCode::OK);
+    let terms_en_json: serde_json::Value = terms_en.json().await.expect("json");
+    assert_eq!(terms_en_json["language"], "en");
+    assert_eq!(terms_en_json["version"], "v7");
+
+    let terms_tr = client
+        .get(format!("{}/system/terms/tr", app.address))
+        .send()
+        .await
+        .expect("terms tr request should execute");
+    assert_eq!(terms_tr.status(), StatusCode::OK);
+    let terms_tr_json: serde_json::Value = terms_tr.json().await.expect("json");
+    assert_eq!(terms_tr_json["language"], "tr");
+
+    let terms_en_cached = client
+        .get(format!("{}/system/terms/en", app.address))
+        .header(
+            "If-None-Match",
+            terms_en_json["content_sha256"]
+                .as_str()
+                .map(|v| format!("\"{}\"", v))
+                .expect("etag"),
+        )
+        .send()
+        .await
+        .expect("conditional terms en request should execute");
+    assert_eq!(terms_en_cached.status(), StatusCode::NOT_MODIFIED);
+
+    let terms_unknown = client
+        .get(format!("{}/system/terms/de", app.address))
+        .send()
+        .await
+        .expect("terms unknown locale request should execute");
+    assert_eq!(terms_unknown.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

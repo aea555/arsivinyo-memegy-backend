@@ -438,25 +438,16 @@ async fn publish_video_status_signal(
     previous_status: Option<String>,
     video: &videos::Model,
 ) -> Result<()> {
-    let has_public_object =
-        video.status == "PUBLISHED" || video.s3_bucket == config.minio_bucket_videos;
-    let url_bucket = if video.status == "PUBLISHED" {
-        config.minio_bucket_videos.clone()
-    } else {
-        video.s3_bucket.clone()
-    };
-    let url = if has_public_object {
-        Some(format!(
-            "{}/{}/{}",
-            config.minio_public_endpoint, url_bucket, video.s3_key
-        ))
-    } else {
-        None
-    };
     let is_liked = likes::Entity::find_by_id((user_id, video.id))
         .one(db)
         .await?
         .is_some();
+    let realtime_video = build_realtime_video_payload(
+        &config.minio_public_endpoint,
+        &config.minio_bucket_videos,
+        video,
+        is_liked,
+    );
 
     let payload = serde_json::json!({
         "type": event_type,
@@ -464,20 +455,7 @@ async fn publish_video_status_signal(
         "event_at": chrono::Utc::now().fixed_offset(),
         "version": 1,
         "previous_status": previous_status,
-        "video": {
-            "id": video.id,
-            "title": video.title.clone(),
-            "description": video.description.clone(),
-            "status": video.status.clone(),
-            "created_at": video.created_at,
-            "updated_at": video.updated_at,
-            "is_anonymous": video.is_anonymous,
-            "is_liked": is_liked,
-            "like_count": video.like_count,
-            "url": url,
-            "processing_error_code": video.processing_error_code.clone(),
-            "processing_error_message": video.processing_error_message.clone(),
-        }
+        "video": realtime_video
     });
 
     queue
@@ -485,6 +463,55 @@ async fn publish_video_status_signal(
         .await?;
 
     Ok(())
+}
+
+fn build_realtime_video_payload(
+    minio_public_endpoint: &str,
+    minio_bucket_videos: &str,
+    video: &videos::Model,
+    is_liked: bool,
+) -> serde_json::Value {
+    let is_published_like = video.status.eq_ignore_ascii_case("PUBLISHED")
+        || video.status.eq_ignore_ascii_case("COMPLETED");
+    let has_public_object = is_published_like || video.s3_bucket == minio_bucket_videos;
+    let url_bucket = if is_published_like {
+        minio_bucket_videos.to_string()
+    } else {
+        video.s3_bucket.clone()
+    };
+    let url = if has_public_object {
+        Some(format!(
+            "{}/{}/{}",
+            minio_public_endpoint, url_bucket, video.s3_key
+        ))
+    } else {
+        None
+    };
+    let thumbnail_url = if has_public_object {
+        Some(format!(
+            "{}/{}/{}_thumb.jpg",
+            minio_public_endpoint, minio_bucket_videos, video.id
+        ))
+    } else {
+        None
+    };
+
+    serde_json::json!({
+        "id": video.id,
+        "title": video.title.clone(),
+        "description": video.description.clone(),
+        "status": video.status.clone(),
+        "created_at": video.created_at,
+        "updated_at": video.updated_at,
+        "is_anonymous": video.is_anonymous,
+        "is_nsfw": video.is_nsfw,
+        "is_liked": is_liked,
+        "like_count": video.like_count,
+        "url": url,
+        "thumbnail_url": thumbnail_url,
+        "processing_error_code": video.processing_error_code.clone(),
+        "processing_error_message": video.processing_error_message.clone(),
+    })
 }
 
 async fn run_ffprobe_preflight(
@@ -792,4 +819,48 @@ fn sanitize_error_message(message: &str) -> String {
         .chars()
         .take(MAX_ERROR_MESSAGE_CHARS)
         .collect::<String>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_realtime_video_payload;
+    use shared::entities::videos;
+    use uuid::Uuid;
+
+    #[test]
+    fn realtime_payload_includes_nsfw_and_thumbnail_url_for_published_video() {
+        let now = chrono::Utc::now().fixed_offset();
+        let video = videos::Model {
+            id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            title: Some("video".to_string()),
+            description: Some("desc".to_string()),
+            s3_bucket: "raw".to_string(),
+            s3_key: "test.mp4".to_string(),
+            status: "PUBLISHED".to_string(),
+            size_bytes: 1024,
+            duration_seconds: Some(5),
+            like_count: 3,
+            is_anonymous: false,
+            is_nsfw: Some(false),
+            moderation_state: "VISIBLE".to_string(),
+            moderation_reason_code: None,
+            moderation_updated_at: None,
+            moderation_updated_by: None,
+            moderation_source_report_id: None,
+            processing_error_code: None,
+            processing_error_message: None,
+            failed_at: None,
+            deleted_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let payload =
+            build_realtime_video_payload("https://cdn.memegy.com", "videos", &video, true);
+
+        assert_eq!(payload["is_nsfw"], serde_json::json!(false));
+        assert!(payload["thumbnail_url"].as_str().is_some());
+        assert!(payload["url"].as_str().is_some());
+    }
 }

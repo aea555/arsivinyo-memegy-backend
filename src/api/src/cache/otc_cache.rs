@@ -12,6 +12,14 @@ pub struct OtcAuthTokenData {
     pub username: String,
     pub email: String,
     pub avatar_url: Option<String>,
+    #[serde(default)]
+    pub age_confirmed: bool,
+    #[serde(default)]
+    pub terms_accepted: bool,
+    #[serde(default)]
+    pub required_terms_version: String,
+    #[serde(default)]
+    pub accepted_terms_version: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

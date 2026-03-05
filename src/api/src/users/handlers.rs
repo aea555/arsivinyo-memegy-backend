@@ -132,14 +132,18 @@ async fn load_liked_video_id_set(
     Ok(liked_video_ids.into_iter().collect())
 }
 
+fn user_profile_cache_key(user_id: Uuid, terms_current_version: &str) -> String {
+    format!("user:{}:profile:v2:{}", user_id, terms_current_version)
+}
+
 /// GET /users/me
 /// Returns the authenticated user's profile.
 /// Cached for 24 hours.
 pub async fn get_me(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    SessionUser(user_id): SessionUser,
 ) -> ApiResult<Json<UserDto>> {
-    let cache_key = format!("user:{}:profile", user_id);
+    let cache_key = user_profile_cache_key(user_id, &state.config.terms_current_version);
 
     // Try cache first
     if let Ok(mut conn) = state.queue.get_conn().await
@@ -155,13 +159,11 @@ pub async fn get_me(
         .await
         .map_err(ApiErrorResponse::db_error)?
         .ok_or_else(|| ApiErrorResponse::not_found("User not found"))?;
+    if user.deleted_at.is_some() {
+        return Err(ApiErrorResponse::unauthorized("Invalid token"));
+    }
 
-    let dto = UserDto {
-        id: user.id,
-        username: user.username,
-        email: user.email,
-        avatar_url: user.avatar_url,
-    };
+    let dto = UserDto::from_user_model(&user, &state.config.terms_current_version);
 
     // Cache result
     if let Ok(mut conn) = state.queue.get_conn().await
@@ -186,10 +188,7 @@ pub(crate) fn build_onboarding_status(
         terms_accepted,
         required_terms_version: config.terms_current_version.clone(),
         accepted_terms_version: user.terms_accepted_version.clone(),
-        terms_url: config
-            .terms_url
-            .clone()
-            .or_else(|| Some("/system/terms".to_string())),
+        terms_url: Some("/system/terms".to_string()),
     }
 }
 
@@ -288,7 +287,12 @@ pub async fn complete_onboarding(
     };
 
     if let Ok(mut conn) = state.queue.get_conn().await {
-        let _: Result<(), _> = conn.del(format!("user:{}:profile", user_id)).await;
+        let _: Result<(), _> = conn
+            .del(user_profile_cache_key(
+                user_id,
+                &state.config.terms_current_version,
+            ))
+            .await;
     }
     let _ = state
         .security_event_service
@@ -330,7 +334,12 @@ pub async fn delete_account(
 
     // 3. Invalidate Cache
     if let Ok(mut conn) = state.queue.get_conn().await {
-        let _: Result<(), _> = conn.del(format!("user:{}:profile", user_id)).await;
+        let _: Result<(), _> = conn
+            .del(user_profile_cache_key(
+                user_id,
+                &state.config.terms_current_version,
+            ))
+            .await;
     }
     let _ = state
         .security_event_service
@@ -538,6 +547,12 @@ pub async fn update_username(
             username: user.username,
             email: user.email,
             avatar_url: user.avatar_url,
+            age_confirmed: user.age_confirmed_at.is_some(),
+            terms_accepted: user.terms_accepted_at.is_some()
+                && user.terms_accepted_version.as_deref()
+                    == Some(state.config.terms_current_version.as_str()),
+            required_terms_version: state.config.terms_current_version.clone(),
+            accepted_terms_version: user.terms_accepted_version,
         };
         if let Some(ref cache_key) = idempotency_cache_key
             && let Ok(mut conn) = state.queue.get_conn().await
@@ -581,15 +596,15 @@ pub async fn update_username(
     })?;
 
     if let Ok(mut conn) = state.queue.get_conn().await {
-        let _: Result<(), _> = conn.del(format!("user:{}:profile", user_id)).await;
+        let _: Result<(), _> = conn
+            .del(user_profile_cache_key(
+                user_id,
+                &state.config.terms_current_version,
+            ))
+            .await;
     }
 
-    let response = UserDto {
-        id: updated.id,
-        username: updated.username,
-        email: updated.email,
-        avatar_url: updated.avatar_url,
-    };
+    let response = UserDto::from_user_model(&updated, &state.config.terms_current_version);
 
     if let Some(ref cache_key) = idempotency_cache_key
         && let Ok(mut conn) = state.queue.get_conn().await

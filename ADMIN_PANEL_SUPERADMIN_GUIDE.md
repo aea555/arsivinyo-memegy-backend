@@ -178,6 +178,10 @@ Allowlisted tables:
 - `send_tickets`
 - `extension_sessions`
 - `admin_audit_logs`
+- `user_bans`
+- `ip_bans`
+- `security_events`
+- `abuse_reports`
 
 Notes:
 - No raw SQL endpoint.
@@ -211,6 +215,10 @@ Profile/account/session:
 Feed:
 - `GET /admin/users/{user_id}/feed`
 
+Onboarding:
+- `GET /admin/users/{user_id}/onboarding/status`
+- `POST /admin/users/{user_id}/onboarding/complete`
+
 User videos:
 - `GET /admin/users/{user_id}/videos`
 - `GET /admin/users/{user_id}/videos/ws`
@@ -242,6 +250,34 @@ Video actions:
 Scope note:
 - OAuth browser bootstrapping endpoints (`/auth/google/login`, `/auth/google/callback`, OTC exchange) are intentionally not mirrored under `/admin`.
 - Superadmin can directly mint user sessions through `/admin/users/{user_id}/session`.
+
+## 5.4 Ban and security routes
+
+User ban:
+- `GET /admin/users/{user_id}/ban`
+- `PUT /admin/users/{user_id}/ban`
+- `DELETE /admin/users/{user_id}/ban`
+
+IP ban:
+- `GET /admin/ip-bans?ip=...`
+- `PUT /admin/ip-bans`
+- `DELETE /admin/ip-bans?ip=...`
+
+Security investigations:
+- `GET /admin/security/users/{user_id}/ips`
+- `GET /admin/security/ips/{ip}/users`
+
+## 5.5 Abuse report and moderation routes
+
+- `GET /admin/abuse/reports`
+- `GET /admin/abuse/reports/{report_id}`
+- `POST /admin/abuse/reports/{report_id}` (resolve)
+- `POST /admin/moderation/videos/{video_id}/action`
+
+System introspection:
+- `GET /admin/system/terms`
+- `GET /admin/system/read-only`
+- `GET /admin/system/maintenance`
 
 ---
 
@@ -299,6 +335,23 @@ Run-as endpoints generally return same payload contract as their underlying publ
 Security implication:
 - Treat this endpoint as highly privileged credential minting.
 - Restrict UI/action access and enforce strong operator controls.
+
+## 6.6 Automation upload flow (admin worker / scraper)
+
+For service-to-service ingestion (for example X scraping workers), the recommended idempotent flow is:
+
+1. `POST /admin/users/{user_id}/videos/init/anonymous` with:
+   - `filename`
+   - `size_bytes`
+   - `is_nsfw: true` (if your policy requires default NSFW true)
+2. Upload binary directly to returned `upload_url` (presigned object-storage URL).
+3. `POST /admin/users/{user_id}/videos/{id}/confirm`.
+
+Idempotency guidance:
+- Use deterministic external identifiers in your own worker DB (example: `tweet_id + media_url_hash`).
+- Before step 1, check whether ingestion already succeeded for that external identifier.
+- On partial failures, retry only the failed stage; do not restart the entire batch.
+- Treat `confirm` retries as safe when the same `video_id` is reused.
 
 ---
 

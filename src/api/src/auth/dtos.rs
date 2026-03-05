@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use shared::entities::users;
 use uuid::Uuid;
 
 #[derive(Deserialize)]
@@ -28,6 +29,28 @@ pub struct UserDto {
     pub username: String,
     pub email: String,
     pub avatar_url: Option<String>,
+    pub age_confirmed: bool,
+    pub terms_accepted: bool,
+    pub required_terms_version: String,
+    pub accepted_terms_version: Option<String>,
+}
+
+impl UserDto {
+    pub fn from_user_model(user: &users::Model, terms_current_version: &str) -> Self {
+        let age_confirmed = user.age_confirmed_at.is_some();
+        let terms_accepted = user.terms_accepted_at.is_some()
+            && user.terms_accepted_version.as_deref() == Some(terms_current_version);
+        Self {
+            id: user.id,
+            username: user.username.clone(),
+            email: user.email.clone(),
+            avatar_url: user.avatar_url.clone(),
+            age_confirmed,
+            terms_accepted,
+            required_terms_version: terms_current_version.to_string(),
+            accepted_terms_version: user.terms_accepted_version.clone(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
