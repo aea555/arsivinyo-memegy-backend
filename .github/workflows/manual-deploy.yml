@@ -1,9 +1,12 @@
-name: Deploy to VPS
+name: Manual Deploy to VPS
 
 on:
-  push:
-    branches:
-      - dev
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag, or commit SHA to deploy"
+        required: true
+        default: "dev"
 
 permissions:
   contents: read
@@ -17,14 +20,19 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
 
       - name: Derive image tags
         id: image
         run: |
           set -euo pipefail
           owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
-          image="ghcr.io/${owner}/arsivinyo-memegy-backend:dev-${GITHUB_SHA}"
-          latest="ghcr.io/${owner}/arsivinyo-memegy-backend:dev-latest"
+          safe_ref="$(echo "${{ inputs.ref }}" | tr '/:@' '-' | tr -cd '[:alnum:]._-')"
+          short_sha="$(git rev-parse --short=12 HEAD)"
+          image="ghcr.io/${owner}/arsivinyo-memegy-backend:${safe_ref}-${short_sha}"
+          latest="ghcr.io/${owner}/arsivinyo-memegy-backend:${safe_ref}-latest"
           echo "image=${image}" >> "$GITHUB_OUTPUT"
           echo "latest=${latest}" >> "$GITHUB_OUTPUT"
 
@@ -98,20 +106,26 @@ jobs:
         uses: appleboy/ssh-action@v1.0.3
         env:
           BACKEND_IMAGE: ${{ needs.build_and_push.outputs.image }}
+          DEPLOY_REF: ${{ inputs.ref }}
         with:
           host: ${{ steps.ssh_host.outputs.host }}
           port: 2558
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
-          envs: BACKEND_IMAGE
+          envs: BACKEND_IMAGE,DEPLOY_REF
           command_timeout: 45m
           script: |
             set -euo pipefail
             cd ~/arsivinyo-memegy-backend/
 
-            git fetch origin
-            git checkout -f dev || git checkout -b dev origin/dev
-            git reset --hard origin/dev
+            git fetch origin --tags --prune
+            if git show-ref --verify --quiet "refs/remotes/origin/${DEPLOY_REF}"; then
+              git checkout -B "${DEPLOY_REF}" "origin/${DEPLOY_REF}"
+              git reset --hard "origin/${DEPLOY_REF}"
+            else
+              git checkout -f "${DEPLOY_REF}"
+              git reset --hard "${DEPLOY_REF}"
+            fi
 
             touch .env.production
             SHARED_NETWORK="$(grep -E '^SHARED_SERVICES_NETWORK=' .env.production 2>/dev/null | tail -n1 | cut -d= -f2- || true)"
@@ -164,7 +178,6 @@ jobs:
             docker compose -f docker-compose.production.yml --env-file .env.production pull api worker || fail_deploy "failed to pull image"
             docker compose -f docker-compose.production.yml --env-file .env.production up -d --no-build --remove-orphans || fail_deploy "failed to start updated services"
 
-            # Ensure nginx picks up template changes before loopback health check.
             docker compose -f docker-compose.production.yml --env-file .env.production restart nginx || true
             sleep 10
 
