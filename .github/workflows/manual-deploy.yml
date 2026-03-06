@@ -118,6 +118,20 @@ jobs:
             set -euo pipefail
             cd ~/arsivinyo-memegy-backend/
 
+            DOCKER_BIN="$(command -v docker || true)"
+            [ -n "${DOCKER_BIN}" ] || { echo "docker command not found on target host"; exit 1; }
+            if ! "${DOCKER_BIN}" info >/dev/null 2>&1; then
+              if sudo -n "${DOCKER_BIN}" info >/dev/null 2>&1; then
+                docker() { sudo -n "${DOCKER_BIN}" "$@"; }
+              else
+                echo "No permission to access docker daemon (try adding user to docker group)."
+                id || true
+                groups || true
+                ls -l /var/run/docker.sock || true
+                exit 1
+              fi
+            fi
+
             git fetch origin --tags --prune
             if git show-ref --verify --quiet "refs/remotes/origin/${DEPLOY_REF}"; then
               git checkout -B "${DEPLOY_REF}" "origin/${DEPLOY_REF}"
