@@ -114,6 +114,10 @@ jobs:
             git reset --hard origin/dev
 
             touch .env.production
+            SHARED_NETWORK="$(grep -E '^SHARED_SERVICES_NETWORK=' .env.production 2>/dev/null | tail -n1 | cut -d= -f2- || true)"
+            SHARED_NETWORK="${SHARED_NETWORK:-arsivinyo-shared}"
+            docker network inspect "${SHARED_NETWORK}" >/dev/null 2>&1 || docker network create "${SHARED_NETWORK}"
+
             PREVIOUS_BACKEND_IMAGE="$(grep -E '^BACKEND_IMAGE=' .env.production | head -n1 | cut -d= -f2- || true)"
             LAST_SUCCESSFUL_FILE=".last_successful_backend_image"
             LAST_SUCCESSFUL_IMAGE="$(cat "${LAST_SUCCESSFUL_FILE}" 2>/dev/null || true)"
